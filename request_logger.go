@@ -154,26 +154,42 @@ func parseSQLiteTime(s string) time.Time {
 	return time.Now()
 }
 
-// ParseAgentInfo also returns instanceID, from x-claude-code-prompt-id: this
-// stays constant across every turn of one Task-tool invocation but differs
-// between concurrent invocations of the same subagent type (confirmed live —
-// two sequential turns of one "general-purpose" subagent shared one
-// Prompt-Id while x-claude-code-agent-id changed between them, so Agent-Id
-// is not the stable identifier despite the name). Without this, parallel
-// same-named subagents (e.g. 3 simultaneous Explore calls) are indistinguishable
-// in the logs — all tagged just "sub:Explore" with no way to tell them apart.
+// ParseAgentInfo also returns instanceID, used to tell apart N concurrent
+// same-named subagents (e.g. 3 simultaneous Explore calls, which would
+// otherwise all collapse into one indistinguishable "sub:Explore" branch).
+//
+// An earlier version of this comment claimed x-claude-code-prompt-id was
+// the stable per-instance key and x-claude-code-agent-id was not. That was
+// backwards, confirmed by two independent live captures (this gateway's
+// own local traffic, and genuine claude-cli traffic against real
+// api.anthropic.com via mitmdump): when the orchestrator spawns two
+// parallel "general-purpose" subagents in one "Agent" tool_use batch, BOTH
+// share the exact same Prompt-Id for their entire run, while each gets its
+// own Agent-Id that stays constant across all of its own turns. Prompt-Id
+// is effectively the *batch* id (shared by every subagent launched
+// together); Agent-Id is the *instance* id. Only subagents carry
+// Agent-Id at all (the main/orchestrator thread never does, per
+// claude-cli's own Kp(agentType==="main") check), which is also why it's
+// never used as a fallback for "main"/"auxiliary" below.
 func ParseAgentInfo(r *http.Request) (agentKey, agentType, subagentName, instanceID string) {
 	reqClass := r.Header.Get("x-claude-code-request-class")
 	rawAgentType := r.Header.Get("x-claude-code-agent-type")
 	promptID := r.Header.Get("x-claude-code-prompt-id")
+	agentID := r.Header.Get("x-claude-code-agent-id")
 
 	if reqClass == "auxiliary" {
 		return "auxiliary", "auxiliary", "", promptID
 	}
 	if rawAgentType != "" {
+		if agentID != "" {
+			return "sub:" + rawAgentType, "subagent", rawAgentType, agentID
+		}
 		return "sub:" + rawAgentType, "subagent", rawAgentType, promptID
 	}
 	if reqClass == "subagent" {
+		if agentID != "" {
+			return "subagent", "subagent", "subagent", agentID
+		}
 		return "subagent", "subagent", "subagent", promptID
 	}
 	return "main", "main", "", promptID
