@@ -20,6 +20,7 @@ type ServerConfig struct {
 	GoogleOAuthClientID      string `json:"google_oauth_client_id,omitempty"`      // overrides auth_manager.go's AntigravityClientID default if set
 	GoogleOAuthClientSecret  string `json:"google_oauth_client_secret,omitempty"`  // overrides auth_manager.go's AntigravityClientSecret default if set
 	MaxStreamDurationSeconds int    `json:"max_stream_duration_seconds,omitempty"` // absolute safety-net ceiling for one streaming request, regardless of ongoing activity; default 1800s (30min) if unset. The real per-request cutoff is idle silence > ttft_timeout_seconds, not this.
+	AntigravityUserAgent     string `json:"antigravity_user_agent,omitempty"`      // overrides auth_manager.go's AntigravityUserAgent default if set — bump this when Google ships a new real Antigravity client version
 }
 
 type TenantConfig struct {
@@ -79,6 +80,9 @@ func LoadConfig(path string) (*ConfigManager, error) {
 	}
 	if cfg.Server.GoogleOAuthClientSecret != "" {
 		AntigravityClientSecret = cfg.Server.GoogleOAuthClientSecret
+	}
+	if cfg.Server.AntigravityUserAgent != "" {
+		AntigravityUserAgent = cfg.Server.AntigravityUserAgent
 	}
 
 	cm := &ConfigManager{

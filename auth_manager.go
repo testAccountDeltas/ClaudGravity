@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // AntigravityClientID/Secret default to the values this gateway has always
@@ -29,15 +31,32 @@ import (
 var (
 	AntigravityClientID     = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 	AntigravityClientSecret = ""
+
+	// AntigravityUserAgent is the exact header the real Antigravity client
+	// sends on its own CloudCode calls — the literal "1.X.X" is not an
+	// unfilled placeholder, that's the string the real client sends.
+	// CloudCode gates its answer on this (an outdated version is served a
+	// reduced model set / coarser quota view), so this needs bumping in
+	// step with Google's shipping Antigravity release when that starts
+	// happening. There's no way for this gateway to auto-detect the current
+	// real value the way clirelay's "learned fingerprint" system does —
+	// that system works by observing genuine Antigravity/Gemini-CLI client
+	// traffic on ITS inbound side (someone pointing a real client at it),
+	// which this gateway's inbound surface (Claude Code only) never sees.
+	// config.json's server.antigravity_user_agent overrides this at startup
+	// (LoadConfig) if set, so it can be bumped without recompiling.
+	AntigravityUserAgent = "vscode/1.X.X (Antigravity/4.3.0)"
 )
 
 const (
-	GoogleTokenEndpoint     = "https://oauth2.googleapis.com/token"
-	GoogleAuthEndpoint      = "https://accounts.google.com/o/oauth2/v2/auth"
-	CloudCodeQuotaEndpoint  = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
-	CloudCodeModelsEndpoint = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
-	AntigravityUserAgent    = "vscode/1.X.X (Antigravity/4.3.0)"
-	OAuthRedirectURI        = "http://localhost:8898/oauth/callback"
+	GoogleTokenEndpoint             = "https://oauth2.googleapis.com/token"
+	GoogleAuthEndpoint              = "https://accounts.google.com/o/oauth2/v2/auth"
+	CloudCodeQuotaEndpoint          = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+	CloudCodeModelsEndpoint         = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+	CloudCodeLoadCodeAssistEndpoint = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+	CloudCodeOnboardUserEndpoint    = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser"
+	OAuthRedirectURI                = "http://localhost:8898/oauth/callback"
+	fallbackProjectID               = "aicode-consumers"
 )
 
 type QuotaBucket struct {
@@ -56,17 +75,18 @@ type QuotaGroup struct {
 }
 
 type AccountRecord struct {
-	Email         string       `json:"email"`
-	ProjectID     string       `json:"project_id"`
-	RefreshToken  string       `json:"refresh_token"`
-	AccessToken   string       `json:"access_token"`
-	ExpiresAt     time.Time    `json:"expires_at"`
-	Disabled      bool         `json:"disabled"`
-	FilePath      string       `json:"file_path"`
-	Quotas        []QuotaGroup `json:"quotas"`
-	CooldownUntil time.Time    `json:"cooldown_until"` // do not route requests until this time if quota exhausted
-	LastChecked   time.Time    `json:"last_checked"`
-	LastError     string       `json:"last_error"`
+	Email           string       `json:"email"`
+	ProjectID       string       `json:"project_id"`
+	ProjectIDProbed bool         `json:"project_id_probed"` // discovered via loadCodeAssist/onboardUser (or confirmed), not just the generic fallback — never re-probe once true
+	RefreshToken    string       `json:"refresh_token"`
+	AccessToken     string       `json:"access_token"`
+	ExpiresAt       time.Time    `json:"expires_at"`
+	Disabled        bool         `json:"disabled"`
+	FilePath        string       `json:"file_path"`
+	Quotas          []QuotaGroup `json:"quotas"`
+	CooldownUntil   time.Time    `json:"cooldown_until"` // do not route requests until this time if quota exhausted
+	LastChecked     time.Time    `json:"last_checked"`
+	LastError       string       `json:"last_error"`
 }
 
 type AccountManager struct {
@@ -108,19 +128,21 @@ func (am *AccountManager) LoadAll() error {
 		refToken := gjson.GetBytes(data, "refresh_token").String()
 		accToken := gjson.GetBytes(data, "access_token").String()
 		projectID := gjson.GetBytes(data, "project_id").String()
+		projectIDProbed := gjson.GetBytes(data, "project_id_probed").Bool()
 		disabled := gjson.GetBytes(data, "disabled").Bool()
 
 		if projectID == "" {
-			projectID = "aicode-consumers"
+			projectID = fallbackProjectID
 		}
 
 		acc := &AccountRecord{
-			Email:        email,
-			ProjectID:    projectID,
-			RefreshToken: refToken,
-			AccessToken:  accToken,
-			Disabled:     disabled,
-			FilePath:     path,
+			Email:           email,
+			ProjectID:       projectID,
+			ProjectIDProbed: projectIDProbed,
+			RefreshToken:    refToken,
+			AccessToken:     accToken,
+			Disabled:        disabled,
+			FilePath:        path,
 		}
 		am.accounts[email] = acc
 		return nil
@@ -176,7 +198,186 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 	acc.ExpiresAt = time.Now().Add(time.Duration(expSeconds) * time.Second)
 	am.mu.Unlock()
 
+	am.triggerProjectIDProbe(email, newAccToken)
+
 	return newAccToken, nil
+}
+
+var projectIDProbeInFlight sync.Map // email -> struct{}
+
+// triggerProjectIDProbe kicks off a background, one-time discovery of the
+// account's REAL project id via loadCodeAssist/onboardUser, instead of
+// silently relying on the generic fallbackProjectID forever. Fired
+// asynchronously so a normal request's token refresh never waits on it —
+// onboardUser alone can poll for up to 10s. Gated on ProjectIDProbed so it
+// only ever runs once per account, mirroring the "don't re-enter onboardUser"
+// guard in clirelay's antigravity executor (that path was observed thrashing
+// production with auth writes + reloads without one).
+func (am *AccountManager) triggerProjectIDProbe(email, accessToken string) {
+	am.mu.RLock()
+	acc, ok := am.accounts[email]
+	am.mu.RUnlock()
+	if !ok || acc.ProjectIDProbed {
+		return
+	}
+	if _, loaded := projectIDProbeInFlight.LoadOrStore(email, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer projectIDProbeInFlight.Delete(email)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+
+		discovered, err := discoverAntigravityProjectID(ctx, accessToken)
+
+		am.mu.Lock()
+		acc.ProjectIDProbed = true
+		if err == nil && discovered != "" && discovered != acc.ProjectID {
+			LogGateway("[AccountManager] %s: discovered real project_id %q (was %q)", email, discovered, acc.ProjectID)
+			acc.ProjectID = discovered
+		} else if err != nil {
+			LogGateway("[AccountManager] %s: project_id probe failed, keeping %q: %v", email, acc.ProjectID, err)
+		} else {
+			LogGateway("[AccountManager] %s: project_id probe confirmed %q", email, acc.ProjectID)
+		}
+		am.persistAccountLocked(acc)
+		am.mu.Unlock()
+	}()
+}
+
+// persistAccountLocked writes project_id/project_id_probed back to the
+// account's own auth JSON file. Caller must hold am.mu. Only those two fields
+// are touched — every other key in the file (tokens, timestamps, whatever a
+// future version adds) passes through untouched.
+func (am *AccountManager) persistAccountLocked(acc *AccountRecord) {
+	if acc.FilePath == "" {
+		return
+	}
+	data, err := os.ReadFile(acc.FilePath)
+	if err != nil {
+		return
+	}
+	updated, err := sjson.SetBytes(data, "project_id", acc.ProjectID)
+	if err != nil {
+		return
+	}
+	updated, err = sjson.SetBytes(updated, "project_id_probed", acc.ProjectIDProbed)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(acc.FilePath, updated, 0644)
+}
+
+// discoverAntigravityProjectID retrieves the account's real GCP project id via
+// loadCodeAssist, onboarding it (onboardUser, polling for completion) if
+// loadCodeAssist reports none yet. Ported from clirelay's
+// internal/auth/antigravity/auth.go (FetchAccountDetails/OnboardUser), which
+// solves the identical discovery problem for the identical upstream.
+func discoverAntigravityProjectID(ctx context.Context, accessToken string) (string, error) {
+	loadBody := []byte(`{"metadata":{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, CloudCodeLoadCodeAssistEndpoint, bytes.NewReader(loadBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", AntigravityUserAgent)
+	req.Header.Set("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+	req.Header.Set("Client-Metadata", `{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("loadCodeAssist: %w", err)
+	}
+	loadRespBytes, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("loadCodeAssist HTTP %d: %s", resp.StatusCode, string(loadRespBytes))
+	}
+
+	loadResp := gjson.ParseBytes(loadRespBytes)
+	projectID := projectIDFromNode(loadResp.Get("cloudaicompanionProject"))
+	if projectID != "" {
+		return projectID, nil
+	}
+
+	defaultTierID := "legacy-tier"
+	loadResp.Get("allowedTiers").ForEach(func(_, tier gjson.Result) bool {
+		if tier.Get("isDefault").Bool() {
+			if id := tier.Get("id").String(); id != "" {
+				defaultTierID = id
+				return false
+			}
+		}
+		return true
+	})
+
+	return onboardAntigravityUser(ctx, accessToken, defaultTierID)
+}
+
+// onboardAntigravityUser polls onboardUser until Google reports the
+// onboarding operation done, then extracts the newly-provisioned project id.
+func onboardAntigravityUser(ctx context.Context, accessToken, tierID string) (string, error) {
+	reqBody, _ := sjson.SetBytes(
+		[]byte(`{"metadata":{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}`),
+		"tierId", tierID,
+	)
+
+	const maxAttempts = 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, CloudCodeOnboardUserEndpoint, bytes.NewReader(reqBody))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", AntigravityUserAgent)
+		req.Header.Set("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+		req.Header.Set("Client-Metadata", `{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`)
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("onboardUser: %w", err)
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("onboardUser HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+		}
+
+		parsed := gjson.ParseBytes(bodyBytes)
+		if parsed.Get("done").Bool() {
+			projectID := projectIDFromNode(parsed.Get("response.cloudaicompanionProject"))
+			if projectID == "" {
+				return "", fmt.Errorf("onboardUser completed without a project id")
+			}
+			return projectID, nil
+		}
+
+		if attempt < maxAttempts {
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return "", ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return "", fmt.Errorf("onboardUser: did not complete after %d attempts", maxAttempts)
+}
+
+// projectIDFromNode handles both wire shapes Google uses for this field: a
+// bare string, or {"id": "..."}.
+func projectIDFromNode(node gjson.Result) string {
+	if node.Type == gjson.String {
+		return strings.TrimSpace(node.String())
+	}
+	if id := node.Get("id").String(); id != "" {
+		return strings.TrimSpace(id)
+	}
+	return ""
 }
 
 func (am *AccountManager) FetchQuota(email string) error {
