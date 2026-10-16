@@ -479,6 +479,16 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		// Antigravity it's rebuilt per host inside the retry loop below.
 		var directURL string
 		if !isAntigravity {
+			// tiering.go's model names (gemini-3.8-flash-tiered/-low/-medium/
+			// -high) are Antigravity/CloudCode-internal aliases — the public
+			// Gemini Developer API this branch calls doesn't recognize them
+			// and 404s. Only reachable once a tenant actually configures a
+			// real google_api_key (both deployments currently still have
+			// the config.example.json placeholder there), but worth fixing
+			// correctly since this is a published, reusable gateway.
+			if strings.HasPrefix(modelName, "gemini-3.8-flash") {
+				modelName = "gemini-2.5-flash"
+			}
 			baseURL := tenant.GoogleBaseURL
 			if baseURL == "" {
 				baseURL = "https://generativelanguage.googleapis.com"
@@ -1095,6 +1105,14 @@ func executeNonStreaming(
 					}
 					var argsObj interface{}
 					_ = json.Unmarshal([]byte(argsRaw), &argsObj)
+					if argsObj == nil {
+						// Malformed JSON (e.g. truncated mid-argument by a
+						// MAX_TOKENS cutoff) leaves argsObj nil, which
+						// serializes as "input": null — Anthropic's
+						// Messages API requires tool_use.input to be an
+						// object.
+						argsObj = map[string]interface{}{}
+					}
 					toolsCalled = append(toolsCalled, fname)
 					callID := nextToolCallID(fname)
 					toolCallIDs = append(toolCallIDs, callID)
@@ -1309,7 +1327,13 @@ func isNative3PModelExhausted(acc *AccountRecord) bool {
 		}
 		return true
 	}
-	return false
+	// Quotas were probed (retrieveUserQuotaSummary ran) but came back with
+	// no Claude/GPT group at all — on a free-tier account that means 3P
+	// was never provisioned, not "quota unknown, assume available". Treated
+	// as available before, so a native 3P model request sailed straight
+	// into a guaranteed 429 and the 15-minute account-wide cooldown that
+	// follows it (even though Gemini itself was still 100% free).
+	return len(acc.Quotas) > 0
 }
 
 func pickFiveHourAndWeekly(acc *AccountRecord, modelName string) (fiveHour, weekly *QuotaBucket) {

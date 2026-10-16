@@ -119,6 +119,19 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 	if budget > 0 && requestedMaxOutputHint <= int64(budget) {
 		requestedMaxOutputHint = int64(budget) + 4096
+	} else if budget < 0 {
+		// Must mirror step 7's own ModeAuto inflation below (maxOutputTokens
+		// raised to the model's full ceiling, since thinking and the visible
+		// answer share that one pool under ModeAuto) — otherwise this
+		// reserves only ~8192 tokens of headroom while the real request
+		// reserves up to 64000, and a conversation sitting near the model's
+		// context ceiling gets under-truncated here only to blow past
+		// Google's real token wall once the inflated output budget is added.
+		if earlyMeta, ok := globalModelCatalog.GetModel(modelName); ok && earlyMeta.MaxOutput > 0 {
+			requestedMaxOutputHint = earlyMeta.MaxOutput
+		} else {
+			requestedMaxOutputHint = 64000
+		}
 	}
 	if dropped, truncated := TruncateConversationToFit(reqMap, modelName, requestedMaxOutputHint); truncated {
 		LogGateway("[ContextWindow] dropped %d oldest message(s) to fit %s's context window [%s]", dropped, modelName, agentKey)

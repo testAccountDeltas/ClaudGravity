@@ -357,7 +357,23 @@ func PassthroughToReal(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// MitmResponseWriter.Flush() always buffers the whole body and computes
+	// its own real Content-Length — but a chunked upstream response has no
+	// Content-Length of its own, so blindly copying its hop-by-hop headers
+	// through left the stale "Transfer-Encoding: chunked" sitting next to
+	// Flush()'s freshly computed Content-Length: two conflicting framing
+	// headers on the same response, which RFC 7230 §3.3.2 forbids and which
+	// Node.js's strict HTTP/1.1 parser (what Claude Code's CLI runs on)
+	// rejects outright instead of just picking one.
+	hopByHop := map[string]bool{
+		"Connection": true, "Keep-Alive": true, "Transfer-Encoding": true,
+		"Trailer": true, "Upgrade": true, "Proxy-Authenticate": true,
+		"Proxy-Authorization": true, "Te": true,
+	}
 	for k, vv := range resp.Header {
+		if hopByHop[k] {
+			continue
+		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
