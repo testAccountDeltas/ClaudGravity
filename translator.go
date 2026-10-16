@@ -9,6 +9,21 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// DropSearchTools is stripped from the declared tools when
+// tenant.StripSearchTools is true (default: true — see README.md's
+// "Почему strip_search_tools по умолчанию true" for the full reasoning).
+// Deliberate, not a forgotten default: Grep/Glob's schema (pattern, path,
+// glob, output_mode, -i/-n/-A/-B/-C, context, multiline, head_limit,
+// offset — only "pattern" required) gives Gemini real room to drop the
+// required field or confuse which field a flag belongs in, and unlike
+// Edit (RepairEditToolCall) there is no defensive repair pass for these
+// two yet to catch and fix a malformed call before it reaches the client.
+// Without them, Gemini falls back to Bash for search — a predictable,
+// visible failure mode (quoting/escaping issues on Windows) instead of a
+// silently malformed structured call. The native Antigravity client
+// (agy.exe) isn't counter-evidence either way: its own tool palette has
+// no Grep/Glob-shaped tool at all — it searches via its own run_command
+// (shell), not through this specific schema.
 var DropSearchTools = map[string]bool{
 	"Grep": true,
 	"Glob": true,
