@@ -7,10 +7,22 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/gjson"
 )
+
+// toolCallSeq makes generated tool_use ids collision-free regardless of
+// timer resolution: time.Now().UnixNano() alone can return the same value
+// for two tool calls processed microseconds apart (common on Windows/VMs
+// with coarse clock granularity), which broke the Anthropic API's
+// requirement that every tool_use id in a message be unique.
+var toolCallSeq atomic.Uint64
+
+func nextToolCallID(name string) string {
+	return fmt.Sprintf("toolu_%s_%d_%d", name, time.Now().UnixNano(), toolCallSeq.Add(1))
+}
 
 type SSEStreamer struct {
 	w                   http.ResponseWriter
@@ -37,6 +49,7 @@ type SSEStreamer struct {
 	requestedSafeguards bool
 	toolCallIDs         []string
 	hasFinished         bool
+	thoughtSignature    string // most recent thoughtSignature seen for the open thinking block, flushed as signature_delta on close
 }
 
 type GroundingSource struct {
@@ -119,6 +132,27 @@ func (s *SSEStreamer) closeCurrentBlock() error {
 	if s.currentType == TypeNone || s.currentIndex < 0 {
 		return nil
 	}
+	// Anthropic's extended-thinking streaming format sends a signature_delta
+	// closing out the thinking block's crypto signature before
+	// content_block_stop; skipping it silently is what pushed us toward the
+	// "skip_thought_signature_validator" placeholder on the translate-back
+	// path (translator.go) in the first place, since the real signature was
+	// never captured and forwarded. Flush whatever we saw.
+	if s.currentType == TypeThinking && s.thoughtSignature != "" {
+		sigPayload := map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": s.currentIndex,
+			"delta": map[string]interface{}{
+				"type":      "signature_delta",
+				"signature": s.thoughtSignature,
+			},
+		}
+		b, _ := json.Marshal(sigPayload)
+		if err := s.SendRaw("content_block_delta", string(b)); err != nil {
+			return err
+		}
+	}
+	s.thoughtSignature = ""
 	stopPayload := map[string]interface{}{
 		"type":  "content_block_stop",
 		"index": s.currentIndex,
@@ -128,7 +162,7 @@ func (s *SSEStreamer) closeCurrentBlock() error {
 	return s.SendRaw("content_block_stop", string(b))
 }
 
-func (s *SSEStreamer) HandleThinking(text string) error {
+func (s *SSEStreamer) HandleThinking(text string, thoughtSignature string) error {
 	if err := s.EnsureMessageStart(); err != nil {
 		return err
 	}
@@ -151,6 +185,9 @@ func (s *SSEStreamer) HandleThinking(text string) error {
 		if err := s.SendRaw("content_block_start", string(b)); err != nil {
 			return err
 		}
+	}
+	if thoughtSignature != "" {
+		s.thoughtSignature = thoughtSignature
 	}
 
 	deltaPayload := map[string]interface{}{
@@ -221,7 +258,7 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string) error {
 	s.toolNames = append(s.toolNames, name)
 	s.toolCallSignatures = append(s.toolCallSignatures, fmt.Sprintf("%s:%s", name, argsRaw))
 
-	callID := fmt.Sprintf("toolu_%s_%d", name, time.Now().UnixNano()%1000000)
+	callID := nextToolCallID(name)
 	s.toolCallIDs = append(s.toolCallIDs, callID)
 
 	startPayload := map[string]interface{}{
@@ -354,7 +391,7 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 		for _, part := range parts.Array() {
 			if part.Get("thought").Bool() {
 				if t := part.Get("text").String(); t != "" {
-					if err := s.HandleThinking(t); err != nil {
+					if err := s.HandleThinking(t, part.Get("thoughtSignature").String()); err != nil {
 						return err
 					}
 				}

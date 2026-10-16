@@ -967,7 +967,18 @@ func executeNonStreaming(
 		parts := cand.Get("content.parts")
 		if parts.IsArray() {
 			for _, p := range parts.Array() {
-				if t := p.Get("text").String(); t != "" {
+				if p.Get("thought").Bool() {
+					if t := p.Get("text").String(); t != "" {
+						block := map[string]interface{}{
+							"type":     "thinking",
+							"thinking": t,
+						}
+						if sig := p.Get("thoughtSignature").String(); sig != "" {
+							block["signature"] = sig
+						}
+						claudeResp["content"] = append(claudeResp["content"].([]map[string]interface{}), block)
+					}
+				} else if t := p.Get("text").String(); t != "" {
 					claudeResp["content"] = append(claudeResp["content"].([]map[string]interface{}), map[string]interface{}{
 						"type": "text",
 						"text": t,
@@ -984,7 +995,7 @@ func executeNonStreaming(
 					var argsObj interface{}
 					_ = json.Unmarshal([]byte(argsRaw), &argsObj)
 					toolsCalled = append(toolsCalled, fname)
-					callID := fmt.Sprintf("toolu_%s_%d", fname, time.Now().UnixNano()%1000000)
+					callID := nextToolCallID(fname)
 					toolCallIDs = append(toolCallIDs, callID)
 					claudeResp["content"] = append(claudeResp["content"].([]map[string]interface{}), map[string]interface{}{
 						"type":  "tool_use",

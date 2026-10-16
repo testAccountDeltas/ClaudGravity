@@ -290,6 +290,22 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 	}
 	newMsgs = rebuilt
 
+	// Gemini's generateContent requires the conversation to end on a "user"
+	// turn; Anthropic allows the last message to be "assistant" (prefill:
+	// the client is asking the model to continue its own prior text). The
+	// tool_use rebuild above already appends a trailing user turn whenever
+	// the last assistant message had tool calls — this catches the plain-
+	// text prefill case that leaves otherwise.
+	if len(newMsgs) > 0 && newMsgs[len(newMsgs)-1]["role"] == "assistant" {
+		newMsgs = append(newMsgs, map[string]interface{}{
+			"role": "user",
+			"content": []map[string]interface{}{
+				{"type": "text", "text": "Continue."},
+			},
+		})
+		modified = true
+	}
+
 	if modified {
 		var genericList []interface{}
 		for _, m := range newMsgs {

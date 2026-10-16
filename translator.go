@@ -182,12 +182,29 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						}
 
 						resText := ""
+						var imageParts []string
 						c := p.Get("content")
 						if c.IsArray() {
 							var sb strings.Builder
 							c.ForEach(func(_, item gjson.Result) bool {
-								if item.Get("type").String() == "text" {
+								switch item.Get("type").String() {
+								case "text":
 									sb.WriteString(item.Get("text").String())
+								case "image":
+									// Previously dropped entirely (only "text"
+									// blocks were read), silently losing any
+									// screenshot/plot a tool returned.
+									src := item.Get("source")
+									if src.Get("type").String() == "base64" {
+										mediaType := src.Get("media_type").String()
+										data := src.Get("data").String()
+										if mediaType != "" && data != "" {
+											imgPart := `{"inlineData":{"mimeType":"","data":""}}`
+											imgPart, _ = sjson.Set(imgPart, "inlineData.mimeType", mediaType)
+											imgPart, _ = sjson.Set(imgPart, "inlineData.data", data)
+											imageParts = append(imageParts, imgPart)
+										}
+									}
 								}
 								return true
 							})
@@ -196,18 +213,38 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							resText = c.String()
 						}
 
-						part := `{"functionResponse":{"name":"","response":{"result":""}}}`
+						// is_error was previously ignored, so a failed tool
+						// call looked identical to a successful one to the
+						// model — it had no signal to recognize the failure
+						// and retry or change approach.
+						responseField := "result"
+						if p.Get("is_error").Bool() {
+							responseField = "error"
+						}
+						part := `{"functionResponse":{"name":"","response":{}}}`
 						part, _ = sjson.Set(part, "functionResponse.name", fnName)
 						if toolUseID != "" {
 							part, _ = sjson.Set(part, "functionResponse.id", toolUseID)
 						}
-						part, _ = sjson.Set(part, "functionResponse.response.result", resText)
+						part, _ = sjson.Set(part, "functionResponse.response."+responseField, resText)
 						partsJSON = append(partsJSON, part)
+						partsJSON = append(partsJSON, imageParts...)
 
 					case "thinking":
 						thoughtTxt := p.Get("thinking").String()
 						if thoughtTxt != "" {
-							part := `{"thought":true,"thoughtSignature":"skip_thought_signature_validator","text":""}`
+							// Prefer the real signature the client echoed back
+							// (now that sse.go actually sends one via
+							// signature_delta) over the skip-validator bypass;
+							// Google warns that permanently skipping the
+							// validator can degrade reasoning quality on long
+							// thinking chains.
+							sig := p.Get("signature").String()
+							if sig == "" {
+								sig = "skip_thought_signature_validator"
+							}
+							part := `{"thought":true,"thoughtSignature":"","text":""}`
+							part, _ = sjson.Set(part, "thoughtSignature", sig)
 							part, _ = sjson.Set(part, "text", thoughtTxt)
 							partsJSON = append(partsJSON, part)
 						}
@@ -289,6 +326,25 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		} else if hasWebSearch {
 			out, _ = sjson.SetRaw(out, "tools.0.googleSearch", "{}")
 		}
+
+		// tool_choice was previously dropped entirely, so a client forcing
+		// tool use (type:"any") or a specific tool (type:"tool", name:X)
+		// silently fell back to Gemini's own default "let the model decide".
+		if len(decls) > 0 {
+			if tc := root.Get("tool_choice"); tc.Exists() {
+				switch tc.Get("type").String() {
+				case "any":
+					out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.mode", "ANY")
+				case "tool":
+					if name := tc.Get("name").String(); name != "" {
+						out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.mode", "ANY")
+						out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.allowedFunctionNames.0", name)
+					}
+				case "none":
+					out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.mode", "NONE")
+				}
+			}
+		}
 	}
 
 	// 7. Thinking & Output Tokens Configuration with Dynamic Model Limits
@@ -304,6 +360,29 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		} else {
 			// -1 enables ModeAuto unbracketed
 			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", -1)
+		}
+	}
+
+	// 6.5 Carry over sampling hyperparameters: previously dropped entirely,
+	// so a client asking for temperature:0 (deterministic code generation)
+	// silently got Gemini's own default (commonly ~1.0) instead.
+	if temp := root.Get("temperature"); temp.Exists() {
+		out, _ = sjson.Set(out, "generationConfig.temperature", temp.Float())
+	}
+	if topP := root.Get("top_p"); topP.Exists() {
+		out, _ = sjson.Set(out, "generationConfig.topP", topP.Float())
+	}
+	if topK := root.Get("top_k"); topK.Exists() {
+		out, _ = sjson.Set(out, "generationConfig.topK", topK.Int())
+	}
+	if stopSeqs := root.Get("stop_sequences"); stopSeqs.IsArray() {
+		var seqs []string
+		for _, s := range stopSeqs.Array() {
+			seqs = append(seqs, s.String())
+		}
+		if len(seqs) > 0 {
+			seqsJSON, _ := json.Marshal(seqs)
+			out, _ = sjson.SetRaw(out, "generationConfig.stopSequences", string(seqsJSON))
 		}
 	}
 
