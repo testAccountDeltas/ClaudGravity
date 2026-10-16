@@ -227,8 +227,16 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							part, _ = sjson.Set(part, "functionResponse.id", toolUseID)
 						}
 						part, _ = sjson.Set(part, "functionResponse.response."+responseField, resText)
+						// Images must nest inside functionResponse.parts, not
+						// sit as sibling parts of this turn — Gemini requires
+						// a turn carrying a functionResponse to contain ONLY
+						// functionResponse parts; a bare inlineData sibling
+						// here is the exact same violation as a bare text
+						// sibling would be.
+						if len(imageParts) > 0 {
+							part, _ = sjson.SetRaw(part, "functionResponse.parts", "["+strings.Join(imageParts, ",")+"]")
+						}
 						partsJSON = append(partsJSON, part)
-						partsJSON = append(partsJSON, imageParts...)
 
 					case "thinking":
 						thoughtTxt := p.Get("thinking").String()

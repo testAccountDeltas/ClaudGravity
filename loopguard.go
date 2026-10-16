@@ -235,6 +235,31 @@ func InjectUserNudge(claudeReqJSON map[string]interface{}, text string) {
 			if role, _ := lastMsg["role"].(string); role == "user" {
 				switch content := lastMsg["content"].(type) {
 				case []interface{}:
+					// Gemini requires a turn carrying a functionResponse to
+					// contain ONLY functionResponse parts — a bare text block
+					// appended alongside a tool_result here guarantees a 400
+					// from Google. If this turn is a tool_result turn, fold
+					// the nudge into the first tool_result's own content
+					// instead of adding a sibling block.
+					for _, item := range content {
+						block, ok := item.(map[string]interface{})
+						if !ok || block["type"] != "tool_result" {
+							continue
+						}
+						switch c := block["content"].(type) {
+						case string:
+							block["content"] = c + "\n\n[" + text + "]"
+						case []interface{}:
+							block["content"] = append(c, map[string]interface{}{
+								"type": "text",
+								"text": "\n\n[" + text + "]",
+							})
+						default:
+							block["content"] = "\n\n[" + text + "]"
+						}
+						claudeReqJSON["messages"] = msgs
+						return
+					}
 					lastMsg["content"] = append(content, nudgeBlock)
 					claudeReqJSON["messages"] = msgs
 					return

@@ -437,8 +437,12 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 	}
 
 	if fr := cand.Get("finishReason").String(); fr != "" && fr != "FINISH_REASON_UNSPECIFIED" {
-		// Append Grounding Sources footer if Google Search was performed
-		if len(s.groundingSources) > 0 {
+		// Append Grounding Sources footer if Google Search was performed —
+		// but never after a tool_use block: per Anthropic convention a
+		// tool_use block ends the assistant's turn (the client replies with
+		// its tool_result next), and trailing text after it risks confusing
+		// stricter SDK parsers.
+		if len(s.groundingSources) > 0 && !s.toolUseOccurred {
 			var sb strings.Builder
 			sb.WriteString("\n\n---\n**Источники Google Search:**\n")
 			seen := make(map[string]bool)

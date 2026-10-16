@@ -947,17 +947,34 @@ func executeNonStreaming(
 	outTok := geminiJSON.Get("usageMetadata.candidatesTokenCount").Int()
 	cacheTok := geminiJSON.Get("usageMetadata.cachedContentTokenCount").Int()
 
+	// Previously only computed for the dashboard's own RequestLog entry
+	// (CacheReadTokens below) and never surfaced to the client — Claude
+	// Code's own /usage cache-hit-rate math silently saw 0% cache reads on
+	// every non-streaming response.
+	usageMap := map[string]interface{}{
+		"input_tokens":  inTok,
+		"output_tokens": outTok,
+	}
+	if cacheTok > 0 {
+		usageMap["cache_read_input_tokens"] = cacheTok
+	}
+
+	// Previously always "end_turn" — a response that hit the output-token
+	// ceiling looked identical to one that finished normally, so the client
+	// had no signal to know its answer was truncated.
+	stopReason := "end_turn"
+	if geminiJSON.Get("candidates.0.finishReason").String() == "MAX_TOKENS" {
+		stopReason = "max_tokens"
+	}
+
 	claudeResp := map[string]interface{}{
-		"id":      fmt.Sprintf("msg_%d", time.Now().UnixNano()),
-		"type":    "message",
-		"role":    "assistant",
-		"model":   modelName,
-		"content": []map[string]interface{}{},
-		"usage": map[string]interface{}{
-			"input_tokens":  inTok,
-			"output_tokens": outTok,
-		},
-		"stop_reason": "end_turn",
+		"id":          fmt.Sprintf("msg_%d", time.Now().UnixNano()),
+		"type":        "message",
+		"role":        "assistant",
+		"model":       modelName,
+		"content":     []map[string]interface{}{},
+		"usage":       usageMap,
+		"stop_reason": stopReason,
 	}
 
 	var toolsCalled []string
