@@ -206,6 +206,9 @@ func main() {
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
 		handleModels(cfgMgr, w, r)
 	})
+	mux.HandleFunc("/v1/models/{id}", func(w http.ResponseWriter, r *http.Request) {
+		handleModelByID(cfgMgr, w, r)
+	})
 	mux.HandleFunc("/v1/usage", func(w http.ResponseWriter, r *http.Request) {
 		handleUsage(cfgMgr, w, r)
 	})
@@ -315,9 +318,16 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	rid := nextReqID()
 	t0 := time.Now()
 
-	// 1. Resolve Tenant by Bearer token
-	authHeader := r.Header.Get("Authorization")
-	clientKey := strings.TrimPrefix(authHeader, "Bearer ")
+	// 1. Resolve Tenant by API key. Claude Code's own OAuth/subscription
+	// flow (what this gateway's launchers all use) sends Authorization:
+	// Bearer — but every official Anthropic SDK (Python, TypeScript) and
+	// any client configured with a plain ANTHROPIC_API_KEY instead sends
+	// x-api-key by default, which this never checked at all.
+	clientKey := r.Header.Get("x-api-key")
+	if clientKey == "" {
+		authHeader := r.Header.Get("Authorization")
+		clientKey = strings.TrimPrefix(authHeader, "Bearer ")
+	}
 	tenant, ok := cfgMgr.GetTenant(clientKey)
 	if !ok {
 		LogGateway("[#%d] Unauthorized: invalid or missing Bearer token", rid)
@@ -1246,45 +1256,51 @@ func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Req
 	_, _ = w.Write(b)
 }
 
+// knownModels backs both /v1/models (list) and /v1/models/{id} (lookup) —
+// previously only the list existed, and any client calling the per-model
+// lookup (the official Anthropic SDKs do, to validate a model id) got a
+// plain 404 instead of that model's metadata.
+var knownModels = []map[string]interface{}{
+	{"id": "gemini-2.5-flash", "object": "model", "display_name": "Gemini 2.5 Flash"},
+	{"id": "gemini-2.5-pro", "object": "model", "display_name": "Gemini 2.5 Pro"},
+	{"id": "gemini-3.8-flash-tiered", "object": "model", "display_name": "Gemini 3.8 Flash Tiered"},
+	{"id": "claude-3-5-haiku-20241022", "object": "model", "display_name": "Claude 3.5 Haiku"},
+	{"id": "claude-3-5-haiku-latest", "object": "model", "display_name": "Claude 3.5 Haiku"},
+	{"id": "claude-3-5-sonnet-20241022", "object": "model", "display_name": "Claude 3.5 Sonnet"},
+	{"id": "claude-3-5-sonnet-latest", "object": "model", "display_name": "Claude 3.5 Sonnet"},
+	{"id": "claude-3-7-sonnet-20250219", "object": "model", "display_name": "Claude 3.7 Sonnet"},
+	{"id": "claude-3-7-sonnet-latest", "object": "model", "display_name": "Claude 3.7 Sonnet"},
+	{"id": "claude-3-opus-20240229", "object": "model", "display_name": "Claude 3 Opus"},
+	{"id": "claude-opus-4-6-thinking", "object": "model", "display_name": "Claude Opus 4.6 Thinking"},
+}
+
 func handleModels(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{
 		"object": "list",
-		"data": []map[string]interface{}{
-			{
-				"id":           "gemini-2.5-flash",
-				"object":       "model",
-				"display_name": "Gemini 2.5 Flash",
-			},
-			{
-				"id":           "gemini-2.5-pro",
-				"object":       "model",
-				"display_name": "Gemini 2.5 Pro",
-			},
-			{
-				"id":           "gemini-3.8-flash-tiered",
-				"object":       "model",
-				"display_name": "Gemini 3.8 Flash Tiered",
-			},
-			{
-				"id":           "claude-3-5-haiku-20241022",
-				"object":       "model",
-				"display_name": "Claude 3.5 Haiku",
-			},
-			{
-				"id":           "claude-3-7-sonnet-20250219",
-				"object":       "model",
-				"display_name": "Claude 3.7 Sonnet",
-			},
-			{
-				"id":           "claude-opus-4-6-thinking",
-				"object":       "model",
-				"display_name": "Claude Opus 4.6 Thinking",
-			},
-		},
+		"data":   knownModels,
+		// This gateway's whole catalog fits in one page — has_more is
+		// always false, but the fields themselves are still expected by
+		// the official SDKs' pagination handling.
+		"has_more": false,
+		"first_id": knownModels[0]["id"],
+		"last_id":  knownModels[len(knownModels)-1]["id"],
 	}
 	b, _ := json.Marshal(resp)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(b)
+}
+
+func handleModelByID(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	for _, m := range knownModels {
+		if m["id"] == id {
+			b, _ := json.Marshal(m)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(b)
+			return
+		}
+	}
+	writeAnthropicError(w, http.StatusNotFound, "not_found_error", fmt.Sprintf("model: %s", id))
 }
 
 // bucketToUsageWindow converts one Gemini quota bucket into the wire shape
@@ -1562,8 +1578,11 @@ const (
 )
 
 func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
-	authHeader := r.Header.Get("Authorization")
-	clientKey := strings.TrimPrefix(authHeader, "Bearer ")
+	clientKey := r.Header.Get("x-api-key")
+	if clientKey == "" {
+		authHeader := r.Header.Get("Authorization")
+		clientKey = strings.TrimPrefix(authHeader, "Bearer ")
+	}
 	tenant, _ := cfgMgr.GetTenant(clientKey)
 
 	convAnchor := r.URL.Query().Get("conversation")
@@ -1735,8 +1754,11 @@ func handleEmbeddings(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Requ
 }
 func handleOAuthUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
 	LogGateway("[SuperRelay Gateway] >>> handleOAuthUsage CALLED from %s %s <<<", r.RemoteAddr, r.URL.Path)
-	authHeader := r.Header.Get("Authorization")
-	clientKey := strings.TrimPrefix(authHeader, "Bearer ")
+	clientKey := r.Header.Get("x-api-key")
+	if clientKey == "" {
+		authHeader := r.Header.Get("Authorization")
+		clientKey = strings.TrimPrefix(authHeader, "Bearer ")
+	}
 	tenant, _ := cfgMgr.GetTenant(clientKey)
 
 	convAnchor := r.URL.Query().Get("conversation")

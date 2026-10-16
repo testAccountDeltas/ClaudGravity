@@ -114,6 +114,24 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 		}
 	}
 
+	// Standard Anthropic "thinking" object — Claude Code itself never sends
+	// this (it uses the proprietary output_config.effort above), but any
+	// generic Anthropic SDK client or non-Claude-Code caller would. Only
+	// applies when effort didn't already decide the budget, so Claude
+	// Code's own requests are completely unaffected.
+	if effort == "" {
+		if th, ok := claudeReqJSON["thinking"].(map[string]interface{}); ok {
+			switch th["type"] {
+			case "disabled":
+				budget = 0
+			case "enabled":
+				if bt, ok := th["budget_tokens"].(float64); ok && bt > 0 {
+					budget = int(bt)
+				}
+			}
+		}
+	}
+
 	claudeReqJSON["model"] = model
 	return model, budget
 }

@@ -9,6 +9,24 @@ import (
 
 const ToolOutputCharLimit = 65536 // 64 KB limit
 
+// extractPlainText concatenates the text of every "text" content block in a
+// normalized ([]map[string]interface{}) message content value.
+func extractPlainText(content interface{}) string {
+	blocks, ok := content.([]map[string]interface{})
+	if !ok {
+		return ""
+	}
+	var sb strings.Builder
+	for _, b := range blocks {
+		if b["type"] == "text" {
+			if t, ok := b["text"].(string); ok {
+				sb.WriteString(t)
+			}
+		}
+	}
+	return sb.String()
+}
+
 var (
 	pollutedToolCallTextPattern = regexp.MustCompile(`(?i)\[Called tool [^\]]*\]`)
 	multiNewlinePattern         = regexp.MustCompile(`\n{3,}`)
@@ -292,15 +310,31 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 
 	// Gemini's generateContent requires the conversation to end on a "user"
 	// turn; Anthropic allows the last message to be "assistant" (prefill:
-	// the client is asking the model to continue its own prior text). The
-	// tool_use rebuild above already appends a trailing user turn whenever
-	// the last assistant message had tool calls — this catches the plain-
-	// text prefill case that leaves otherwise.
+	// the client is asking the model to continue its own prior text, e.g. a
+	// literal "{" to force JSON output). The tool_use rebuild above already
+	// appends a trailing user turn whenever the last assistant message had
+	// tool calls — this catches the plain-text prefill case that leaves
+	// otherwise. Gemini has no real prefill mechanism (no way to hand a
+	// model a prefix and have it literally continue those exact tokens),
+	// so a bare "Continue." gave it no idea a prefix even existed — it
+	// would restate a "Certainly, here's the continuation..." preamble and
+	// repeat the prefix instead of picking up from it, breaking anything
+	// parsing the output as a single JSON value. Telling it the exact
+	// prefix text and to continue from it without repeating it is the best
+	// Gemini-side approximation available.
 	if len(newMsgs) > 0 && newMsgs[len(newMsgs)-1]["role"] == "assistant" {
+		prefillText := extractPlainText(newMsgs[len(newMsgs)-1]["content"])
+		nudgeText := "Continue."
+		if prefillText != "" {
+			nudgeText = fmt.Sprintf(
+				"[SYSTEM NOTE: Your previous turn ended mid-output with this exact text, which the user already has: %q — continue DIRECTLY from the next character. Do not repeat, restate, or add any preamble before it; your reply must pick up exactly where that text left off.]",
+				prefillText,
+			)
+		}
 		newMsgs = append(newMsgs, map[string]interface{}{
 			"role": "user",
 			"content": []map[string]interface{}{
-				{"type": "text", "text": "Continue."},
+				{"type": "text", "text": nudgeText},
 			},
 		})
 		modified = true

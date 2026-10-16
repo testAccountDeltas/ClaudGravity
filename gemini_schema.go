@@ -284,6 +284,7 @@ func addAdditionalPropertiesHints(jsonStr string) string {
 
 var unsupportedConstraints = []string{
 	"minLength", "maxLength", "exclusiveMinimum", "exclusiveMaximum",
+	"minimum", "maximum", // MCP tools with numeric validators commonly set these; Gemini's schema doesn't document support for them
 	"pattern", "minItems", "maxItems", "format",
 	"default", "examples", // Claude rejects these in VALIDATED mode
 }

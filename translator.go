@@ -248,7 +248,13 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							part, _ = sjson.Set(part, "text", txt)
 							partsJSON = append(partsJSON, part)
 						}
-					case "image":
+					case "image", "document":
+						// "document" (PDF, added to Anthropic's API in Sep
+						// 2024) was falling into no case at all and being
+						// silently dropped — Gemini takes it the exact same
+						// way as an image: inlineData with the real
+						// mimeType (application/pdf here instead of
+						// image/*).
 						src := p.Get("source")
 						if src.Get("type").String() == "base64" {
 							mediaType := src.Get("media_type").String()
@@ -343,10 +349,10 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 								switch item.Get("type").String() {
 								case "text":
 									sb.WriteString(item.Get("text").String())
-								case "image":
+								case "image", "document":
 									// Previously dropped entirely (only "text"
 									// blocks were read), silently losing any
-									// screenshot/plot a tool returned.
+									// screenshot/plot/PDF a tool returned.
 									src := item.Get("source")
 									if src.Get("type").String() == "base64" {
 										mediaType := src.Get("media_type").String()
@@ -465,7 +471,13 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 
 		tools.ForEach(func(_, t gjson.Result) bool {
 			name := t.Get("name").String()
-			if strings.EqualFold(name, "WebSearch") || strings.EqualFold(name, "GoogleSearch") {
+			// Claude Code's real native tool is snake_case "web_search"
+			// (confirmed against websearch.go's own fast-path check, which
+			// matches that exact string) — "WebSearch"/"GoogleSearch" never
+			// matched it, so inline Gemini googleSearch grounding never
+			// actually activated for the one real tool name it exists for.
+			normName := strings.ToLower(strings.ReplaceAll(name, "_", ""))
+			if normName == "websearch" || normName == "googlesearch" {
 				hasWebSearch = true
 			}
 			if tenant.StripSearchTools && DropSearchTools[name] {
@@ -551,17 +563,24 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// 7. Thinking & Output Tokens Configuration with Dynamic Model Limits
 	modelMeta, hasMeta := globalModelCatalog.GetModel(modelName)
 
-	if budget != 0 {
-		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.includeThoughts", true)
-		if budget > 0 {
-			if hasMeta && modelMeta.MinThinkingBudget > 0 && budget < modelMeta.MinThinkingBudget {
-				budget = modelMeta.MinThinkingBudget
-			}
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", budget)
-		} else {
-			// -1 enables ModeAuto unbracketed
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", -1)
+	// budget==0 used to be unreachable (the effort-based switch in
+	// tiering.go never produced it) and this block simply skipped itself
+	// for it. It's now a real, deliberate signal too — the standard
+	// Anthropic "thinking": {"type": "disabled"} request maps to it — so
+	// it must still send an explicit thinkingBudget:0 rather than fall
+	// through to Gemini's own default (models that think by default would
+	// otherwise keep thinking with no cap at all).
+	out, _ = sjson.Set(out, "generationConfig.thinkingConfig.includeThoughts", budget != 0)
+	if budget > 0 {
+		if hasMeta && modelMeta.MinThinkingBudget > 0 && budget < modelMeta.MinThinkingBudget {
+			budget = modelMeta.MinThinkingBudget
 		}
+		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", budget)
+	} else if budget < 0 {
+		// -1 enables ModeAuto unbracketed
+		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", -1)
+	} else {
+		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", 0)
 	}
 
 	// 6.5 Carry over sampling hyperparameters: previously dropped entirely,
