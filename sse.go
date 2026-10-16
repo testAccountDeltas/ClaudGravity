@@ -24,6 +24,63 @@ func nextToolCallID(name string) string {
 	return fmt.Sprintf("toolu_%s_%d_%d", name, time.Now().UnixNano(), toolCallSeq.Add(1))
 }
 
+const (
+	toolSignatureStaleAfter = 2 * time.Hour
+	toolSignatureSweepEvery = 30 * time.Minute
+)
+
+// toolSignatureCache remembers the real Gemini thoughtSignature attached to
+// a functionCall part, keyed by that call's own tool_use id. Anthropic's
+// tool_use content block has no signature field to round-trip it through
+// Claude Code itself (unlike "thinking" blocks, which do) — this is the only
+// way to recover the real signature when that same tool_use id is echoed
+// back on a later turn, instead of always falling back to Google's
+// "skip_thought_signature_validator" bypass, which its own docs warn
+// degrades reasoning quality across multi-turn tool-calling chains.
+var (
+	toolSignatureMu   sync.Mutex
+	toolSignatureMap  = make(map[string]string)
+	toolSignatureSeen = make(map[string]time.Time)
+)
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(toolSignatureSweepEvery)
+		defer ticker.Stop()
+		for range ticker.C {
+			sweepStaleToolSignatures()
+		}
+	}()
+}
+
+func sweepStaleToolSignatures() {
+	toolSignatureMu.Lock()
+	defer toolSignatureMu.Unlock()
+	cutoff := time.Now().Add(-toolSignatureStaleAfter)
+	for id, t := range toolSignatureSeen {
+		if t.Before(cutoff) {
+			delete(toolSignatureSeen, id)
+			delete(toolSignatureMap, id)
+		}
+	}
+}
+
+func setToolSignature(callID, signature string) {
+	if callID == "" || signature == "" {
+		return
+	}
+	toolSignatureMu.Lock()
+	defer toolSignatureMu.Unlock()
+	toolSignatureMap[callID] = signature
+	toolSignatureSeen[callID] = time.Now()
+}
+
+func getToolSignature(callID string) string {
+	toolSignatureMu.Lock()
+	defer toolSignatureMu.Unlock()
+	return toolSignatureMap[callID]
+}
+
 type SSEStreamer struct {
 	w                   http.ResponseWriter
 	flusher             http.Flusher
@@ -244,7 +301,7 @@ func (s *SSEStreamer) HandleText(text string) error {
 	return s.SendRaw("content_block_delta", string(b))
 }
 
-func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string) error {
+func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSignature string) error {
 	if repaired, ok := RepairEditToolCall(name, argsRaw, s.sessionID); ok {
 		argsRaw = repaired
 	}
@@ -262,6 +319,7 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string) error {
 
 	callID := nextToolCallID(name)
 	s.toolCallIDs = append(s.toolCallIDs, callID)
+	setToolSignature(callID, thoughtSignature)
 
 	startPayload := map[string]interface{}{
 		"type":  "content_block_start",
@@ -426,7 +484,7 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 				if args == "" {
 					args = "{}"
 				}
-				if err := s.HandleFunctionCall(name, args); err != nil {
+				if err := s.HandleFunctionCall(name, args, part.Get("thoughtSignature").String()); err != nil {
 					return err
 				}
 			} else if t := part.Get("text").String(); t != "" {

@@ -14,6 +14,18 @@ var DropSearchTools = map[string]bool{
 	"Glob": true,
 }
 
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // sealFunctionResponseTurn enforces Gemini's "a turn carrying a
 // functionResponse must contain ONLY functionResponse parts" rule (the same
 // constraint already handled for LoopGuard nudges in loopguard.go and for
@@ -218,7 +230,18 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						if argsRaw == "" {
 							argsRaw = "{}"
 						}
-						part := `{"thoughtSignature":"skip_thought_signature_validator","functionCall":{"name":"","args":{}}}`
+						// Prefer the real signature this exact call was
+						// originally emitted with (cached in sse.go/
+						// server.go when we first sent it) over the
+						// skip-validator bypass — Anthropic's tool_use
+						// schema has no field to round-trip it through the
+						// client itself, unlike "thinking" blocks.
+						sig := getToolSignature(callID)
+						if sig == "" {
+							sig = "skip_thought_signature_validator"
+						}
+						part := `{"thoughtSignature":"","functionCall":{"name":"","args":{}}}`
+						part, _ = sjson.Set(part, "thoughtSignature", sig)
 						part, _ = sjson.Set(part, "functionCall.name", name)
 						if callID != "" {
 							part, _ = sjson.Set(part, "functionCall.id", callID)
@@ -230,7 +253,38 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						toolUseID := p.Get("tool_use_id").String()
 						fnName := toolIDToName[toolUseID]
 						if fnName == "" {
-							fnName = "tool"
+							// Map miss (its tool_use fell outside a
+							// truncated context window, or a subagent
+							// history desync) previously fell back to the
+							// literal string "tool" — Gemini validates
+							// functionResponse.name against the declared
+							// tools and rejects anything not in that list
+							// with a guaranteed 400. Recover the real name
+							// from our own id format first: "toolu_<name>_
+							// <nanots>_<seq>" (see nextToolCallID in
+							// sse.go). Can't just split on "_" since a tool
+							// name may itself contain underscores — strip
+							// the trailing two purely-numeric segments
+							// instead of guessing which piece is the name.
+							if rest, ok := strings.CutPrefix(toolUseID, "toolu_"); ok {
+								segs := strings.Split(rest, "_")
+								end := len(segs)
+								for end > 0 && isAllDigits(segs[end-1]) {
+									end--
+								}
+								if end > 0 {
+									fnName = strings.Join(segs[:end], "_")
+								}
+							}
+							if fnName == "" {
+								// Last resort: any declared tool at least
+								// matches Google's validation; "tool" never
+								// does.
+								fnName = root.Get("tools.0.name").String()
+							}
+							if fnName == "" {
+								fnName = "tool"
+							}
 						}
 
 						resText := ""
@@ -567,15 +621,26 @@ func ScrubBillingHeader(txt string) string {
 			continue
 		}
 
-		// Filter heavy repetitive environment sections
+		// Filter heavy repetitive environment sections — but the section
+		// also carries the model's only signal for which OS/shell it's
+		// actually running on (Platform/Shell/working directory). Dropping
+		// it wholesale previously left Gemini guessing, and it would guess
+		// Unix (export, ls, grep) on a Windows box as often as not.
 		if trimmed == "# Environment" {
 			skipSection = true
+			cleanLines = append(cleanLines, line)
 			continue
 		}
 		if skipSection {
 			if strings.HasPrefix(trimmed, "# ") {
 				skipSection = false
 			} else {
+				if strings.Contains(lower, "platform:") ||
+					strings.Contains(lower, "shell:") ||
+					strings.Contains(lower, "os version:") ||
+					strings.Contains(lower, "working directory:") {
+					cleanLines = append(cleanLines, line)
+				}
 				continue
 			}
 		}

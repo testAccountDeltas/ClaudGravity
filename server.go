@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 var (
@@ -351,6 +352,27 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	// fallback that would otherwise need geminiBody is a last-resort content
 	// hash, and bodyBytes is an equally stable stand-in for that.
 	sessionID := DeriveSessionID(r, bodyBytes, bodyBytes)
+
+	// Native 3P model names (claude-sonnet-4-6 etc.) pass through
+	// tiering.go's ResolveTieringAndEffort unchanged — fine when the
+	// account serving this request has 3P quota, but free-tier accounts
+	// commonly sit at 0% there while Gemini itself is wide open. Account
+	// selection for the real request happens further below (translation
+	// has to run first — it decides the model that selection routes on),
+	// so this peeks the conversation's already-sticky account, if any, to
+	// catch the common case: an established multi-turn chat that's about
+	// to land back on the same exhausted account it was already using.
+	reqModel := gjson.GetBytes(bodyBytes, "model").String()
+	if reqModel == "claude-sonnet-4-6" || reqModel == "claude-opus-4-6-thinking" || reqModel == "gpt-oss-120b-medium" {
+		if peekEmail := globalSelector.GetAffinityAccount(convAnchor); peekEmail != "" {
+			if peekAcc, ok := globalAccountManager.GetAccount(peekEmail); ok && isNative3PModelExhausted(peekAcc) {
+				if patched, err := sjson.SetBytes(bodyBytes, "model", "gemini-3.8-flash-tiered"); err == nil {
+					LogGateway("[#%d] !! Native 3P model %s has exhausted quota on sticky account %s, remapping to gemini-3.8-flash-tiered", rid, reqModel, peekEmail)
+					bodyBytes = patched
+				}
+			}
+		}
+	}
 
 	// 3. Full Orchestrator Translation: Tiering, LoopGuard, Middle-Truncation 64KB, Sanitizer
 	geminiBody, modelName, budget, wasShrunk, err := ConvertClaudeRequestToGemini(bodyBytes, tenant, reqClass, agentKey, sessionID, instanceID)
@@ -1032,6 +1054,7 @@ func executeNonStreaming(
 					toolsCalled = append(toolsCalled, fname)
 					callID := nextToolCallID(fname)
 					toolCallIDs = append(toolCallIDs, callID)
+					setToolSignature(callID, p.Get("thoughtSignature").String())
 					claudeResp["content"] = append(claudeResp["content"].([]map[string]interface{}), map[string]interface{}{
 						"type":  "tool_use",
 						"id":    callID,
@@ -1211,6 +1234,31 @@ func bucketToUsageWindow(b *QuotaBucket) map[string]interface{} {
 // unless the currently active request is explicitly targeting a 3P Claude/GPT model.
 // This prevents false 100% lockout displays in Claude Code when a 3P quota bucket
 // is exhausted while Gemini is 95%+ free.
+// isNative3PModelExhausted reports whether acc's own 3P (Claude/GPT) quota
+// group is exhausted. Native 3P model names (claude-sonnet-4-6 etc.) pass
+// straight through tiering.go's ResolveTieringAndEffort unchanged — fine
+// when the account has 3P quota, but on a free-tier account that's commonly
+// 0% while Gemini itself sits at 100%, which previously meant requests for
+// those models hit a guaranteed 429 instead of falling back to the
+// Gemini-mapped equivalent other claude-* models already get.
+func isNative3PModelExhausted(acc *AccountRecord) bool {
+	if acc == nil {
+		return false
+	}
+	for _, g := range acc.Quotas {
+		if !strings.Contains(strings.ToLower(g.DisplayName), "claude") {
+			continue
+		}
+		for _, b := range g.Buckets {
+			if b.RemainingFraction > 0.05 {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
 func pickFiveHourAndWeekly(acc *AccountRecord, modelName string) (fiveHour, weekly *QuotaBucket) {
 	if acc == nil || len(acc.Quotas) == 0 {
 		return nil, nil
