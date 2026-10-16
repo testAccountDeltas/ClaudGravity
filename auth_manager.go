@@ -535,6 +535,12 @@ func (am *AccountManager) TriggerAsyncQuotaRefresh(email string, maxAge time.Dur
 	}()
 }
 
+// RefreshAllQuotas refreshes every account's quota concurrently. FetchQuota
+// only ever holds am.mu for brief reads/writes, never across the actual
+// network round-trip, so refreshing N accounts one at a time bought nothing
+// but N sequential round-trips (noticeably slow on the dashboard's "Refresh
+// Quotas" button once there are more than a couple of accounts) — safe to
+// fire them all at once instead.
 func (am *AccountManager) RefreshAllQuotas() {
 	am.mu.RLock()
 	var emails []string
@@ -543,9 +549,15 @@ func (am *AccountManager) RefreshAllQuotas() {
 	}
 	am.mu.RUnlock()
 
+	var wg sync.WaitGroup
 	for _, e := range emails {
-		_ = am.FetchQuota(e)
+		wg.Add(1)
+		go func(email string) {
+			defer wg.Done()
+			_ = am.FetchQuota(email)
+		}(e)
 	}
+	wg.Wait()
 }
 
 func (am *AccountManager) GetAccount(email string) (*AccountRecord, bool) {
