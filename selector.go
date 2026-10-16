@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -18,21 +19,37 @@ const (
 	maxSessionAffinityEntries = 5000
 )
 
-type SessionAffinityEntry struct {
-	Email     string
-	ExpiresAt time.Time
+// affinityLRUEntry is the value stored in each affinityLRU list.Element.
+// Kept as a pointer-sized struct in the list itself (not a copy in the map)
+// so lookups, refreshes and moves are all O(1) without re-allocating.
+type affinityLRUEntry struct {
+	key       string
+	email     string
+	expiresAt time.Time
 }
 
 type AccountSelector struct {
-	mu            sync.Mutex
-	stickyMap     map[string]string               // apiKey -> assigned email (fallback)
-	affinityMap   map[string]SessionAffinityEntry // conversationAnchor / sessionID -> assigned email
+	mu        sync.Mutex
+	stickyMap map[string]string // apiKey -> assigned email (fallback)
+
+	// affinityLRU/affinityIdx together replace a plain
+	// map[string]SessionAffinityEntry. A bare Go map has no iteration
+	// order guarantee, so evicting "the oldest" out of it at capacity was
+	// actually evicting an arbitrary entry — on a long-lived server this
+	// could silently kick an ACTIVE conversation's account binding and
+	// force an avoidable Google-side prompt-cache reset. list.List gives a
+	// real most-recently-used-at-front order: MoveToFront on every hit,
+	// evict from Back() when full, so eviction is deterministic and always
+	// picks the conversation that's gone longest without being touched.
+	affinityLRU   *list.List               // front = most recently used
+	affinityIdx   map[string]*list.Element // conversationAnchor/sessionID -> its node in affinityLRU
 	roundRobinIdx int
 }
 
 var globalSelector = &AccountSelector{
 	stickyMap:   make(map[string]string),
-	affinityMap: make(map[string]SessionAffinityEntry),
+	affinityLRU: list.New(),
+	affinityIdx: make(map[string]*list.Element),
 }
 
 // DeriveConversationAnchor creates a stable identifier for a multi-turn conversation.
@@ -122,20 +139,20 @@ func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey
 
 	// 2. Session Affinity by Conversation Anchor (Highest Priority for prompt cache)
 	if conversationKey != "" {
-		if entry, ok := as.affinityMap[conversationKey]; ok {
-			if now.Before(entry.ExpiresAt) {
+		if el, ok := as.affinityIdx[conversationKey]; ok {
+			entry := el.Value.(*affinityLRUEntry)
+			if now.Before(entry.expiresAt) {
 				for _, acc := range accounts {
-					if acc.Email == entry.Email && !isExcluded(acc) && hasRemainingQuota(acc) {
-						// Refresh lease
-						as.affinityMap[conversationKey] = SessionAffinityEntry{
-							Email:     acc.Email,
-							ExpiresAt: now.Add(sessionAffinityTTL),
-						}
+					if acc.Email == entry.email && !isExcluded(acc) && hasRemainingQuota(acc) {
+						// Refresh lease and mark as most-recently-used.
+						entry.expiresAt = now.Add(sessionAffinityTTL)
+						as.affinityLRU.MoveToFront(el)
 						return acc, nil
 					}
 				}
 			} else {
-				delete(as.affinityMap, conversationKey)
+				as.affinityLRU.Remove(el)
+				delete(as.affinityIdx, conversationKey)
 			}
 		}
 	}
@@ -259,16 +276,19 @@ func (as *AccountSelector) GetOrAssignStickyAccount(apiKey string, tenant Tenant
 	return accounts[0]
 }
 
-// GetAffinityAccount returns the assigned email for a conversation anchor or session id.
+// GetAffinityAccount returns the assigned email for a conversation anchor or
+// session id. A pure peek — doesn't refresh the LRU position or TTL, since
+// callers use this to inspect the binding without necessarily acting on it.
 func (as *AccountSelector) GetAffinityAccount(conversationKey string) string {
 	if conversationKey == "" {
 		return ""
 	}
 	as.mu.Lock()
 	defer as.mu.Unlock()
-	if entry, ok := as.affinityMap[conversationKey]; ok {
-		if time.Now().Before(entry.ExpiresAt) {
-			return entry.Email
+	if el, ok := as.affinityIdx[conversationKey]; ok {
+		entry := el.Value.(*affinityLRUEntry)
+		if time.Now().Before(entry.expiresAt) {
+			return entry.email
 		}
 	}
 	return ""
@@ -288,31 +308,31 @@ func (as *AccountSelector) bindAffinityLocked(key, email string, now time.Time) 
 	if key == "" || email == "" {
 		return
 	}
-	if len(as.affinityMap) >= maxSessionAffinityEntries {
-		// Evict expired entries
-		for k, e := range as.affinityMap {
-			if now.After(e.ExpiresAt) {
-				delete(as.affinityMap, k)
-			}
-		}
-		// If still full, drop an arbitrary ~10% (Go map iteration order is
-		// randomized, not insertion order, so this isn't actually "oldest" —
-		// it's a cheap approximation that's fine for a soft cache eviction)
-		if len(as.affinityMap) >= maxSessionAffinityEntries {
-			count := 0
-			for k := range as.affinityMap {
-				delete(as.affinityMap, k)
-				count++
-				if count >= maxSessionAffinityEntries/10 {
-					break
-				}
-			}
-		}
+
+	// Already bound: update in place and promote to most-recently-used.
+	if el, ok := as.affinityIdx[key]; ok {
+		entry := el.Value.(*affinityLRUEntry)
+		entry.email = email
+		entry.expiresAt = now.Add(sessionAffinityTTL)
+		as.affinityLRU.MoveToFront(el)
+		return
 	}
-	as.affinityMap[key] = SessionAffinityEntry{
-		Email:     email,
-		ExpiresAt: now.Add(sessionAffinityTTL),
+
+	// New binding: make room first. Evict from the real tail (truly
+	// least-recently-used, not a random map entry) — expired ones first,
+	// since those are free wins, then plain LRU order if still full.
+	for len(as.affinityIdx) >= maxSessionAffinityEntries {
+		back := as.affinityLRU.Back()
+		if back == nil {
+			break
+		}
+		be := back.Value.(*affinityLRUEntry)
+		as.affinityLRU.Remove(back)
+		delete(as.affinityIdx, be.key)
 	}
+
+	entry := &affinityLRUEntry{key: key, email: email, expiresAt: now.Add(sessionAffinityTTL)}
+	as.affinityIdx[key] = as.affinityLRU.PushFront(entry)
 }
 
 func hasRemainingQuota(acc *AccountRecord) bool {
@@ -363,9 +383,13 @@ func (as *AccountSelector) UnstickAccount(email string) {
 			delete(as.stickyMap, k)
 		}
 	}
-	for k, v := range as.affinityMap {
-		if v.Email == email {
-			delete(as.affinityMap, k)
+	for el := as.affinityLRU.Front(); el != nil; {
+		next := el.Next()
+		entry := el.Value.(*affinityLRUEntry)
+		if entry.email == email {
+			as.affinityLRU.Remove(el)
+			delete(as.affinityIdx, entry.key)
 		}
+		el = next
 	}
 }
