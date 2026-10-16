@@ -29,6 +29,33 @@ var AntigravityHosts = []string{
 	"https://cloudcode-pa.googleapis.com",
 }
 
+// antigravityHosts is the fallback order for the main inference path
+// specifically — NOT the same list as AntigravityHosts (used only by the
+// one-off warmup probe, where hitting production once is low-stakes).
+// Sandbox first: the plain daily host throttles far more readily (measured
+// independently in clirelay: the daily host rate-limited requests the
+// sandbox host then served without complaint). Production is deliberately
+// excluded: it answers every request from a free-tier account with
+// `429 RESOURCE_EXHAUSTED`, and a 429 here trips MarkAccountCooldown,
+// poisoning every subsequent request on this account for 15 minutes — a
+// host that only ever says "quota" can never serve the caller that just
+// got location-gated in the first place.
+var antigravityHosts = []string{
+	"https://daily-cloudcode-pa.sandbox.googleapis.com",
+	"https://daily-cloudcode-pa.googleapis.com",
+}
+
+// isAntigravityLocationGateError reports whether an upstream response is a
+// verdict on which exit host answered ("User location is not supported for
+// the API use") rather than on the request itself — worth another host, not
+// a hard failure.
+func isAntigravityLocationGateError(status int, errText string) bool {
+	if status != http.StatusBadRequest || errText == "" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(errText), "user location is not supported")
+}
+
 // WrapAntigravityPayload wraps a Gemini request for the Antigravity envelope.
 // generation selects which deterministic session bucket to use: 0 is the
 // conversation's normal, stable bucket (same every call, for prompt-cache
@@ -104,7 +131,8 @@ func isSessionTokenWallError(status int, errText string) bool {
 	}
 	lower := strings.ToLower(errText)
 	return strings.Contains(lower, "exceeds the maximum number of tokens") ||
-		strings.Contains(lower, "exceeds the maximum number of token")
+		strings.Contains(lower, "exceeds the maximum number of token") ||
+		strings.Contains(lower, "1048576")
 }
 
 // WarmupSingleAccount sends a 1-token lightweight query to activate the account's 7-day window.

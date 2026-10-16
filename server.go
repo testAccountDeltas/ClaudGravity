@@ -341,48 +341,65 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			}
 		}
 
-		// Prepare upstream URL
-		var upstreamURL string
-
-		if isAntigravity {
-			host := "https://daily-cloudcode-pa.sandbox.googleapis.com"
-			if isStreaming {
-				upstreamURL = host + "/v1internal:streamGenerateContent?alt=sse"
-			} else {
-				upstreamURL = host + "/v1internal:generateContent"
-			}
-		} else {
+		// Non-Antigravity upstream URL is fixed for the whole attempt; for
+		// Antigravity it's rebuilt per host inside the retry loop below.
+		var directURL string
+		if !isAntigravity {
 			baseURL := tenant.GoogleBaseURL
 			if baseURL == "" {
 				baseURL = "https://generativelanguage.googleapis.com"
 			}
 			if isStreaming {
-				upstreamURL = fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", baseURL, modelName)
+				directURL = fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", baseURL, modelName)
 			} else {
-				upstreamURL = fmt.Sprintf("%s/v1beta/models/%s:generateContent", baseURL, modelName)
+				directURL = fmt.Sprintf("%s/v1beta/models/%s:generateContent", baseURL, modelName)
 			}
 			if tenant.GoogleAPIKey != "" {
-				if strings.Contains(upstreamURL, "?") {
-					upstreamURL += "&key=" + tenant.GoogleAPIKey
+				if strings.Contains(directURL, "?") {
+					directURL += "&key=" + tenant.GoogleAPIKey
 				} else {
-					upstreamURL += "?key=" + tenant.GoogleAPIKey
+					directURL += "?key=" + tenant.GoogleAPIKey
 				}
 			}
 		}
 
-		// Session-bump retry loop: Google's per-session cache bucket has a
-		// hard ~1,048,576-token wall independent of any particular model's
-		// context window. context_window.go's proactive truncation already
-		// targets each model's REAL ceiling, but that's an estimate — if it
-		// still undershoots and this exact wall gets hit, don't throw away
-		// the conversation (that's what truncation already tried to avoid)
-		// and don't burn an account-rotation slot on it either: just re-send
-		// the identical request on a freshly-bumped, deterministic session
-		// bucket for the SAME account. (Same fix independently proven out in
-		// clirelay's antigravity_session_bump — see warmup.go.)
+		// Combined host-fallback + session-bump retry loop, same account,
+		// same conversation, two independent recovery strategies for two
+		// distinct upstream signals (both confirmed real via measurement in
+		// the clirelay project, which solves the identical problem for the
+		// identical upstream):
+		//
+		//  - Location gate (400 "User location is not supported for the API
+		//    use"): a verdict on which EXIT HOST answered, not on the
+		//    request. Move to the next host in antigravityHosts and resend
+		//    unchanged. Production is deliberately excluded from that list —
+		//    it answers free-tier accounts with 429 RESOURCE_EXHAUSTED on
+		//    every single request, and a 429 trips this gateway's own
+		//    account cooldown, poisoning requests that follow.
+		//  - Session token-wall (400 "...exceeds the maximum number of
+		//    tokens...", ~1,048,576): a verdict on the upstream session
+		//    cache bucket, not on the conversation. context_window.go's
+		//    proactive truncation targets each model's real ceiling, but
+		//    it's an estimate; if it still undershoots, bump the
+		//    deterministic session id instead of losing history or burning
+		//    an account-rotation slot on it.
 		const maxSessionBumps = 2
+		const maxLocationGatePasses = 2 // full passes over antigravityHosts
+		hostIdx := 0
+		locationGatePasses := 0
+		bump := 0
 		var success bool
-		for bump := 0; bump <= maxSessionBumps; bump++ {
+		for {
+			upstreamURL := directURL
+			if isAntigravity {
+				host := antigravityHosts[hostIdx]
+				if isStreaming {
+					upstreamURL = host + "/v1internal:streamGenerateContent?alt=sse"
+				} else {
+					upstreamURL = host + "/v1internal:generateContent"
+				}
+			}
+
 			var finalPayload []byte
 			if isAntigravity {
 				finalPayload = WrapAntigravityPayload(modelName, geminiBody, projectID, bump)
@@ -399,10 +416,35 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, wasShrunk, hasSafeguards, w)
 			}
 
-			if success || !isAntigravity || bump == maxSessionBumps || !isSessionTokenWallError(lastStatus, fmt.Sprint(lastErr)) {
+			if success || !isAntigravity {
 				break
 			}
-			LogGateway("[#%d] !! Session token-wall (~1,048,576) hit on %s, bumping to a fresh session bucket and retrying same account", rid, accLabel)
+			errText := fmt.Sprint(lastErr)
+
+			if isAntigravityLocationGateError(lastStatus, errText) {
+				hostIdx++
+				if hostIdx >= len(antigravityHosts) {
+					hostIdx = 0
+					locationGatePasses++
+				}
+				if locationGatePasses >= maxLocationGatePasses {
+					LogGateway("[#%d] !! Location gate exhausted all hosts %d time(s) on %s, giving up on this account", rid, locationGatePasses, accLabel)
+					break
+				}
+				LogGateway("[#%d] !! Location gate on %s, retrying on next host (%s)", rid, accLabel, antigravityHosts[hostIdx])
+				continue
+			}
+
+			if isSessionTokenWallError(lastStatus, errText) {
+				if bump >= maxSessionBumps {
+					break
+				}
+				bump++
+				LogGateway("[#%d] !! Session token-wall (~1,048,576) hit on %s, bumping to a fresh session bucket and retrying same account", rid, accLabel)
+				continue
+			}
+
+			break
 		}
 
 		if success {
