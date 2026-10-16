@@ -163,12 +163,15 @@ func (cm *ConfigManager) CreateAPIKey(name string, stickyAccount string, strateg
 		GoogleBaseURL:    "https://daily-cloudcode-pa.sandbox.googleapis.com",
 		DefaultModel:     model,
 		ThinkingBudget:   -1,
-		// Grep/Glob are Claude Code's own lightweight native functions (no
-		// shell subprocess on any OS). Stripping them forces Gemini onto
-		// Bash for search instead, which on Windows runs into chronic
-		// quoting/escaping breakage. The read-loop risk this was guarding
-		// against is already handled properly by LoopGuard.
-		StripSearchTools: false,
+		// Stripped by default: Grep/Glob's schema is rich enough (pattern,
+		// path, glob, output_mode, -i/-n/-A/-B/-C, context, multiline,
+		// head_limit, offset) that Gemini has real room to mangle a call —
+		// forgetting the one required "pattern" field, confusing which
+		// field a flag belongs in. Revisit once there's a defensive
+		// repair pass for these two tools (same idea as RepairEditToolCall)
+		// or concrete live evidence Gemini actually handles them cleanly
+		// through this schema.
+		StripSearchTools: true,
 		StickyAccount:    stickyAccount,
 		Strategy:         strategy,
 	}
