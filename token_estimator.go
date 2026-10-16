@@ -7,6 +7,54 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// detectRussianConversation checks the latest user-role message for Cyrillic
+// text, to pick which language gateway-synthesized strings use (the
+// grounding-sources footer, currently) — this text bypasses the model
+// entirely (built by the gateway itself after the model has already
+// finished, or instead of calling it), so the model has no chance to match
+// its own output language to it. The user's own latest message is the
+// freshest signal for "what language is this conversation in right now."
+func detectRussianConversation(bodyBytes []byte) bool {
+	msgs := gjson.GetBytes(bodyBytes, "messages")
+	if !msgs.IsArray() {
+		return false
+	}
+	arr := msgs.Array()
+	for i := len(arr) - 1; i >= 0; i-- {
+		m := arr[i]
+		if m.Get("role").String() != "user" {
+			continue
+		}
+		var text string
+		content := m.Get("content")
+		if content.Type == gjson.String {
+			text = content.String()
+		} else if content.IsArray() {
+			content.ForEach(func(_, block gjson.Result) bool {
+				if block.Get("type").String() == "text" {
+					text = block.Get("text").String()
+					return false
+				}
+				return true
+			})
+		}
+		if text == "" {
+			continue
+		}
+		cyrillic := 0
+		for _, r := range text {
+			if r >= 0x0400 && r <= 0x04FF {
+				cyrillic++
+				if cyrillic >= 3 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return false
+}
+
 // estimateApproxTokens computes a weighted character-to-token approximation
 // using Anthropic's BPE weight characteristics (ASCII, digits, punctuation, non-ASCII/CJK/Cyrillic).
 func estimateApproxTokens(text string) int {

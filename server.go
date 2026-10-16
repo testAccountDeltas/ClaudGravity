@@ -510,7 +510,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			if isStreaming {
 				success, lastStatus, lastErr = executeStreamingWithWatchdog(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes)
 			} else {
-				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w)
+				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes)
 			}
 
 			if success || !isAntigravity {
@@ -850,7 +850,8 @@ UpstreamReady:
 	// contract never sees input_tokens corrected later and would otherwise
 	// be stuck believing it was 0 for the whole conversation.
 	estInputTokens := estimateApproxClaudeTokens(claudeBodyBytes)
-	streamer := NewSSEStreamer(w, flusher, modelName, sessionID, hasSafeguards, estInputTokens)
+	preferRussian := detectRussianConversation(claudeBodyBytes)
+	streamer := NewSSEStreamer(w, flusher, modelName, sessionID, hasSafeguards, estInputTokens, preferRussian)
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	totalDur := time.Since(t0)
@@ -931,6 +932,7 @@ func executeNonStreaming(
 	wasShrunk bool,
 	hasSafeguards bool,
 	w http.ResponseWriter,
+	claudeBodyBytes []byte,
 ) (bool, int, error) {
 	// Unlike the streaming path (which has the panic/TTFT watchdog), this had
 	// no deadline at all — a hung upstream could block the request forever.
@@ -1070,7 +1072,11 @@ func executeNonStreaming(
 		if gm := cand.Get("groundingMetadata"); gm.Exists() {
 			if chunks := gm.Get("groundingChunks"); chunks.IsArray() && len(chunks.Array()) > 0 {
 				var sb strings.Builder
-				sb.WriteString("\n\n---\n**Источники Google Search:**\n")
+				if detectRussianConversation(claudeBodyBytes) {
+					sb.WriteString("\n\n---\n**Источники Google Search:**\n")
+				} else {
+					sb.WriteString("\n\n---\n**Google Search Sources:**\n")
+				}
 				seen := make(map[string]bool)
 				for _, c := range chunks.Array() {
 					uri := c.Get("web.uri").String()

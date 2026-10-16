@@ -108,6 +108,7 @@ type SSEStreamer struct {
 	hasFinished         bool
 	thoughtSignature    string // most recent thoughtSignature seen for the open thinking block, flushed as signature_delta on close
 	estInputTokens      int    // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
+	preferRussian       bool   // conversation's own language, detected from the user's latest message — picks which language gateway-synthesized text (grounding footer) uses, since that text bypasses the model entirely
 }
 
 type GroundingSource struct {
@@ -122,7 +123,7 @@ const (
 	TypeToolUse  = 3
 )
 
-func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int) *SSEStreamer {
+func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool) *SSEStreamer {
 	return &SSEStreamer{
 		w:                   w,
 		flusher:             flusher,
@@ -133,6 +134,7 @@ func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, s
 		sessionID:           sessionID,
 		requestedSafeguards: requestedSafeguards,
 		estInputTokens:      estInputTokens,
+		preferRussian:       preferRussian,
 	}
 }
 
@@ -527,7 +529,11 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 		// stricter SDK parsers.
 		if len(s.groundingSources) > 0 && !s.toolUseOccurred {
 			var sb strings.Builder
-			sb.WriteString("\n\n---\n**Источники Google Search:**\n")
+			if s.preferRussian {
+				sb.WriteString("\n\n---\n**Источники Google Search:**\n")
+			} else {
+				sb.WriteString("\n\n---\n**Google Search Sources:**\n")
+			}
 			seen := make(map[string]bool)
 			for _, src := range s.groundingSources {
 				if !seen[src.URI] {
