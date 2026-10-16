@@ -23,12 +23,13 @@ import (
 )
 
 var (
+	// Chrome-fingerprinted transport for every outbound call to Google
+	// (inference, OAuth, quotas, model catalog, web-search grounding): Go's
+	// own crypto/tls ClientHello doesn't match any real browser or the
+	// genuine Antigravity client, which is a JA3/JA4-level signal Google
+	// could filter on before the request content is even inspected.
 	httpClient = &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			IdleConnTimeout:     90 * time.Second,
-		},
+		Transport: newFingerprintedRoundTripper(),
 	}
 	reqCounter uint64
 	reqMu      sync.Mutex
