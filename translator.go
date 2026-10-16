@@ -24,6 +24,14 @@ import (
 // (agy.exe) isn't counter-evidence either way: its own tool palette has
 // no Grep/Glob-shaped tool at all — it searches via its own run_command
 // (shell), not through this specific schema.
+//
+// This isn't just theory: a sibling project (opencode, same Gemini 3.x
+// models) independently confirmed and live-tested the exact root cause —
+// Gemini reliably mishandles specialized multi-field search tools
+// (misplaces or drops the required "pattern" field) while handling one
+// general shell tool (a plain command string) correctly. Verified 3/3 and
+// on a real ~39-call project run with zero errors once grep/glob were
+// denied. Same fix there: deny the specialized tools, shell-only.
 var DropSearchTools = map[string]bool{
 	"Grep": true,
 	"Glob": true,
