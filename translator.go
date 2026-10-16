@@ -180,7 +180,12 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		}
 	}
 	if systemPrompt != "" {
-		out, _ = sjson.Set(out, "system_instruction.role", "user")
+		// Per Google's REST spec, system_instruction is just {"parts": [...]}
+		// — role is only meaningful on conversation turns in "contents",
+		// not here. CloudCode's internal protobuf parser tolerates the
+		// extra field (confirmed: this ran with it present for this whole
+		// session without issue), but the public Gemini Developer API path
+		// isn't worth the same risk for a field that was never required.
 		out, _ = sjson.Set(out, "system_instruction.parts.0.text", systemPrompt)
 	}
 

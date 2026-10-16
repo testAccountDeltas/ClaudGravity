@@ -416,6 +416,13 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	// computing total = input_tokens + cache_read_input_tokens (per
 	// Anthropic's own documented formula) sees the cache tokens twice, and
 	// the displayed cache-hit-rate comes out roughly half of the real one.
+	// If the stream ended (e.g. a dropped connection) without Gemini ever
+	// sending a final usageMetadata chunk, s.inputTokens stays at its zero
+	// value — falling back to 0 here would contradict the non-zero
+	// estInputTokens estimate message_start already told the client.
+	if s.inputTokens == 0 && s.estInputTokens > 0 {
+		s.inputTokens = int64(s.estInputTokens)
+	}
 	uncachedInputTokens := s.inputTokens - s.cacheTokens
 	if uncachedInputTokens < 0 {
 		uncachedInputTokens = 0
