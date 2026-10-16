@@ -123,7 +123,7 @@ func searchWithGoogleGrounding(ctx context.Context, query string, googleToken st
 		return nil, "", err
 	}
 
-	wrapped := WrapAntigravityPayload("gemini-2.5-flash", reqBytes, projectID)
+	wrapped := WrapAntigravityPayload("gemini-2.5-flash", reqBytes, projectID, 0)
 	endpointURL := "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:generateContent"
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpointURL, bytes.NewReader(wrapped))

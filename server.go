@@ -340,9 +340,8 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			}
 		}
 
-		// Prepare upstream URL and payload
+		// Prepare upstream URL
 		var upstreamURL string
-		var finalPayload []byte
 
 		if isAntigravity {
 			host := "https://daily-cloudcode-pa.sandbox.googleapis.com"
@@ -351,7 +350,6 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			} else {
 				upstreamURL = host + "/v1internal:generateContent"
 			}
-			finalPayload = WrapAntigravityPayload(modelName, geminiBody, projectID)
 		} else {
 			baseURL := tenant.GoogleBaseURL
 			if baseURL == "" {
@@ -369,17 +367,41 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 					upstreamURL += "?key=" + tenant.GoogleAPIKey
 				}
 			}
-			finalPayload = geminiBody
 		}
 
-		LogGateway("[#%d] >> POST /v1/messages [attempt %d/%d] key=%s account=%s model=%s thinkBudget=%d stream=%v bytes=%d [%s]",
-			rid, attempt+1, maxAttempts, tenant.Name, accLabel, modelName, budget, isStreaming, len(geminiBody), agentKey)
-
+		// Session-bump retry loop: Google's per-session cache bucket has a
+		// hard ~1,048,576-token wall independent of any particular model's
+		// context window. context_window.go's proactive truncation already
+		// targets each model's REAL ceiling, but that's an estimate — if it
+		// still undershoots and this exact wall gets hit, don't throw away
+		// the conversation (that's what truncation already tried to avoid)
+		// and don't burn an account-rotation slot on it either: just re-send
+		// the identical request on a freshly-bumped, deterministic session
+		// bucket for the SAME account. (Same fix independently proven out in
+		// clirelay's antigravity_session_bump — see warmup.go.)
+		const maxSessionBumps = 2
 		var success bool
-		if isStreaming {
-			success, lastStatus, lastErr = executeStreamingWithWatchdog(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, wasShrunk, hasSafeguards, w, flusher)
-		} else {
-			success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, wasShrunk, hasSafeguards, w)
+		for bump := 0; bump <= maxSessionBumps; bump++ {
+			var finalPayload []byte
+			if isAntigravity {
+				finalPayload = WrapAntigravityPayload(modelName, geminiBody, projectID, bump)
+			} else {
+				finalPayload = geminiBody
+			}
+
+			LogGateway("[#%d] >> POST /v1/messages [attempt %d/%d, session-gen %d] key=%s account=%s model=%s thinkBudget=%d stream=%v bytes=%d [%s]",
+				rid, attempt+1, maxAttempts, bump, tenant.Name, accLabel, modelName, budget, isStreaming, len(geminiBody), agentKey)
+
+			if isStreaming {
+				success, lastStatus, lastErr = executeStreamingWithWatchdog(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, wasShrunk, hasSafeguards, w, flusher)
+			} else {
+				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, wasShrunk, hasSafeguards, w)
+			}
+
+			if success || !isAntigravity || bump == maxSessionBumps || !isSessionTokenWallError(lastStatus, fmt.Sprint(lastErr)) {
+				break
+			}
+			LogGateway("[#%d] !! Session token-wall (~1,048,576) hit on %s, bumping to a fresh session bucket and retrying same account", rid, accLabel)
 		}
 
 		if success {

@@ -29,7 +29,15 @@ var AntigravityHosts = []string{
 	"https://cloudcode-pa.googleapis.com",
 }
 
-func WrapAntigravityPayload(modelName string, payload []byte, projectID string) []byte {
+// WrapAntigravityPayload wraps a Gemini request for the Antigravity envelope.
+// generation selects which deterministic session bucket to use: 0 is the
+// conversation's normal, stable bucket (same every call, for prompt-cache
+// reuse); bumping it (1, 2, ...) rotates to a fresh session bucket on the
+// SAME account/conversation, which is how a request recovers from Google's
+// per-session ~1,048,576-token wall (confirmed: this exact wall and recovery
+// pattern already exists, independently, in clirelay's
+// antigravity_session_bump — see sendAntigravityWithSessionBump below).
+func WrapAntigravityPayload(modelName string, payload []byte, projectID string, generation int) []byte {
 	var requestRaw string
 	if reqNode := gjson.GetBytes(payload, "request"); reqNode.IsObject() {
 		requestRaw = reqNode.Raw
@@ -49,14 +57,14 @@ func WrapAntigravityPayload(modelName string, payload []byte, projectID string) 
 	template, _ = sjson.SetRaw(template, "request", requestRaw)
 
 	// Derive stable session ID for prefix cache
-	sessionID := generateStableSessionID(payload)
+	sessionID := generateStableSessionID(payload, generation)
 	template, _ = sjson.Set(template, "request.sessionId", sessionID)
 	template, _ = sjson.Delete(template, "request.safetySettings")
 
 	return []byte(template)
 }
 
-func generateStableSessionID(payload []byte) string {
+func generateStableSessionID(payload []byte, generation int) string {
 	contents := gjson.GetBytes(payload, "request.contents")
 	if !contents.Exists() {
 		contents = gjson.GetBytes(payload, "contents")
@@ -66,8 +74,16 @@ func generateStableSessionID(payload []byte) string {
 			if content.Get("role").String() == "user" {
 				text := content.Get("parts.0.text").String()
 				if text != "" {
-					h := sha256.Sum256([]byte(text))
-					n := int64(binary.BigEndian.Uint64(h[:8])) & 0x7FFFFFFFFFFFFFFF
+					h := sha256.New()
+					h.Write([]byte(text))
+					if generation > 0 {
+						// Deterministic-but-distinct per generation: same
+						// conversation keeps hitting the SAME bumped bucket
+						// on retry (idempotent), without colliding with gen 0.
+						fmt.Fprintf(h, ":gen%d", generation)
+					}
+					sum := h.Sum(nil)
+					n := int64(binary.BigEndian.Uint64(sum[:8])) & 0x7FFFFFFFFFFFFFFF
 					return "-" + strconv.FormatInt(n, 10)
 				}
 			}
@@ -77,6 +93,18 @@ func generateStableSessionID(payload []byte) string {
 	n := randGen.Int63n(9_000_000_000_000_000_000)
 	randMu.Unlock()
 	return "-" + strconv.FormatInt(n, 10)
+}
+
+// isSessionTokenWallError matches Google's "per-session ~1,048,576-token
+// wall" 400 error — distinct from a genuine too-large-request rejection or a
+// 429 quota error, neither of which a session bump can fix.
+func isSessionTokenWallError(status int, errText string) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	lower := strings.ToLower(errText)
+	return strings.Contains(lower, "exceeds the maximum number of tokens") ||
+		strings.Contains(lower, "exceeds the maximum number of token")
 }
 
 // WarmupSingleAccount sends a 1-token lightweight query to activate the account's 7-day window.
@@ -95,7 +123,7 @@ func (am *AccountManager) WarmupSingleAccount(ctx context.Context, email string)
 	}
 
 	rawRequest := `{"contents":[{"role":"user","parts":[{"text":"1"}]}],"generationConfig":{"maxOutputTokens":1}}`
-	wrapped := WrapAntigravityPayload("gemini-2.5-flash", []byte(rawRequest), acc.ProjectID)
+	wrapped := WrapAntigravityPayload("gemini-2.5-flash", []byte(rawRequest), acc.ProjectID, 0)
 
 	var lastErr error
 	for _, host := range AntigravityHosts {

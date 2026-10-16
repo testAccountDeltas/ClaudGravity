@@ -192,7 +192,7 @@ func DeriveSessionID(r *http.Request, bodyBytes []byte, geminiBody []byte) strin
 		}
 	}
 
-	rawSess := generateStableSessionID(geminiBody)
+	rawSess := generateStableSessionID(geminiBody, 0)
 	rawClean := strings.TrimPrefix(rawSess, "-")
 	if len(rawClean) > 8 {
 		rawClean = rawClean[:8]
