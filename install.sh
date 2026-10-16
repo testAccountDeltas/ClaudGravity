@@ -44,7 +44,7 @@ say "Параметры шлюза"
 
 GATEWAY_URL="${CLAUDGRAVITY_URL:-}"
 if [ -z "$GATEWAY_URL" ]; then
-  read -rp "Адрес шлюза (например 72.56.108.240 или 72.56.108.240:8898): " GATEWAY_URL
+  read -rp "Адрес шлюза (например 203.0.113.10 или 203.0.113.10:8898): " GATEWAY_URL
 fi
 GATEWAY_URL="${GATEWAY_URL%/}"
 GATEWAY_URL="${GATEWAY_URL#http://}"
