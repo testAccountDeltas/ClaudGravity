@@ -966,6 +966,13 @@ table.clean-table tr:hover td {
         </div>
         <div class="agent-pill-stat" id="statReviewerTurns">0</div>
       </div>
+      <div class="agent-pill-card" onclick="filterBySubagentTag('general-purpose', this)">
+        <div class="agent-pill-info">
+          <span class="agent-pill-title"><span class="tag-badge subagent">General</span> Основной рабочий</span>
+          <span class="agent-pill-meta" id="statGeneralTokens">0 токенов</span>
+        </div>
+        <div class="agent-pill-stat" id="statGeneralTurns">0</div>
+      </div>
     </div>
 
     <!-- Master / Detail Split Area -->
@@ -1312,6 +1319,8 @@ function logRowMatchesFilter(el, query) {
     match = agent.includes('architect');
   } else if (activeFilter === 'reviewer') {
     match = agent.includes('review');
+  } else if (activeFilter === 'general-purpose') {
+    match = agent.includes('general');
   } else if (activeFilter === 'errors') {
     match = isError;
   }
@@ -1447,6 +1456,7 @@ function updateSubagentsSummary() {
   let expTurns = 0, expTok = 0;
   let archTurns = 0, archTok = 0;
   let revTurns = 0, revTok = 0;
+  let genTurns = 0, genTok = 0;
   let allTurns = logs.length;
   let allTok = 0;
 
@@ -1461,6 +1471,8 @@ function updateSubagentsSummary() {
       archTurns++; archTok += tok;
     } else if (key.includes('review')) {
       revTurns++; revTok += tok;
+    } else if (key.includes('general')) {
+      genTurns++; genTok += tok;
     }
   });
 
@@ -1475,6 +1487,9 @@ function updateSubagentsSummary() {
 
   document.getElementById('statReviewerTurns').innerText = revTurns;
   document.getElementById('statReviewerTokens').innerText = formatCompactTokens(revTok);
+
+  document.getElementById('statGeneralTurns').innerText = genTurns;
+  document.getElementById('statGeneralTokens').innerText = formatCompactTokens(genTok);
 
   document.getElementById('tabCountLogs').innerText = allTurns;
 }

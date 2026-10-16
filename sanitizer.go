@@ -239,48 +239,56 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 		}
 	}
 
-	// Synthesize answers for abandoned tool_uses
-	var unanswered []string
-	for _, m := range newMsgs {
-		if m["role"] == "assistant" {
-			blocks := m["content"].([]map[string]interface{})
-			for _, b := range blocks {
-				if b["type"] == "tool_use" {
-					if id, ok := b["id"].(string); ok && id != "" {
-						if !toolResultsSeen[id] {
-							unanswered = append(unanswered, id)
-						}
-					}
+	// Synthesize answers for abandoned tool_uses, immediately after the
+	// assistant turn that made them — not dumped at the end of the whole
+	// conversation. Gemini requires each functionCall to be closed by its
+	// functionResponse in the very next turn; stacking every recovered stub
+	// at the tail broke that for any orphaned call that wasn't in the very
+	// last assistant turn.
+	var rebuilt []map[string]interface{}
+	skipNext := false
+	for i, m := range newMsgs {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		rebuilt = append(rebuilt, m)
+
+		if m["role"] != "assistant" {
+			continue
+		}
+		var synths []map[string]interface{}
+		for _, b := range m["content"].([]map[string]interface{}) {
+			if b["type"] == "tool_use" {
+				if id, ok := b["id"].(string); ok && id != "" && !toolResultsSeen[id] {
+					synths = append(synths, map[string]interface{}{
+						"type":        "tool_result",
+						"tool_use_id": id,
+						"content":     "(recovered by proxy)",
+					})
 				}
 			}
 		}
-	}
-
-	if len(unanswered) > 0 {
-		var synths []map[string]interface{}
-		for _, tid := range unanswered {
-			synths = append(synths, map[string]interface{}{
-				"type":        "tool_result",
-				"tool_use_id": tid,
-				"content":     "(recovered by proxy)",
-			})
+		if len(synths) == 0 {
+			continue
 		}
-
-		lastMsg := newMsgs[len(newMsgs)-1]
-		if lastMsg["role"] == "assistant" {
-			newMsgs = append(newMsgs, map[string]interface{}{
+		modified = true
+		if i+1 < len(newMsgs) && newMsgs[i+1]["role"] == "user" {
+			nextBlocks := newMsgs[i+1]["content"].([]map[string]interface{})
+			merged := make([]map[string]interface{}, 0, len(synths)+len(nextBlocks))
+			merged = append(merged, synths...)
+			merged = append(merged, nextBlocks...)
+			newMsgs[i+1]["content"] = merged
+			rebuilt = append(rebuilt, newMsgs[i+1])
+			skipNext = true
+		} else {
+			rebuilt = append(rebuilt, map[string]interface{}{
 				"role":    "user",
 				"content": synths,
 			})
-		} else {
-			lastBlocks := lastMsg["content"].([]map[string]interface{})
-			merged := make([]map[string]interface{}, 0, len(synths)+len(lastBlocks))
-			merged = append(merged, synths...)
-			merged = append(merged, lastBlocks...)
-			lastMsg["content"] = merged
 		}
-		modified = true
 	}
+	newMsgs = rebuilt
 
 	if modified {
 		var genericList []interface{}

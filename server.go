@@ -35,6 +35,60 @@ var (
 	reqMu      sync.Mutex
 )
 
+const (
+	sessionBumpStaleAfter = 2 * time.Hour
+	sessionBumpSweepEvery = 30 * time.Minute
+)
+
+// sessionBumpMap remembers, per session, the last session-id "bump" that
+// got a long (>1M-token) conversation past the upstream session token-wall.
+// Without this, bump always restarted at 0 on every new HTTP request, so
+// every turn after the wall was first hit paid for a guaranteed-failing
+// bump=0 attempt before retrying with the bump that actually works.
+var (
+	sessionBumpMu   sync.Mutex
+	sessionBumpMap  = make(map[string]int)
+	sessionBumpSeen = make(map[string]time.Time)
+)
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(sessionBumpSweepEvery)
+		defer ticker.Stop()
+		for range ticker.C {
+			sweepStaleSessionBumps()
+		}
+	}()
+}
+
+func sweepStaleSessionBumps() {
+	sessionBumpMu.Lock()
+	defer sessionBumpMu.Unlock()
+	cutoff := time.Now().Add(-sessionBumpStaleAfter)
+	for sessionID, t := range sessionBumpSeen {
+		if t.Before(cutoff) {
+			delete(sessionBumpSeen, sessionID)
+			delete(sessionBumpMap, sessionID)
+		}
+	}
+}
+
+func getSessionBump(sessionID string) int {
+	sessionBumpMu.Lock()
+	defer sessionBumpMu.Unlock()
+	return sessionBumpMap[sessionID]
+}
+
+func setSessionBump(sessionID string, bump int) {
+	if sessionID == "" {
+		return
+	}
+	sessionBumpMu.Lock()
+	defer sessionBumpMu.Unlock()
+	sessionBumpMap[sessionID] = bump
+	sessionBumpSeen[sessionID] = time.Now()
+}
+
 // recoverMiddleware stops a panic in any single request from crashing the
 // whole process — previously nothing in this codebase called recover(), so
 // one bad request (malformed body, a nil-pointer edge case in translation,
@@ -186,13 +240,14 @@ func main() {
 	// trusts for MITM interception. Kept on a separate port from the CONNECT
 	// proxy above, since a CONNECT request line is sent as plain HTTP by
 	// convention — wrapping that same port in TLS would break proxying.
+	var tlsSrv *http.Server
 	if mitmCA != nil {
 		tlsPort := serverCfg.TLSPort
 		gwCert, err := mitmCA.GetCertificate(serverCfg.PublicHost)
 		if err != nil {
 			LogGateway("[SuperRelay Gateway] Warning: could not mint gateway TLS cert: %v", err)
 		} else {
-			tlsSrv := &http.Server{
+			tlsSrv = &http.Server{
 				Addr:      fmt.Sprintf(":%d", tlsPort),
 				Handler:   recoverMiddleware(mux),
 				TLSConfig: &tls.Config{Certificates: []tls.Certificate{gwCert}},
@@ -206,7 +261,11 @@ func main() {
 		}
 	}
 
-	// Graceful shutdown
+	// Graceful shutdown: previously only the plain HTTP/CONNECT server (srv)
+	// was shut down — the TLS API listener (tlsSrv, port 8900, what
+	// ANTHROPIC_BASE_URL actually points at) and the SQLite log store kept
+	// running until the process was killed outright, leaving in-flight TLS
+	// requests cut off mid-response and the WAL file uncheckpointed.
 	go func() {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -215,6 +274,10 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
+		if tlsSrv != nil {
+			_ = tlsSrv.Shutdown(ctx)
+		}
+		globalLogStore.Close()
 	}()
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -283,8 +346,14 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Derived before translation (geminiBody doesn't exist yet) so the
+	// LoopGuard key below can be scoped to this one conversation: its only
+	// fallback that would otherwise need geminiBody is a last-resort content
+	// hash, and bodyBytes is an equally stable stand-in for that.
+	sessionID := DeriveSessionID(r, bodyBytes, bodyBytes)
+
 	// 3. Full Orchestrator Translation: Tiering, LoopGuard, Middle-Truncation 64KB, Sanitizer
-	geminiBody, modelName, budget, wasShrunk, err := ConvertClaudeRequestToGemini(bodyBytes, tenant, reqClass, agentKey)
+	geminiBody, modelName, budget, wasShrunk, err := ConvertClaudeRequestToGemini(bodyBytes, tenant, reqClass, agentKey, sessionID, instanceID)
 	if err != nil {
 		LogGateway("[#%d] Translation error: %v", rid, err)
 		http.Error(w, fmt.Sprintf(`{"error":{"message":"Translation error: %v"}}`, err), http.StatusBadRequest)
@@ -293,7 +362,6 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 
 	isStream := gjson.GetBytes(bodyBytes, "stream").Bool()
 	serverCfg := cfgMgr.GetServerConfig()
-	sessionID := DeriveSessionID(r, bodyBytes, geminiBody)
 	// Auto-detect and record session working directory for Edit repair
 	if cwd := ExtractCWDFromSystemPrompt(gjson.GetBytes(bodyBytes, "system").Raw); cwd != "" {
 		RecordSessionCWD(sessionID, cwd)
@@ -389,7 +457,12 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		const maxLocationGatePasses = 2 // full passes over antigravityHosts
 		hostIdx := 0
 		locationGatePasses := 0
-		bump := 0
+		// Start from this session's last-known-good bump instead of 0: once a
+		// long (>1M-token) conversation has hit the session token-wall once,
+		// every later turn would otherwise repeat the same failing bump=0
+		// attempt first, burning a wasted round-trip on every single turn for
+		// the rest of the conversation instead of just the first one.
+		bump := getSessionBump(sessionID)
 		var success bool
 		for {
 			upstreamURL := directURL
@@ -442,6 +515,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 					break
 				}
 				bump++
+				setSessionBump(sessionID, bump)
 				LogGateway("[#%d] !! Session token-wall (~1,048,576) hit on %s, bumping to a fresh session bucket and retrying same account", rid, accLabel)
 				continue
 			}
@@ -760,10 +834,11 @@ UpstreamReady:
 			madeProgress = true
 		}
 	}
-	globalLoopGuard.RecordReadTurn(agentKey, readCount, madeProgress)
+	loopKey := agentKey + "|" + sessionID + "|" + instanceID
+	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress)
 
 	hasIgnoreTag := strings.Contains(streamer.lastText, OscIgnoreTag)
-	globalLoopGuard.RecordToolCalls(agentKey, streamer.toolCallSignatures, hasIgnoreTag)
+	globalLoopGuard.RecordToolCalls(loopKey, streamer.toolCallSignatures, hasIgnoreTag)
 
 	var hitRate float64
 	if streamer.inputTokens > 0 {

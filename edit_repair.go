@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/tidwall/gjson"
@@ -63,10 +64,42 @@ func isWithinSessionCWD(path, sessionID string) bool {
 // request. Unlike reading the gateway's own disk, this works identically
 // whether the gateway and the client share a filesystem or not -- the
 // history is already inside the request body.
+const (
+	// sessionSnapStaleAfter/sessionSnapSweepEvery bound the otherwise-
+	// unbounded growth of sessionSnapMap: without this, every file content
+	// a session has ever Read/Written stays in memory for the gateway's
+	// entire process lifetime, across every session that ever connected.
+	sessionSnapStaleAfter = 2 * time.Hour
+	sessionSnapSweepEvery = 30 * time.Minute
+)
+
 var (
 	sessionSnapLock sync.RWMutex
 	sessionSnapMap  = make(map[string]map[string]string) // sessionID -> filePath -> content
+	sessionSnapSeen = make(map[string]time.Time)          // sessionID -> last touch, for staleness sweeps
 )
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(sessionSnapSweepEvery)
+		defer ticker.Stop()
+		for range ticker.C {
+			sweepStaleSessionSnapshots()
+		}
+	}()
+}
+
+func sweepStaleSessionSnapshots() {
+	sessionSnapLock.Lock()
+	defer sessionSnapLock.Unlock()
+	cutoff := time.Now().Add(-sessionSnapStaleAfter)
+	for sessionID, t := range sessionSnapSeen {
+		if t.Before(cutoff) {
+			delete(sessionSnapSeen, sessionID)
+			delete(sessionSnapMap, sessionID)
+		}
+	}
+}
 
 func getSessionSnapshot(sessionID, path string) (string, bool) {
 	sessionSnapLock.RLock()
@@ -91,6 +124,7 @@ func setSessionSnapshot(sessionID, path, content string) {
 		sessionSnapMap[sessionID] = m
 	}
 	m[path] = content
+	sessionSnapSeen[sessionID] = time.Now()
 }
 
 // stripCatNPrefix reverses the Read tool's "cat -n"-style numbering

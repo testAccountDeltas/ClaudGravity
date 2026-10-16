@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -78,7 +79,7 @@ func (lg *LoopGuardManager) touchLocked(agentKey string) {
 // substantial amount of actual explanatory text/thinking — not just "let me
 // check X") wipes the window: that's real forward motion, not skimming.
 func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeProgress bool) {
-	if agentKey == "" || agentKey == "auxiliary" {
+	if agentKey == "" || agentKey == "auxiliary" || strings.HasPrefix(agentKey, "auxiliary|") {
 		return
 	}
 	lg.mu.Lock()
@@ -98,7 +99,7 @@ func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeP
 }
 
 func (lg *LoopGuardManager) CheckAndResetReadStreak(agentKey string) bool {
-	if agentKey == "" || agentKey == "auxiliary" {
+	if agentKey == "" || agentKey == "auxiliary" || strings.HasPrefix(agentKey, "auxiliary|") {
 		return false
 	}
 	lg.mu.Lock()
@@ -117,7 +118,7 @@ func (lg *LoopGuardManager) CheckAndResetReadStreak(agentKey string) bool {
 
 // RecordToolCalls records tool calls executed in this turn.
 func (lg *LoopGuardManager) RecordToolCalls(agentKey string, calls []string, hasIgnoreTag bool) {
-	if agentKey == "" || agentKey == "auxiliary" {
+	if agentKey == "" || agentKey == "auxiliary" || strings.HasPrefix(agentKey, "auxiliary|") {
 		return
 	}
 	lg.mu.Lock()
@@ -151,7 +152,7 @@ func (lg *LoopGuardManager) RecordToolCalls(agentKey string, calls []string, has
 }
 
 func (lg *LoopGuardManager) CheckAndResetOscillation(agentKey string) bool {
-	if agentKey == "" || agentKey == "auxiliary" {
+	if agentKey == "" || agentKey == "auxiliary" || strings.HasPrefix(agentKey, "auxiliary|") {
 		return false
 	}
 	lg.mu.Lock()

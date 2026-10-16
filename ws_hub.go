@@ -69,10 +69,8 @@ func (h *WSHub) run() {
 		case msg := <-h.broadcast:
 			h.mu.RLock()
 			for client := range h.clients {
-				select {
-				case client.send <- msg:
-				default:
-					// Slow client buffer full: unregister to avoid stalling
+				if !client.SafeSend(msg) {
+					// Closed or slow client buffer full: unregister to avoid stalling
 					go func(c *WSClient) {
 						h.unregister <- c
 					}(client)
@@ -88,10 +86,7 @@ func (h *WSHub) run() {
 			})
 			h.mu.RLock()
 			for client := range h.clients {
-				select {
-				case client.send <- pingEvent:
-				default:
-				}
+				client.SafeSend(pingEvent)
 			}
 			h.mu.RUnlock()
 		}
@@ -105,6 +100,25 @@ func (c *WSClient) Close() {
 		c.closed = true
 		close(c.send)
 		_ = c.ws.Close()
+	}
+}
+
+// SafeSend queues payload on the client's send channel, holding the same
+// mutex Close() uses so a send can never race a close(c.send) and panic.
+// Returns false if the client is already closed or its buffer is full
+// (slow client) — callers treat both as "drop/unregister", never as a
+// reason to send to the channel directly.
+func (c *WSClient) SafeSend(payload []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return false
+	}
+	select {
+	case c.send <- payload:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -169,10 +183,7 @@ func (h *WSHub) sendInitialSnapshot(client *WSClient) {
 		Data:      snapshot,
 	})
 	if err == nil {
-		select {
-		case client.send <- payload:
-		default:
-		}
+		client.SafeSend(payload)
 	}
 }
 

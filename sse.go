@@ -154,8 +154,12 @@ func (s *SSEStreamer) HandleThinking(text string) error {
 	}
 
 	deltaPayload := map[string]interface{}{
-		"type":     "thinking_delta",
-		"thinking": text,
+		"type":  "content_block_delta",
+		"index": s.currentIndex,
+		"delta": map[string]interface{}{
+			"type":     "thinking_delta",
+			"thinking": text,
+		},
 	}
 	s.thinkingChars += len(text)
 	b, _ := json.Marshal(deltaPayload)

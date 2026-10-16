@@ -87,6 +87,14 @@ type AccountRecord struct {
 	CooldownUntil   time.Time    `json:"cooldown_until"` // do not route requests until this time if quota exhausted
 	LastChecked     time.Time    `json:"last_checked"`
 	LastError       string       `json:"last_error"`
+
+	// refreshMu serializes RefreshAccessToken calls for this one account:
+	// without it, N concurrent requests on the same account (e.g. parallel
+	// subagents) each saw a pre-refresh AccessToken and all fired their own
+	// token-refresh HTTP round-trip. Holding this for the whole call means
+	// only the first caller hits the network; the rest block, then see the
+	// now-cached token and skip the request entirely.
+	refreshMu sync.Mutex
 }
 
 type AccountManager struct {
@@ -161,6 +169,21 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 	}
 	if acc.RefreshToken == "" {
 		return "", fmt.Errorf("account %s has no refresh token", email)
+	}
+
+	acc.refreshMu.Lock()
+	defer acc.refreshMu.Unlock()
+
+	// Re-check under this account's own lock: either we still have a valid
+	// cached token (no network call needed at all), or a concurrent caller
+	// already refreshed it while we were waiting for the lock above.
+	am.mu.RLock()
+	cachedToken := acc.AccessToken
+	cachedExpiry := acc.ExpiresAt
+	am.mu.RUnlock()
+	const refreshSafetyMargin = 60 * time.Second
+	if cachedToken != "" && time.Now().Add(refreshSafetyMargin).Before(cachedExpiry) {
+		return cachedToken, nil
 	}
 
 	data := url.Values{}
@@ -474,8 +497,18 @@ func (am *AccountManager) FetchQuota(email string) error {
 		})
 	}
 
+	// Only a Gemini-bucket exhaustion cools the whole account down: Gemini
+	// powers ~99% of requests and is what CooldownUntil gates in selector.go
+	// (account-wide, not per-model). A 3P (Claude/GPT) bucket can legitimately
+	// sit at 0% for days on a free-tier account while Gemini itself is still
+	// at 100% — letting that 3P exhaustion set CooldownUntil locked such
+	// accounts out of Gemini for up to the 3P bucket's own reset window
+	// (matches pickFiveHourAndWeekly's same "claude" vs "gemini" group split).
 	var maxCooldown time.Time
 	for _, g := range groups {
+		if strings.Contains(strings.ToLower(g.DisplayName), "claude") {
+			continue
+		}
 		for _, b := range g.Buckets {
 			if b.RemainingFraction <= 0.05 && b.ResetTime != "" {
 				if t, err := time.Parse(time.RFC3339Nano, b.ResetTime); err == nil {

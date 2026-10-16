@@ -16,7 +16,17 @@ var DropSearchTools = map[string]bool{
 
 // ConvertClaudeRequestToGemini converts an Anthropic Messages API payload into
 // a Google Gemini streamGenerateContent payload with full sanitization and tiering.
-func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqClass string, agentKey string) ([]byte, string, int, bool, error) {
+func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqClass string, agentKey string, sessionID string, instanceID string) ([]byte, string, int, bool, error) {
+	// loopKey disambiguates both across sessions and across parallel
+	// subagents within one session: agentKey alone (e.g. "sub:general-
+	// purpose") is shared by every concurrent instance of that subagent
+	// type, in every session the gateway is serving, and even bare "main"
+	// was one single key shared by every session's main thread. sessionID
+	// scopes it to one conversation; instanceID (stable per subagent run,
+	// since it's the agent-id header, not the per-batch prompt-id — see
+	// ParseAgentInfo's comment) further separates concurrent subagents of
+	// the same type within that same session.
+	loopKey := agentKey + "|" + sessionID + "|" + instanceID
 	// Parse as generic map for in-place AST transformations
 	var reqMap map[string]interface{}
 	if err := json.Unmarshal(claudeJSON, &reqMap); err != nil {
@@ -51,13 +61,13 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 
 	// 2. Loop-Guard Nudges (Read-Loop & Oscillation)
-	if globalLoopGuard.CheckAndResetReadStreak(agentKey) {
+	if globalLoopGuard.CheckAndResetReadStreak(loopKey) {
 		InjectUserNudge(reqMap, NudgeReadLoop)
-		LogGateway(".. read-loop window >= %d Read calls [%s] -> injecting stop-nudge", ReadWindowThreshold, agentKey)
+		LogGateway(".. read-loop window >= %d Read calls [%s] -> injecting stop-nudge", ReadWindowThreshold, loopKey)
 	}
-	if globalLoopGuard.CheckAndResetOscillation(agentKey) {
+	if globalLoopGuard.CheckAndResetOscillation(loopKey) {
 		InjectUserNudge(reqMap, NudgeOscillation)
-		LogGateway(".. tool-call oscillation [%s] -> injecting loop-nudge", agentKey)
+		LogGateway(".. tool-call oscillation [%s] -> injecting loop-nudge", loopKey)
 	}
 
 	// 3. Full AST Sanitization (Middle Truncation 64KB, Non-empty sentinels, role repair, tool pairing)

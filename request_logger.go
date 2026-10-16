@@ -107,12 +107,38 @@ func InitLogStore(dbPath string) error {
 		}
 	}()
 
+	// WAL mode never shrinks its -wal file on its own without an explicit
+	// checkpoint; left unattended it grows unbounded (seen in practice: 4MB+
+	// WAL against a 220KB main db file) since nothing else in this gateway
+	// ever asked SQLite to fold it back in.
+	go func() {
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			_, _ = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		}
+	}()
+
 	return nil
 }
 
 func cleanupOldLogs(db *sql.DB) {
 	cutoff := time.Now().Add(-24 * time.Hour)
 	_, _ = db.Exec("DELETE FROM request_logs WHERE timestamp < ?", cutoff)
+}
+
+// Close checkpoints the WAL back into the main db file and closes the
+// connection. Called on graceful shutdown so a killed process doesn't leave
+// an uncheckpointed -wal file (or, worse, miss flushing the last batch of
+// in-flight writes) behind.
+func (s *SQLiteLogStore) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return
+	}
+	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	_ = s.db.Close()
 }
 
 func MaskKey(key string) string {
@@ -348,7 +374,8 @@ func (s *SQLiteLogStore) QuerySessions(limit int) []SessionSummary {
 		SUM(CASE WHEN agent_type = 'main' THEN 1 ELSE 0 END) as main_count,
 		SUM(CASE WHEN agent_type = 'subagent' THEN 1 ELSE 0 END) as sub_count,
 		SUM(CASE WHEN status >= 400 OR error != '' THEN 1 ELSE 0 END) as err_count,
-		SUM(CASE WHEN was_panicked = 1 THEN 1 ELSE 0 END) as panic_count
+		SUM(CASE WHEN was_panicked = 1 THEN 1 ELSE 0 END) as panic_count,
+		GROUP_CONCAT(DISTINCT CASE WHEN subagent_name != '' THEN subagent_name END) as subagent_names
 	FROM request_logs
 	WHERE session_id != '-' AND session_id != ''
 	GROUP BY session_id
@@ -369,13 +396,14 @@ func (s *SQLiteLogStore) QuerySessions(limit int) []SessionSummary {
 		var avgHit sql.NullFloat64
 		var mainCount, subCount, errCount, panicCount sql.NullInt64
 		var startTimeStr, lastTimeStr string
+		var subagentNamesRaw sql.NullString
 
 		err := rows.Scan(
 			&sm.SessionID, &sm.Key, &sm.KeyMasked, &sm.Account,
 			&startTimeStr, &lastTimeStr,
 			&sm.TotalRequests, &totalIn, &totalOut,
 			&avgHit, &mainCount, &subCount,
-			&errCount, &panicCount,
+			&errCount, &panicCount, &subagentNamesRaw,
 		)
 		if err != nil {
 			continue
@@ -404,16 +432,8 @@ func (s *SQLiteLogStore) QuerySessions(limit int) []SessionSummary {
 			sm.HasPanic = (panicCount.Int64 > 0)
 		}
 
-		// Discover unique subagents in this session
-		subRows, err := s.db.Query(`SELECT DISTINCT subagent_name FROM request_logs WHERE session_id = ? AND subagent_name != ''`, sm.SessionID)
-		if err == nil {
-			for subRows.Next() {
-				var subName string
-				if err := subRows.Scan(&subName); err == nil && subName != "" {
-					sm.SubagentNames = append(sm.SubagentNames, subName)
-				}
-			}
-			subRows.Close()
+		if subagentNamesRaw.Valid && subagentNamesRaw.String != "" {
+			sm.SubagentNames = strings.Split(subagentNamesRaw.String, ",")
 		}
 		if sm.SubagentNames == nil {
 			sm.SubagentNames = []string{}
