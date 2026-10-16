@@ -323,8 +323,18 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			// still arrives complete in a single chunk. Removed; this
 			// appears to be an inherent property of this specific
 			// undocumented endpoint, not something fixable client-side.
-		} else if hasWebSearch {
-			out, _ = sjson.SetRaw(out, "tools.0.googleSearch", "{}")
+		}
+		// Confirmed via Google's own docs: Gemini 3 models support combining
+		// custom functionDeclarations and the built-in googleSearch tool in
+		// the same tools array — previously this was an else-if, so any
+		// request that declared even one other tool (true for ~every real
+		// Claude Code call) silently dropped googleSearch grounding entirely.
+		if hasWebSearch {
+			idx := 0
+			if len(decls) > 0 {
+				idx = 1
+			}
+			out, _ = sjson.SetRaw(out, fmt.Sprintf("tools.%d.googleSearch", idx), "{}")
 		}
 
 		// tool_choice was previously dropped entirely, so a client forcing
