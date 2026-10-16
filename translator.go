@@ -14,6 +14,58 @@ var DropSearchTools = map[string]bool{
 	"Glob": true,
 }
 
+// sealFunctionResponseTurn enforces Gemini's "a turn carrying a
+// functionResponse must contain ONLY functionResponse parts" rule (the same
+// constraint already handled for LoopGuard nudges in loopguard.go and for
+// tool_result images above): if parts mixes functionResponse entries with
+// anything else — plain text, images — the mix is folded into the first
+// functionResponse (text as response.user_note, images nested under
+// functionResponse.parts) and only the now-self-contained functionResponse
+// entries are returned. Returns parts unchanged when there's no
+// functionResponse, or nothing else to fold (already pure).
+func sealFunctionResponseTurn(parts []string) []string {
+	var fnResp, other []string
+	for _, p := range parts {
+		if gjson.Get(p, "functionResponse").Exists() {
+			fnResp = append(fnResp, p)
+		} else {
+			other = append(other, p)
+		}
+	}
+	if len(fnResp) == 0 || len(other) == 0 {
+		return parts
+	}
+
+	var note strings.Builder
+	var imgParts []string
+	for _, p := range other {
+		if t := gjson.Get(p, "text"); t.Exists() {
+			if note.Len() > 0 {
+				note.WriteString("\n")
+			}
+			note.WriteString(t.String())
+		} else if gjson.Get(p, "inlineData").Exists() {
+			imgParts = append(imgParts, p)
+		}
+	}
+
+	target := fnResp[0]
+	if note.Len() > 0 {
+		target, _ = sjson.Set(target, "functionResponse.response.user_note", note.String())
+	}
+	if len(imgParts) > 0 {
+		if existing := gjson.Get(target, "functionResponse.parts"); existing.IsArray() {
+			existing.ForEach(func(_, v gjson.Result) bool {
+				imgParts = append([]string{v.Raw}, imgParts...)
+				return true
+			})
+		}
+		target, _ = sjson.SetRaw(target, "functionResponse.parts", "["+strings.Join(imgParts, ",")+"]")
+	}
+	fnResp[0] = target
+	return fnResp
+}
+
 // ConvertClaudeRequestToGemini converts an Anthropic Messages API payload into
 // a Google Gemini streamGenerateContent payload with full sanitization and tiering.
 func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqClass string, agentKey string, sessionID string, instanceID string) ([]byte, string, int, bool, error) {
@@ -271,12 +323,26 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			if len(partsJSON) == 0 {
 				partsJSON = append(partsJSON, `{"text":"..."}`)
 			}
+			partsJSON = sealFunctionResponseTurn(partsJSON)
 
 			if geminiRole == lastRole && contentIdx > 0 {
 				targetIdx := contentIdx - 1
-				for _, pjson := range partsJSON {
-					out, _ = sjson.SetRaw(out, fmt.Sprintf("contents.%d.parts.-1", targetIdx), pjson)
-				}
+				// This message's own parts are already pure (sealed above),
+				// but merging them into the PREVIOUS turn can still produce
+				// a mix if that turn is pure functionResponse and this one
+				// is pure text (or vice versa) — both the same Gemini role,
+				// e.g. a tool_result-only turn immediately followed by a
+				// separate plain-text user turn. Re-seal the combined set.
+				existingRaw := gjson.Get(out, fmt.Sprintf("contents.%d.parts", targetIdx))
+				var combined []string
+				existingRaw.ForEach(func(_, v gjson.Result) bool {
+					combined = append(combined, v.Raw)
+					return true
+				})
+				combined = append(combined, partsJSON...)
+				combined = sealFunctionResponseTurn(combined)
+				combinedJSON := "[" + strings.Join(combined, ",") + "]"
+				out, _ = sjson.SetRaw(out, fmt.Sprintf("contents.%d.parts", targetIdx), combinedJSON)
 			} else {
 				out, _ = sjson.Set(out, fmt.Sprintf("contents.%d.role", contentIdx), geminiRole)
 				for _, pjson := range partsJSON {
@@ -306,7 +372,13 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			desc := t.Get("description").String()
 			schemaRaw := CleanJSONSchemaForAntigravity(t.Get("input_schema").Raw)
 			if strings.TrimSpace(schemaRaw) == "" || schemaRaw == "null" {
-				schemaRaw = `{"type":"object","properties":{}}`
+				// Google rejects an OBJECT-type schema with empty properties
+				// ("parameters.properties: should be non-empty for OBJECT
+				// type") — route through the same placeholder mechanism
+				// CleanJSONSchemaForAntigravity already uses for schemas
+				// that end up empty after cleaning, instead of a raw
+				// properties:{} that bypasses it entirely.
+				schemaRaw = addEmptySchemaPlaceholder(`{"type":"object","properties":{}}`)
 			}
 
 			decl := `{"name":"","description":"","parameters":{}}`
@@ -414,6 +486,24 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	} else if hasMeta && modelMeta.MaxOutput > 0 && requestedMax > modelMeta.MaxOutput {
 		// Clamp requested tokens to model's certified ceiling (prevent Google 400 Bad Request)
 		requestedMax = modelMeta.MaxOutput
+	}
+
+	// Gemini's maxOutputTokens is a single shared ceiling for thinking AND
+	// the visible answer combined — unlike Claude's max_tokens, which only
+	// caps the visible output. Under ModeAuto (budget == -1) the model can
+	// freely spend an unbounded share of that SAME ceiling on invisible
+	// thinking before Claude Code's own (often small, e.g. 8192) max_tokens
+	// request is even considered; whatever's left can truncate mid
+	// tool-call-argument JSON. Give ModeAuto the model's full certified
+	// ceiling regardless of what the client asked for — there's no cost
+	// downside on this quota-based backend to requesting a higher ceiling
+	// the model doesn't end up using.
+	if budget < 0 {
+		if hasMeta && modelMeta.MaxOutput > 0 {
+			requestedMax = modelMeta.MaxOutput
+		} else {
+			requestedMax = 64000
+		}
 	}
 
 	// For models with extended thinking enabled (e.g. Claude on Vertex AI):

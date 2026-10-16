@@ -64,7 +64,7 @@ func isAntigravityLocationGateError(status int, errText string) bool {
 // per-session ~1,048,576-token wall (confirmed: this exact wall and recovery
 // pattern already exists, independently, in clirelay's
 // antigravity_session_bump — see sendAntigravityWithSessionBump below).
-func WrapAntigravityPayload(modelName string, payload []byte, projectID string, generation int) []byte {
+func WrapAntigravityPayload(modelName string, payload []byte, projectID string, generation int, fallbackSessionKey string) []byte {
 	var requestRaw string
 	if reqNode := gjson.GetBytes(payload, "request"); reqNode.IsObject() {
 		requestRaw = reqNode.Raw
@@ -84,14 +84,15 @@ func WrapAntigravityPayload(modelName string, payload []byte, projectID string, 
 	template, _ = sjson.SetRaw(template, "request", requestRaw)
 
 	// Derive stable session ID for prefix cache
-	sessionID := generateStableSessionID(payload, generation)
+	sessionID := generateStableSessionID(payload, generation, fallbackSessionKey)
 	template, _ = sjson.Set(template, "request.sessionId", sessionID)
 	template, _ = sjson.Delete(template, "request.safetySettings")
 
 	return []byte(template)
 }
 
-func generateStableSessionID(payload []byte, generation int) string {
+func generateStableSessionID(payload []byte, generation int, fallbackKey string) string {
+	hashKey := ""
 	contents := gjson.GetBytes(payload, "request.contents")
 	if !contents.Exists() {
 		contents = gjson.GetBytes(payload, "contents")
@@ -99,22 +100,35 @@ func generateStableSessionID(payload []byte, generation int) string {
 	if contents.IsArray() {
 		for _, content := range contents.Array() {
 			if content.Get("role").String() == "user" {
-				text := content.Get("parts.0.text").String()
-				if text != "" {
-					h := sha256.New()
-					h.Write([]byte(text))
-					if generation > 0 {
-						// Deterministic-but-distinct per generation: same
-						// conversation keeps hitting the SAME bumped bucket
-						// on retry (idempotent), without colliding with gen 0.
-						fmt.Fprintf(h, ":gen%d", generation)
-					}
-					sum := h.Sum(nil)
-					n := int64(binary.BigEndian.Uint64(sum[:8])) & 0x7FFFFFFFFFFFFFFF
-					return "-" + strconv.FormatInt(n, 10)
+				if text := content.Get("parts.0.text").String(); text != "" {
+					hashKey = text
+					break
 				}
 			}
 		}
+	}
+	// First user turn opening on an image/tool-call (parts.0 isn't text)
+	// previously fell straight through to a pure random id here — a brand
+	// new, uncorrelated sessionId on every single call, permanently
+	// defeating Google's server-side prefix cache for that whole
+	// conversation. Fall back to the gateway's own already-resolved
+	// session key (real x-claude-code-session-id header in the common
+	// case) before resorting to randomness.
+	if hashKey == "" {
+		hashKey = fallbackKey
+	}
+	if hashKey != "" {
+		h := sha256.New()
+		h.Write([]byte(hashKey))
+		if generation > 0 {
+			// Deterministic-but-distinct per generation: same
+			// conversation keeps hitting the SAME bumped bucket
+			// on retry (idempotent), without colliding with gen 0.
+			fmt.Fprintf(h, ":gen%d", generation)
+		}
+		sum := h.Sum(nil)
+		n := int64(binary.BigEndian.Uint64(sum[:8])) & 0x7FFFFFFFFFFFFFFF
+		return "-" + strconv.FormatInt(n, 10)
 	}
 	randMu.Lock()
 	n := randGen.Int63n(9_000_000_000_000_000_000)
@@ -201,7 +215,7 @@ func (am *AccountManager) WarmupSingleAccount(ctx context.Context, email string)
 	}
 
 	rawRequest := `{"contents":[{"role":"user","parts":[{"text":"1"}]}],"generationConfig":{"maxOutputTokens":1}}`
-	wrapped := WrapAntigravityPayload("gemini-2.5-flash", []byte(rawRequest), acc.ProjectID, 0)
+	wrapped := WrapAntigravityPayload("gemini-2.5-flash", []byte(rawRequest), acc.ProjectID, 0, "")
 
 	var lastErr error
 	for _, host := range AntigravityHosts {

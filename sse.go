@@ -50,6 +50,7 @@ type SSEStreamer struct {
 	toolCallIDs         []string
 	hasFinished         bool
 	thoughtSignature    string // most recent thoughtSignature seen for the open thinking block, flushed as signature_delta on close
+	estInputTokens      int    // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
 }
 
 type GroundingSource struct {
@@ -64,7 +65,7 @@ const (
 	TypeToolUse  = 3
 )
 
-func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool) *SSEStreamer {
+func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int) *SSEStreamer {
 	return &SSEStreamer{
 		w:                   w,
 		flusher:             flusher,
@@ -74,6 +75,7 @@ func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, s
 		lastEventTime:       time.Now(),
 		sessionID:           sessionID,
 		requestedSafeguards: requestedSafeguards,
+		estInputTokens:      estInputTokens,
 	}
 }
 
@@ -119,7 +121,7 @@ func (s *SSEStreamer) EnsureMessageStart() error {
 			"stop_reason":   nil,
 			"stop_sequence": nil,
 			"usage": map[string]interface{}{
-				"input_tokens":  0,
+				"input_tokens":  s.estInputTokens,
 				"output_tokens": 0,
 			},
 		},
@@ -315,8 +317,19 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 		stopReason = "max_tokens"
 	}
 
+	// Gemini's promptTokenCount is the FULL input (cached + uncached), but
+	// Anthropic's input_tokens means only the uncached delta — cached reads
+	// are reported separately via cache_read_input_tokens. Sending the full
+	// count in both fields double-counts the cached portion: a client
+	// computing total = input_tokens + cache_read_input_tokens (per
+	// Anthropic's own documented formula) sees the cache tokens twice, and
+	// the displayed cache-hit-rate comes out roughly half of the real one.
+	uncachedInputTokens := s.inputTokens - s.cacheTokens
+	if uncachedInputTokens < 0 {
+		uncachedInputTokens = 0
+	}
 	usage := map[string]interface{}{
-		"input_tokens":  s.inputTokens,
+		"input_tokens":  uncachedInputTokens,
 		"output_tokens": s.outputTokens,
 	}
 	if s.cacheTokens > 0 {
@@ -390,9 +403,21 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 	if parts.IsArray() {
 		for _, part := range parts.Array() {
 			if part.Get("thought").Bool() {
+				// The signature is often carried on a trailing chunk whose
+				// text is empty ("") — Google's own docs warn that filtering
+				// on an empty chunk.text silently drops it. Capture it
+				// either way; only emit a thinking_delta when there's text.
+				sig := part.Get("thoughtSignature").String()
 				if t := part.Get("text").String(); t != "" {
-					if err := s.HandleThinking(t, part.Get("thoughtSignature").String()); err != nil {
+					if err := s.HandleThinking(t, sig); err != nil {
 						return err
+					}
+				} else if sig != "" {
+					if err := s.EnsureMessageStart(); err != nil {
+						return err
+					}
+					if s.currentType == TypeThinking {
+						s.thoughtSignature = sig
 					}
 				}
 			} else if fc := part.Get("functionCall"); fc.Exists() {

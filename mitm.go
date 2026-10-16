@@ -306,7 +306,19 @@ func PassthroughToReal(w http.ResponseWriter, r *http.Request) {
 	target.Scheme = "https"
 	target.Host = r.Host
 
-	outReq, err := http.NewRequest(r.Method, target.String(), r.Body)
+	// r.Body is a one-shot io.ReadCloser; http.NewRequest only wires up
+	// GetBody automatically for *bytes.Reader/*bytes.Buffer/*strings.Reader,
+	// so passing it directly leaves GetBody nil and Go's transport can't
+	// rewind-and-retry on a transient connection drop — confirmed live in
+	// superrelay.log: "cannot rewind body after connection loss". Buffering
+	// it (these are passthrough API calls, not large file transfers) lets
+	// the transport retry transparently instead of surfacing a 502.
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "proxy error", http.StatusBadGateway)
+		return
+	}
+	outReq, err := http.NewRequest(r.Method, target.String(), bytes.NewReader(bodyBytes))
 	if err != nil {
 		http.Error(w, "proxy error", http.StatusBadGateway)
 		return

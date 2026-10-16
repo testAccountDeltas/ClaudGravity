@@ -477,7 +477,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 
 			var finalPayload []byte
 			if isAntigravity {
-				finalPayload = WrapAntigravityPayload(modelName, geminiBody, projectID, bump)
+				finalPayload = WrapAntigravityPayload(modelName, geminiBody, projectID, bump, sessionID)
 			} else {
 				finalPayload = geminiBody
 			}
@@ -486,7 +486,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				rid, attempt+1, maxAttempts, bump, tenant.Name, accLabel, modelName, budget, isStreaming, len(geminiBody), agentKey)
 
 			if isStreaming {
-				success, lastStatus, lastErr = executeStreamingWithWatchdog(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher)
+				success, lastStatus, lastErr = executeStreamingWithWatchdog(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes)
 			} else {
 				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w)
 			}
@@ -575,6 +575,7 @@ func executeStreamingWithWatchdog(
 	hasSafeguards bool,
 	w http.ResponseWriter,
 	flusher http.Flusher,
+	claudeBodyBytes []byte,
 ) (bool, int, error) {
 	panicTimeout := time.Duration(serverCfg.PanicTimeoutSeconds) * time.Second
 	ttftTimeout := time.Duration(serverCfg.TTFTTimeoutSeconds) * time.Second
@@ -820,7 +821,14 @@ UpstreamReady:
 	wMu.Unlock()
 
 	ttft := time.Since(t0)
-	streamer := NewSSEStreamer(w, flusher, modelName, sessionID, hasSafeguards)
+	// Gemini only reports usageMetadata at the very end of the stream, but
+	// Anthropic's SDK expects message_start to carry a real (or at least
+	// approximate) input_tokens count — its own message_delta handler only
+	// ever updates output_tokens, so a client faithfully following that
+	// contract never sees input_tokens corrected later and would otherwise
+	// be stuck believing it was 0 for the whole conversation.
+	estInputTokens := estimateApproxClaudeTokens(claudeBodyBytes)
+	streamer := NewSSEStreamer(w, flusher, modelName, sessionID, hasSafeguards, estInputTokens)
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	totalDur := time.Since(t0)
@@ -951,8 +959,18 @@ func executeNonStreaming(
 	// (CacheReadTokens below) and never surfaced to the client — Claude
 	// Code's own /usage cache-hit-rate math silently saw 0% cache reads on
 	// every non-streaming response.
+	//
+	// Gemini's promptTokenCount is the FULL input (cached + uncached), but
+	// Anthropic's input_tokens means only the uncached delta — see the
+	// matching fix in sse.go's FinishStream for the full explanation of why
+	// reporting the full count here double-counts cache_read_input_tokens
+	// on the client side.
+	uncachedInTok := inTok - cacheTok
+	if uncachedInTok < 0 {
+		uncachedInTok = 0
+	}
 	usageMap := map[string]interface{}{
-		"input_tokens":  inTok,
+		"input_tokens":  uncachedInTok,
 		"output_tokens": outTok,
 	}
 	if cacheTok > 0 {
