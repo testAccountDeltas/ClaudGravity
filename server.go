@@ -396,7 +396,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	}
 
 	// 3. Full Orchestrator Translation: Tiering, LoopGuard, Middle-Truncation 64KB, Sanitizer
-	geminiBody, modelName, budget, wasShrunk, err := ConvertClaudeRequestToGemini(bodyBytes, tenant, reqClass, agentKey, sessionID, instanceID)
+	geminiBody, modelName, budget, wasShrunk, syntheticReasonTools, err := ConvertClaudeRequestToGemini(bodyBytes, tenant, reqClass, agentKey, sessionID, instanceID)
 	if err != nil {
 		LogGateway("[#%d] Translation error: %v", rid, err)
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Translation error: %v", err))
@@ -560,9 +560,9 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				rid, attempt+1, maxAttempts, bump, tenant.Name, accLabel, modelName, budget, isStreaming, len(geminiBody), agentKey)
 
 			if isStreaming {
-				success, lastStatus, lastErr = executeStreamingWithWatchdog(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes)
+				success, lastStatus, lastErr = executeStreamingWithWatchdog(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes, syntheticReasonTools)
 			} else {
-				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes)
+				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes, syntheticReasonTools)
 			}
 
 			if success || !isAntigravity {
@@ -650,6 +650,7 @@ func executeStreamingWithWatchdog(
 	w http.ResponseWriter,
 	flusher http.Flusher,
 	claudeBodyBytes []byte,
+	syntheticReasonTools map[string]bool,
 ) (bool, int, error) {
 	panicTimeout := time.Duration(serverCfg.PanicTimeoutSeconds) * time.Second
 	ttftTimeout := time.Duration(serverCfg.TTFTTimeoutSeconds) * time.Second
@@ -903,7 +904,7 @@ UpstreamReady:
 	// be stuck believing it was 0 for the whole conversation.
 	estInputTokens := estimateApproxClaudeTokens(claudeBodyBytes)
 	preferRussian := detectRussianConversation(claudeBodyBytes)
-	streamer := NewSSEStreamer(w, flusher, modelName, sessionID, hasSafeguards, estInputTokens, preferRussian)
+	streamer := NewSSEStreamer(w, flusher, modelName, sessionID, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools)
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	totalDur := time.Since(t0)
@@ -985,6 +986,7 @@ func executeNonStreaming(
 	hasSafeguards bool,
 	w http.ResponseWriter,
 	claudeBodyBytes []byte,
+	syntheticReasonTools map[string]bool,
 ) (bool, int, error) {
 	// Unlike the streaming path (which has the panic/TTFT watchdog), this had
 	// no deadline at all — a hung upstream could block the request forever.
@@ -1102,6 +1104,14 @@ func executeNonStreaming(
 					}
 					if repairedArgs, ok := RepairEditToolCall(fname, argsRaw, sessionID); ok {
 						argsRaw = repairedArgs
+					}
+					if syntheticReasonTools[fname] {
+						// Same synthetic-placeholder cleanup as sse.go's
+						// HandleFunctionCall — see there for the full
+						// explanation.
+						if cleaned, err := sjson.Delete(argsRaw, "reason"); err == nil {
+							argsRaw = cleaned
+						}
 					}
 					var argsObj interface{}
 					_ = json.Unmarshal([]byte(argsRaw), &argsObj)

@@ -147,27 +147,73 @@ func removePlaceholderFields(jsonStr string) string {
 
 // convertRefsToHints converts $ref to description hints (Lazy Hint strategy).
 func convertRefsToHints(jsonStr string) string {
-	paths := findPaths(jsonStr, "$ref")
-	sortByDepth(paths)
-
-	for _, p := range paths {
-		refVal := gjson.Get(jsonStr, p).String()
-		defName := refVal
-		if idx := strings.LastIndex(refVal, "/"); idx >= 0 {
-			defName = refVal[idx+1:]
+	// Resolving refs can itself introduce nested $ref (a $defs entry that
+	// points at another $defs entry), so loop until a pass finds none —
+	// bounded defensively since a malformed/circular schema must not hang
+	// the request.
+	for pass := 0; pass < 10; pass++ {
+		paths := findPaths(jsonStr, "$ref")
+		if len(paths) == 0 {
+			break
 		}
+		sortByDepth(paths)
 
-		parentPath := trimSuffix(p, ".$ref")
-		hint := fmt.Sprintf("See: %s", defName)
-		if existing := gjson.Get(jsonStr, descriptionPath(parentPath)).String(); existing != "" {
-			hint = fmt.Sprintf("%s (%s)", existing, hint)
+		for _, p := range paths {
+			refVal := gjson.Get(jsonStr, p).String()
+			parentPath := trimSuffix(p, ".$ref")
+
+			// A $defs/$definitions entry is still present in jsonStr at
+			// this point (Phase 1 runs before removeUnsupportedKeywords
+			// strips them in Phase 3) — Pydantic/Zod-generated schemas
+			// overwhelmingly use this LOCAL, self-contained form rather
+			// than a remote $ref URL. Inline the real definition instead
+			// of discarding its actual type/enum for a bare {"type":
+			// "object"} stub, which silently turned e.g. a string enum
+			// parameter into an object the model then fills in wrong.
+			if def := resolveLocalRef(jsonStr, refVal); def != "" {
+				jsonStr = setRawAt(jsonStr, parentPath, def)
+				continue
+			}
+
+			defName := refVal
+			if idx := strings.LastIndex(refVal, "/"); idx >= 0 {
+				defName = refVal[idx+1:]
+			}
+			hint := fmt.Sprintf("See: %s", defName)
+			if existing := gjson.Get(jsonStr, descriptionPath(parentPath)).String(); existing != "" {
+				hint = fmt.Sprintf("%s (%s)", existing, hint)
+			}
+
+			replacement := `{"type":"object","description":""}`
+			replacement, _ = sjson.Set(replacement, "description", hint)
+			jsonStr = setRawAt(jsonStr, parentPath, replacement)
 		}
-
-		replacement := `{"type":"object","description":""}`
-		replacement, _ = sjson.Set(replacement, "description", hint)
-		jsonStr = setRawAt(jsonStr, parentPath, replacement)
 	}
 	return jsonStr
+}
+
+// resolveLocalRef looks up a JSON Schema $ref against this same document's
+// own "$defs" or "definitions" dictionary (the only two locations this
+// function understands — a remote/external $ref URL isn't resolvable here
+// and falls back to the lossy hint-stub in convertRefsToHints). Returns ""
+// if the ref isn't a local pointer or the named definition doesn't exist.
+func resolveLocalRef(jsonStr, refVal string) string {
+	const defsPrefix = "#/$defs/"
+	const definitionsPrefix = "#/definitions/"
+	var name string
+	switch {
+	case strings.HasPrefix(refVal, defsPrefix):
+		name = refVal[len(defsPrefix):]
+		if def := gjson.Get(jsonStr, "$defs."+name); def.Exists() {
+			return def.Raw
+		}
+	case strings.HasPrefix(refVal, definitionsPrefix):
+		name = refVal[len(definitionsPrefix):]
+		if def := gjson.Get(jsonStr, "definitions."+name); def.Exists() {
+			return def.Raw
+		}
+	}
+	return ""
 }
 
 func convertConstToEnum(jsonStr string) string {

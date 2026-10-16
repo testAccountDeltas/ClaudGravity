@@ -66,13 +66,15 @@ func sealFunctionResponseTurn(parts []string) []string {
 		target, _ = sjson.Set(target, "functionResponse.response.user_note", note.String())
 	}
 	if len(imgParts) > 0 {
+		var combinedImgParts []string
 		if existing := gjson.Get(target, "functionResponse.parts"); existing.IsArray() {
 			existing.ForEach(func(_, v gjson.Result) bool {
-				imgParts = append([]string{v.Raw}, imgParts...)
+				combinedImgParts = append(combinedImgParts, v.Raw)
 				return true
 			})
 		}
-		target, _ = sjson.SetRaw(target, "functionResponse.parts", "["+strings.Join(imgParts, ",")+"]")
+		combinedImgParts = append(combinedImgParts, imgParts...)
+		target, _ = sjson.SetRaw(target, "functionResponse.parts", "["+strings.Join(combinedImgParts, ",")+"]")
 	}
 	fnResp[0] = target
 	return fnResp
@@ -80,7 +82,7 @@ func sealFunctionResponseTurn(parts []string) []string {
 
 // ConvertClaudeRequestToGemini converts an Anthropic Messages API payload into
 // a Google Gemini streamGenerateContent payload with full sanitization and tiering.
-func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqClass string, agentKey string, sessionID string, instanceID string) ([]byte, string, int, bool, error) {
+func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqClass string, agentKey string, sessionID string, instanceID string) ([]byte, string, int, bool, map[string]bool, error) {
 	// loopKey disambiguates both across sessions and across parallel
 	// subagents within one session: agentKey alone (e.g. "sub:general-
 	// purpose") is shared by every concurrent instance of that subagent
@@ -94,7 +96,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// Parse as generic map for in-place AST transformations
 	var reqMap map[string]interface{}
 	if err := json.Unmarshal(claudeJSON, &reqMap); err != nil {
-		return nil, "", 0, false, fmt.Errorf("invalid json: %w", err)
+		return nil, "", 0, false, nil, fmt.Errorf("invalid json: %w", err)
 	}
 
 	// 1. Dynamic Tiering & Model Effort Resolution
@@ -153,7 +155,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// Re-serialize sanitized request
 	sanitizedBytes, err := json.Marshal(reqMap)
 	if err != nil {
-		return nil, "", 0, false, fmt.Errorf("re-marshal sanitized json: %w", err)
+		return nil, "", 0, false, nil, fmt.Errorf("re-marshal sanitized json: %w", err)
 	}
 
 	root := gjson.ParseBytes(sanitizedBytes)
@@ -184,6 +186,23 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 
 	// 5. Messages Translation
 	toolIDToName := make(map[string]string)
+	// Validates any recovered-by-heuristic fnName below against what's
+	// actually declared — the id-parsing fallback assumes our own
+	// "toolu_<name>_<nanots>_<seq>" format (see nextToolCallID), but a
+	// native Anthropic id like "toolu_01XfD..." has no underscore at all,
+	// so isAllDigits never trims anything and the WHOLE opaque id string
+	// becomes "fnName" — non-empty, so the old empty-string fallback never
+	// caught it, and Google rejected a functionResponse.name that matches
+	// no declared tool.
+	declaredToolNames := make(map[string]bool)
+	if toolsArr := root.Get("tools"); toolsArr.IsArray() {
+		toolsArr.ForEach(func(_, t gjson.Result) bool {
+			if n := t.Get("name").String(); n != "" {
+				declaredToolNames[n] = true
+			}
+			return true
+		})
+	}
 	messages := root.Get("messages")
 
 	if messages.IsArray() {
@@ -288,6 +307,16 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 								if end > 0 {
 									fnName = strings.Join(segs[:end], "_")
 								}
+							}
+							// Validate the recovered name against what's
+							// actually declared, regardless of where it
+							// came from — a native Anthropic id has no
+							// underscore at all, so the parse above never
+							// trims anything and fnName ends up as the
+							// whole opaque id string (non-empty, so it
+							// would otherwise sail straight past here).
+							if fnName != "" && !declaredToolNames[fnName] {
+								fnName = ""
 							}
 							if fnName == "" {
 								// Last resort: any declared tool at least
@@ -424,6 +453,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 
 	// 6. Tools Declaration
+	syntheticReasonTools := make(map[string]bool)
 	if tools := root.Get("tools"); tools.IsArray() {
 		var decls []string
 		hasWebSearch := false
@@ -446,6 +476,15 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				// that end up empty after cleaning, instead of a raw
 				// properties:{} that bypasses it entirely.
 				schemaRaw = addEmptySchemaPlaceholder(`{"type":"object","properties":{}}`)
+			}
+			// Remember which tools got our synthetic "reason" placeholder
+			// injected (the only way Gemini will accept an argument-less
+			// tool's schema) so the caller can strip that key back out of
+			// the model's actual function-call args before handing them to
+			// Claude Code — a strict MCP tool with additionalProperties:
+			// false rejects a "reason" field it never declared.
+			if strings.Contains(schemaRaw, placeholderReasonDescription) {
+				syntheticReasonTools[name] = true
 			}
 
 			decl := `{"name":"","description":"","parameters":{}}`
@@ -610,7 +649,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		out, _ = sjson.Set(out, fmt.Sprintf("safetySettings.%d.threshold", i), threshold)
 	}
 
-	return []byte(out), modelName, budget, wasShrunk, nil
+	return []byte(out), modelName, budget, wasShrunk, syntheticReasonTools, nil
 }
 
 // ScrubBillingHeader strips out fingerprint headers and billing marks that trigger Google 429/Filter:

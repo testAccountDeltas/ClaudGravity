@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // toolCallSeq makes generated tool_use ids collision-free regardless of
@@ -82,33 +83,34 @@ func getToolSignature(callID string) string {
 }
 
 type SSEStreamer struct {
-	w                   http.ResponseWriter
-	flusher             http.Flusher
-	mu                  sync.Mutex
-	hasStarted          bool
-	currentType         int // 0: none, 1: text, 2: thinking, 3: tool_use
-	currentIndex        int
-	messageID           string
-	model               string
-	inputTokens         int64
-	outputTokens        int64
-	cacheTokens         int64
-	toolUseOccurred     bool
-	textChars           int
-	thinkingChars       int
-	toolNames           []string
-	toolCallSignatures  []string
-	lastText            string
-	lastEventTime       time.Time
-	searchQueries       []string
-	groundingSources    []GroundingSource
-	sessionID           string
-	requestedSafeguards bool
-	toolCallIDs         []string
-	hasFinished         bool
-	thoughtSignature    string // most recent thoughtSignature seen for the open thinking block, flushed as signature_delta on close
-	estInputTokens      int    // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
-	preferRussian       bool   // conversation's own language, detected from the user's latest message — picks which language gateway-synthesized text (grounding footer) uses, since that text bypasses the model entirely
+	w                    http.ResponseWriter
+	flusher              http.Flusher
+	mu                   sync.Mutex
+	hasStarted           bool
+	currentType          int // 0: none, 1: text, 2: thinking, 3: tool_use
+	currentIndex         int
+	messageID            string
+	model                string
+	inputTokens          int64
+	outputTokens         int64
+	cacheTokens          int64
+	toolUseOccurred      bool
+	textChars            int
+	thinkingChars        int
+	toolNames            []string
+	toolCallSignatures   []string
+	lastText             string
+	lastEventTime        time.Time
+	searchQueries        []string
+	groundingSources     []GroundingSource
+	sessionID            string
+	requestedSafeguards  bool
+	toolCallIDs          []string
+	hasFinished          bool
+	thoughtSignature     string          // most recent thoughtSignature seen for the open thinking block, flushed as signature_delta on close
+	estInputTokens       int             // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
+	preferRussian        bool            // conversation's own language, detected from the user's latest message — picks which language gateway-synthesized text (grounding footer) uses, since that text bypasses the model entirely
+	syntheticReasonTools map[string]bool // tool names whose Gemini-bound schema got our synthetic "reason" placeholder injected (translator.go); that key is stripped back out of the model's actual function-call args before handing them to Claude Code
 }
 
 type GroundingSource struct {
@@ -123,18 +125,19 @@ const (
 	TypeToolUse  = 3
 )
 
-func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool) *SSEStreamer {
+func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool) *SSEStreamer {
 	return &SSEStreamer{
-		w:                   w,
-		flusher:             flusher,
-		messageID:           fmt.Sprintf("msg_%d", time.Now().UnixNano()),
-		model:               model,
-		currentIndex:        -1,
-		lastEventTime:       time.Now(),
-		sessionID:           sessionID,
-		requestedSafeguards: requestedSafeguards,
-		estInputTokens:      estInputTokens,
-		preferRussian:       preferRussian,
+		w:                    w,
+		flusher:              flusher,
+		messageID:            fmt.Sprintf("msg_%d", time.Now().UnixNano()),
+		model:                model,
+		currentIndex:         -1,
+		lastEventTime:        time.Now(),
+		sessionID:            sessionID,
+		requestedSafeguards:  requestedSafeguards,
+		estInputTokens:       estInputTokens,
+		preferRussian:        preferRussian,
+		syntheticReasonTools: syntheticReasonTools,
 	}
 }
 
@@ -307,6 +310,17 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSig
 	if repaired, ok := RepairEditToolCall(name, argsRaw, s.sessionID); ok {
 		argsRaw = repaired
 	}
+	if s.syntheticReasonTools[name] {
+		// This tool's Gemini-bound schema only has a "reason" property
+		// because its real schema had none at all (addEmptySchemaPlaceholder
+		// in translator.go) — the model dutifully filled it in since it's
+		// marked required, but it was never part of the tool's actual
+		// declared arguments, and a strict handler (additionalProperties:
+		// false) rejects an argument it never declared.
+		if cleaned, err := sjson.Delete(argsRaw, "reason"); err == nil {
+			argsRaw = cleaned
+		}
+	}
 	if err := s.EnsureMessageStart(); err != nil {
 		return err
 	}
@@ -368,6 +382,18 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	}
 	if err := s.closeCurrentBlock(); err != nil {
 		return err
+	}
+
+	// A mid-generation safety cutoff with nothing produced yet is the same
+	// silent-failure shape as the promptFeedback block above, just arriving
+	// as a candidate's finishReason instead of a top-level field — tell the
+	// client instead of completing a textless turn as a normal "end_turn".
+	// If some content DID stream before the cutoff, let it through as-is:
+	// the client has something to show, which beats discarding it.
+	if finishReason == "SAFETY" && !s.toolUseOccurred && s.textChars == 0 && s.thinkingChars == 0 {
+		errPayload := `{"type":"error","error":{"type":"api_error","message":"Google safety filters stopped generation (finishReason: SAFETY) before any content was produced"}}`
+		_ = s.SendRaw("error", errPayload)
+		return fmt.Errorf("generation stopped by Google safety filters")
 	}
 
 	// MAX_TOKENS must win over tool_use: toolUseOccurred only means a
@@ -462,6 +488,22 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 		errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":%q}}`, "Upstream stream error: "+msg)
 		_ = s.SendRaw("error", errPayload)
 		return fmt.Errorf("upstream stream error: %s", msg)
+	}
+
+	// A prompt Google's safety filters reject outright (before any
+	// candidate is even generated) comes back as a normal 200 OK with a
+	// promptFeedback node and no "candidates" or "error" field at all — the
+	// same silent-swallow failure mode as the error check above, just under
+	// a different key. Without this it fell straight through to the
+	// candidates-empty return below and the client saw a clean, empty
+	// "end_turn" instead of learning the prompt was blocked.
+	if pf := root.Get("promptFeedback"); pf.Exists() {
+		if br := pf.Get("blockReason").String(); br != "" && br != "BLOCK_REASON_UNSPECIFIED" {
+			msg := "Google safety filters blocked this prompt: " + br
+			errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":%q}}`, msg)
+			_ = s.SendRaw("error", errPayload)
+			return fmt.Errorf("prompt blocked by Google safety filters: %s", br)
+		}
 	}
 
 	// Update token usage
