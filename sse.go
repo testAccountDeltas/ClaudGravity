@@ -427,9 +427,25 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	if uncachedInputTokens < 0 {
 		uncachedInputTokens = 0
 	}
+	// Gemini never reports a distinct "tokens newly written to cache"
+	// counter — only cachedContentTokenCount (tokens actually READ from an
+	// existing cache). On a cache miss (nothing read yet) with a prompt
+	// large enough that Google's implicit caching will cache it going
+	// forward, approximate cache_creation_input_tokens as the uncached
+	// amount; without this, Claude Code saw 0% caching on a session's
+	// first turn even though Google silently caches it for every turn
+	// after.
+	var cacheCreationTokens int64
+	if s.cacheTokens == 0 && uncachedInputTokens > 1024 {
+		cacheCreationTokens = uncachedInputTokens
+		uncachedInputTokens = 0
+	}
 	usage := map[string]interface{}{
 		"input_tokens":  uncachedInputTokens,
 		"output_tokens": s.outputTokens,
+	}
+	if cacheCreationTokens > 0 {
+		usage["cache_creation_input_tokens"] = cacheCreationTokens
 	}
 	if s.cacheTokens > 0 {
 		usage["cache_read_input_tokens"] = s.cacheTokens

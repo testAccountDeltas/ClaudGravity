@@ -721,12 +721,15 @@ func ScrubBillingHeader(txt string) string {
 			}
 		}
 
-		// Strip git status and fast mode noise lines
-		if strings.HasPrefix(trimmed, "gitStatus:") ||
-			strings.HasPrefix(trimmed, "Recent commits:") ||
-			strings.HasPrefix(trimmed, "<fast_mode_info>") ||
-			strings.HasPrefix(trimmed, "</fast_mode_info>") ||
-			strings.Contains(trimmed, "git status at the start of the conversation") {
+		// Strip fast-mode noise markers only — gitStatus:/Recent commits:
+		// used to be stripped too, but that section is only ~80-180 tokens
+		// and removing it meant Gemini had no idea which branch/files were
+		// already changed, so its very first move was burning a Bash
+		// round-trip on "git status"/"git log" to ask for information that
+		// was already sitting right there — a turn's worth of latency and
+		// tool_use/tool_result tokens to "save" a sliver of context.
+		if strings.HasPrefix(trimmed, "<fast_mode_info>") ||
+			strings.HasPrefix(trimmed, "</fast_mode_info>") {
 			continue
 		}
 

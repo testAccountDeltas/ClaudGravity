@@ -128,6 +128,13 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 				if bt, ok := th["budget_tokens"].(float64); ok && bt > 0 {
 					budget = int(bt)
 				}
+			case "adaptive":
+				// Not a type this codebase has independently confirmed in
+				// Anthropic's own public docs, but harmless either way: if
+				// no real client ever sends it, this case just never
+				// triggers. ModeAuto is the closest Gemini-side equivalent
+				// to "let the model decide its own thinking depth".
+				budget = -1
 			}
 		}
 	}

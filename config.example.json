@@ -16,7 +16,7 @@
       "google_base_url": "https://generativelanguage.googleapis.com",
       "default_model": "gemini-2.5-flash",
       "thinking_budget": -1,
-      "strip_search_tools": true,
+      "strip_search_tools": false,
       "sticky_account": "",
       "strategy": ""
     }

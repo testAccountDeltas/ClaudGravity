@@ -1061,9 +1061,20 @@ func executeNonStreaming(
 	if uncachedInTok < 0 {
 		uncachedInTok = 0
 	}
+	// Same cache_creation_input_tokens approximation as sse.go's
+	// FinishStream — see there for why Gemini gives us no real signal for
+	// this and a cache-miss-but-large-prompt heuristic is the best stand-in.
+	var cacheCreationTok int64
+	if cacheTok == 0 && uncachedInTok > 1024 {
+		cacheCreationTok = uncachedInTok
+		uncachedInTok = 0
+	}
 	usageMap := map[string]interface{}{
 		"input_tokens":  uncachedInTok,
 		"output_tokens": outTok,
+	}
+	if cacheCreationTok > 0 {
+		usageMap["cache_creation_input_tokens"] = cacheCreationTok
 	}
 	if cacheTok > 0 {
 		usageMap["cache_read_input_tokens"] = cacheTok

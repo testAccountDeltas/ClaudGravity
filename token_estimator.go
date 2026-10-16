@@ -153,12 +153,24 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 							total += estimateApproxTokens(rc.String())
 						} else if rc.IsArray() {
 							rc.ForEach(func(_, item gjson.Result) bool {
-								total += estimateApproxTokens(item.Get("text").String())
+								switch item.Get("type").String() {
+								case "image", "document":
+									total += 1600
+								default:
+									total += estimateApproxTokens(item.Get("text").String())
+								}
 								return true
 							})
 						}
 					case "image":
 						// Rough image token cost (typical Anthropic resolution ~1600 tokens)
+						total += 1600
+					case "document":
+						// PDF support (translator.go) was added without a
+						// matching estimate here — every document block
+						// was silently counted as 0 tokens. Same flat
+						// per-block guess as image; page count isn't known
+						// at this point.
 						total += 1600
 					}
 					return true
