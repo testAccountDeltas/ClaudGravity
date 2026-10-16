@@ -1,0 +1,490 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/tidwall/gjson"
+)
+
+type SSEStreamer struct {
+	w                   http.ResponseWriter
+	flusher             http.Flusher
+	mu                  sync.Mutex
+	hasStarted          bool
+	currentType         int // 0: none, 1: text, 2: thinking, 3: tool_use
+	currentIndex        int
+	messageID           string
+	model               string
+	inputTokens         int64
+	outputTokens        int64
+	cacheTokens         int64
+	toolUseOccurred     bool
+	textChars           int
+	thinkingChars       int
+	toolNames           []string
+	toolCallSignatures  []string
+	lastText            string
+	lastEventTime       time.Time
+	searchQueries       []string
+	groundingSources    []GroundingSource
+	sessionID           string
+	requestedSafeguards bool
+	toolCallIDs         []string
+	hasFinished         bool
+}
+
+type GroundingSource struct {
+	Title string `json:"title"`
+	URI   string `json:"uri"`
+}
+
+const (
+	TypeNone     = 0
+	TypeText     = 1
+	TypeThinking = 2
+	TypeToolUse  = 3
+)
+
+func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool) *SSEStreamer {
+	return &SSEStreamer{
+		w:                   w,
+		flusher:             flusher,
+		messageID:           fmt.Sprintf("msg_%d", time.Now().UnixNano()),
+		model:               model,
+		currentIndex:        -1,
+		lastEventTime:       time.Now(),
+		sessionID:           sessionID,
+		requestedSafeguards: requestedSafeguards,
+	}
+}
+
+func (s *SSEStreamer) SendRaw(event, data string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastEventTime = time.Now()
+	msg := fmt.Sprintf("event: %s\ndata: %s\n\n", event, data)
+	_, err := s.w.Write([]byte(msg))
+	if err == nil && s.flusher != nil {
+		s.flusher.Flush()
+	}
+	return err
+}
+
+func (s *SSEStreamer) SendKeepalivePing() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if time.Since(s.lastEventTime) < 4*time.Second {
+		return nil
+	}
+	s.lastEventTime = time.Now()
+	_, err := s.w.Write([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n"))
+	if err == nil && s.flusher != nil {
+		s.flusher.Flush()
+	}
+	return err
+}
+
+func (s *SSEStreamer) EnsureMessageStart() error {
+	if s.hasStarted {
+		return nil
+	}
+	s.hasStarted = true
+	startPayload := map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":            s.messageID,
+			"type":          "message",
+			"role":          "assistant",
+			"content":       []interface{}{},
+			"model":         s.model,
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]interface{}{
+				"input_tokens":  0,
+				"output_tokens": 0,
+			},
+		},
+	}
+	b, _ := json.Marshal(startPayload)
+	return s.SendRaw("message_start", string(b))
+}
+
+func (s *SSEStreamer) closeCurrentBlock() error {
+	if s.currentType == TypeNone || s.currentIndex < 0 {
+		return nil
+	}
+	stopPayload := map[string]interface{}{
+		"type":  "content_block_stop",
+		"index": s.currentIndex,
+	}
+	b, _ := json.Marshal(stopPayload)
+	s.currentType = TypeNone
+	return s.SendRaw("content_block_stop", string(b))
+}
+
+func (s *SSEStreamer) HandleThinking(text string) error {
+	if err := s.EnsureMessageStart(); err != nil {
+		return err
+	}
+	if s.currentType != TypeThinking {
+		if err := s.closeCurrentBlock(); err != nil {
+			return err
+		}
+		s.currentIndex++
+		s.currentType = TypeThinking
+
+		startPayload := map[string]interface{}{
+			"type":  "content_block_start",
+			"index": s.currentIndex,
+			"content_block": map[string]interface{}{
+				"type":     "thinking",
+				"thinking": "",
+			},
+		}
+		b, _ := json.Marshal(startPayload)
+		if err := s.SendRaw("content_block_start", string(b)); err != nil {
+			return err
+		}
+	}
+
+	deltaPayload := map[string]interface{}{
+		"type":     "thinking_delta",
+		"thinking": text,
+	}
+	s.thinkingChars += len(text)
+	b, _ := json.Marshal(deltaPayload)
+	return s.SendRaw("content_block_delta", string(b))
+}
+
+func (s *SSEStreamer) HandleText(text string) error {
+	if err := s.EnsureMessageStart(); err != nil {
+		return err
+	}
+	if s.currentType != TypeText {
+		if err := s.closeCurrentBlock(); err != nil {
+			return err
+		}
+		s.currentIndex++
+		s.currentType = TypeText
+
+		startPayload := map[string]interface{}{
+			"type":  "content_block_start",
+			"index": s.currentIndex,
+			"content_block": map[string]interface{}{
+				"type": "text",
+				"text": "",
+			},
+		}
+		b, _ := json.Marshal(startPayload)
+		if err := s.SendRaw("content_block_start", string(b)); err != nil {
+			return err
+		}
+	}
+
+	deltaPayload := map[string]interface{}{
+		"type":  "content_block_delta",
+		"index": s.currentIndex,
+		"delta": map[string]interface{}{
+			"type": "text_delta",
+			"text": text,
+		},
+	}
+	s.textChars += len(text)
+	s.lastText += text
+	b, _ := json.Marshal(deltaPayload)
+	return s.SendRaw("content_block_delta", string(b))
+}
+
+func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string) error {
+	if repaired, ok := RepairEditToolCall(name, argsRaw, s.sessionID); ok {
+		argsRaw = repaired
+	}
+	if err := s.EnsureMessageStart(); err != nil {
+		return err
+	}
+	if err := s.closeCurrentBlock(); err != nil {
+		return err
+	}
+	s.currentIndex++
+	s.currentType = TypeToolUse
+	s.toolUseOccurred = true
+	s.toolNames = append(s.toolNames, name)
+	s.toolCallSignatures = append(s.toolCallSignatures, fmt.Sprintf("%s:%s", name, argsRaw))
+
+	callID := fmt.Sprintf("toolu_%s_%d", name, time.Now().UnixNano()%1000000)
+	s.toolCallIDs = append(s.toolCallIDs, callID)
+
+	startPayload := map[string]interface{}{
+		"type":  "content_block_start",
+		"index": s.currentIndex,
+		"content_block": map[string]interface{}{
+			"type":  "tool_use",
+			"id":    callID,
+			"name":  name,
+			"input": map[string]interface{}{},
+		},
+	}
+	b, _ := json.Marshal(startPayload)
+	if err := s.SendRaw("content_block_start", string(b)); err != nil {
+		return err
+	}
+
+	deltaPayload := map[string]interface{}{
+		"type":  "content_block_delta",
+		"index": s.currentIndex,
+		"delta": map[string]interface{}{
+			"type":         "input_json_delta",
+			"partial_json": argsRaw,
+		},
+	}
+	b, _ = json.Marshal(deltaPayload)
+	if err := s.SendRaw("content_block_delta", string(b)); err != nil {
+		return err
+	}
+
+	return s.closeCurrentBlock()
+}
+
+func (s *SSEStreamer) FinishStream(finishReason string) error {
+	s.mu.Lock()
+	if s.hasFinished {
+		s.mu.Unlock()
+		return nil
+	}
+	s.hasFinished = true
+	s.mu.Unlock()
+
+	if err := s.EnsureMessageStart(); err != nil {
+		return err
+	}
+	if err := s.closeCurrentBlock(); err != nil {
+		return err
+	}
+
+	stopReason := "end_turn"
+	if s.toolUseOccurred {
+		stopReason = "tool_use"
+	} else if finishReason == "MAX_TOKENS" {
+		stopReason = "max_tokens"
+	}
+
+	usage := map[string]interface{}{
+		"input_tokens":  s.inputTokens,
+		"output_tokens": s.outputTokens,
+	}
+	if s.cacheTokens > 0 {
+		usage["cache_read_input_tokens"] = s.cacheTokens
+	}
+
+	deltaMap := map[string]interface{}{
+		"stop_reason":   stopReason,
+		"stop_sequence": nil,
+	}
+
+	if s.requestedSafeguards {
+		toolUsesMap := make(map[string]interface{})
+		for _, tid := range s.toolCallIDs {
+			toolUsesMap[tid] = map[string]interface{}{
+				"type":    "evaluated",
+				"outcome": "not_flagged",
+			}
+		}
+		deltaMap["safeguard_results"] = []interface{}{
+			map[string]interface{}{
+				"type": "dangerous_tool_use",
+				"status": map[string]interface{}{
+					"type":      "available",
+					"tool_uses": toolUsesMap,
+				},
+			},
+		}
+	}
+
+	deltaPayload := map[string]interface{}{
+		"type":  "message_delta",
+		"delta": deltaMap,
+		"usage": usage,
+	}
+	b, _ := json.Marshal(deltaPayload)
+	if err := s.SendRaw("message_delta", string(b)); err != nil {
+		return err
+	}
+
+	return s.SendRaw("message_stop", `{"type":"message_stop"}`)
+}
+
+// ProcessGeminiChunk parses a single Gemini SSE JSON line and drives the state machine.
+func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
+	root := gjson.ParseBytes(chunkJSON)
+	if respNode := root.Get("response"); respNode.Exists() {
+		root = respNode
+	}
+
+	// Update token usage
+	if um := root.Get("usageMetadata"); um.Exists() {
+		if pt := um.Get("promptTokenCount").Int(); pt > 0 {
+			s.inputTokens = pt
+		}
+		if ct := um.Get("candidatesTokenCount").Int(); ct > 0 {
+			s.outputTokens = ct
+		}
+		if cc := um.Get("cachedContentTokenCount").Int(); cc > 0 {
+			s.cacheTokens = cc
+		}
+	}
+
+	candidates := root.Get("candidates")
+	if !candidates.IsArray() || len(candidates.Array()) == 0 {
+		return nil
+	}
+	cand := candidates.Array()[0]
+
+	parts := cand.Get("content.parts")
+	if parts.IsArray() {
+		for _, part := range parts.Array() {
+			if part.Get("thought").Bool() {
+				if t := part.Get("text").String(); t != "" {
+					if err := s.HandleThinking(t); err != nil {
+						return err
+					}
+				}
+			} else if fc := part.Get("functionCall"); fc.Exists() {
+				name := fc.Get("name").String()
+				args := fc.Get("args").Raw
+				if args == "" {
+					args = "{}"
+				}
+				if err := s.HandleFunctionCall(name, args); err != nil {
+					return err
+				}
+			} else if t := part.Get("text").String(); t != "" {
+				if err := s.HandleText(t); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Process Grounding Metadata from Google Search
+	if gm := cand.Get("groundingMetadata"); gm.Exists() {
+		if queries := gm.Get("webSearchQueries"); queries.IsArray() {
+			for _, q := range queries.Array() {
+				s.searchQueries = append(s.searchQueries, q.String())
+			}
+		}
+		if chunks := gm.Get("groundingChunks"); chunks.IsArray() {
+			for _, c := range chunks.Array() {
+				uri := c.Get("web.uri").String()
+				title := c.Get("web.title").String()
+				if uri != "" {
+					if title == "" {
+						title = uri
+					}
+					s.groundingSources = append(s.groundingSources, GroundingSource{
+						Title: title,
+						URI:   uri,
+					})
+				}
+			}
+		}
+	}
+
+	if fr := cand.Get("finishReason").String(); fr != "" && fr != "FINISH_REASON_UNSPECIFIED" {
+		// Append Grounding Sources footer if Google Search was performed
+		if len(s.groundingSources) > 0 {
+			var sb strings.Builder
+			sb.WriteString("\n\n---\n**Источники Google Search:**\n")
+			seen := make(map[string]bool)
+			for _, src := range s.groundingSources {
+				if !seen[src.URI] {
+					seen[src.URI] = true
+					sb.WriteString(fmt.Sprintf("- [%s](%s)\n", src.Title, src.URI))
+				}
+			}
+			_ = s.HandleText(sb.String())
+		}
+		return s.FinishStream(fr)
+	}
+
+	return nil
+}
+
+// StreamGeminiToClaude reads lines from Gemini stream body and translates to
+// Claude SSE events. onActivity, when non-nil, is called every time bytes
+// are actually read from upstream — the caller uses this to run an
+// idle-timeout watchdog that only cancels on genuine silence, not on total
+// elapsed duration (a single buffered function-call chunk for a huge Write
+// can legitimately take minutes to arrive).
+func StreamGeminiToClaude(streamer *SSEStreamer, r io.Reader, onActivity func()) error {
+	// Start 5-second keepalive heartbeat worker to prevent Claude Code idle timeouts during pauses
+	pingTicker := time.NewTicker(5 * time.Second)
+	defer pingTicker.Stop()
+
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+
+	go func() {
+		for {
+			select {
+			case <-pingTicker.C:
+				_ = streamer.SendKeepalivePing()
+			case <-stopPing:
+				return
+			}
+		}
+	}()
+
+	buf := make([]byte, 64*1024)
+	var leftOver string
+
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if onActivity != nil {
+				onActivity()
+			}
+			data := leftOver + string(buf[:n])
+			lines := strings.Split(data, "\n")
+			leftOver = lines[len(lines)-1]
+
+			for i := 0; i < len(lines)-1; i++ {
+				line := strings.TrimSpace(lines[i])
+				if strings.HasPrefix(line, "data:") {
+					payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+					if payload == "[DONE]" {
+						return streamer.FinishStream("STOP")
+					}
+					if strings.HasPrefix(payload, "{") {
+						if err := streamer.ProcessGeminiChunk([]byte(payload)); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+	}
+
+	if strings.TrimSpace(leftOver) != "" {
+		line := strings.TrimSpace(leftOver)
+		if strings.HasPrefix(line, "data:") {
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if strings.HasPrefix(payload, "{") {
+				_ = streamer.ProcessGeminiChunk([]byte(payload))
+			}
+		}
+	}
+
+	return streamer.FinishStream("STOP")
+}

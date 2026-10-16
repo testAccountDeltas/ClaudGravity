@@ -1,0 +1,37 @@
+# ===== Секреты и реальные учётные данные — НИКОГДА не коммитить =====
+
+# Живой конфиг: содержит сгенерированные dashboard_password/proxy_secret
+# и реальные tenant-ключи. Коммитим только config.example.json (шаблон).
+config.json
+
+# Google OAuth refresh/access токены реальных аккаунтов. Папка auths/
+# должна существовать в репо (для .gitkeep), но её содержимое — никогда.
+auths/*.json
+auths/**/*.json
+all_auths/
+all-server-auths.tar.gz
+server-auths.tar.gz
+all_auth_credentials.jsonl
+server_quota_dump.jsonl
+
+# Приватный ключ локального MITM CA + сам сертификат — генерируются
+# автоматически при первом старте (InitMitmCA), машинно-специфичны.
+certs/
+
+# ===== Собранные бинарники =====
+gateway.exe
+gateway_new.exe
+*.exe
+
+# ===== Runtime-данные / логи / БД — генерируются при работе шлюза =====
+superrelay.log
+superrelay.log.*
+superrelay_logs.db
+superrelay_logs.db-shm
+superrelay_logs.db-wal
+gateway.db
+debug_upstream_request.json
+
+# ===== Случайный мусор отладочных сессий =====
+probe.txt
+undefined/

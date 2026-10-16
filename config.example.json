@@ -1,0 +1,23 @@
+{
+  "server": {
+    "port": 8898,
+    "panic_timeout_seconds": 30,
+    "ttft_timeout_seconds": 180,
+    "read_timeout_seconds": 600,
+    "tls_port": 8900,
+    "max_stream_duration_seconds": 1800
+  },
+  "tenants": {
+    "sk-your-tenant-key-here": {
+      "name": "Default Account",
+      "google_auth_type": "api_key",
+      "google_api_key": "YOUR_GEMINI_API_KEY_HERE",
+      "google_base_url": "https://generativelanguage.googleapis.com",
+      "default_model": "gemini-2.5-flash",
+      "thinking_budget": -1,
+      "strip_search_tools": true,
+      "sticky_account": "",
+      "strategy": ""
+    }
+  }
+}

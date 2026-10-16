@@ -1,0 +1,1442 @@
+﻿<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SuperRelay — Cloud Engine Console</title>
+<style>
+:root {
+  --bg-base: #070a11;
+  --bg-card: #0d121f;
+  --bg-row-alt: #0a0f1a;
+  --bg-hover: #131c31;
+  --border-subtle: #1e293b;
+  --border-strong: #334155;
+  --text-main: #f1f5f9;
+  --text-muted: #94a3b8;
+  --text-dim: #64748b;
+  --accent-blue: #3b82f6;
+  --accent-purple: #8b5cf6;
+  --status-good: #10b981;
+  --status-warn: #f59e0b;
+  --status-crit: #ef4444;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg-base);
+  color: var(--text-main);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+.app-header {
+  height: 48px;
+  background: #090e1a;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+.brand-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.brand-logo {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.brand-badge {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  background: rgba(59,130,246,0.15);
+  color: #60a5fa;
+  border: 1px solid rgba(59,130,246,0.3);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.btn {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: all 0.15s ease;
+  text-decoration: none;
+  font-family: inherit;
+}
+.btn-primary {
+  background: #2563eb;
+  color: #fff;
+  border-color: #3b82f6;
+}
+.btn-primary:hover { background: #1d4ed8; }
+.btn-secondary {
+  background: #1e293b;
+  color: #cbd5e1;
+  border-color: #334155;
+}
+.btn-secondary:hover { background: #334155; color: #fff; }
+.btn-danger {
+  background: rgba(239,68,68,0.12);
+  color: #f87171;
+  border-color: rgba(239,68,68,0.25);
+}
+.btn-danger:hover { background: rgba(239,68,68,0.25); }
+.btn-warm {
+  background: rgba(245,158,11,0.12);
+  color: #fbbf24;
+  border-color: rgba(245,158,11,0.25);
+}
+.btn-warm:hover { background: rgba(245,158,11,0.25); }
+.btn-icon-only {
+  width: 26px;
+  height: 24px;
+  padding: 0;
+  justify-content: center;
+}
+.kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1px;
+  background: var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.kpi-tile {
+  background: #0a0f1b;
+  padding: 10px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.kpi-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+}
+.kpi-value-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.kpi-value {
+  font-size: 20px;
+  font-weight: 700;
+  font-feature-settings: "tnum";
+  color: var(--text-main);
+  font-family: var(--font-mono);
+}
+.kpi-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.tabs-bar {
+  display: flex;
+  background: #090e1a;
+  border-bottom: 1px solid var(--border-subtle);
+  padding: 0 16px;
+  gap: 16px;
+}
+.tab-btn {
+  padding: 10px 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: inherit;
+}
+.tab-btn:hover { color: var(--text-main); }
+.tab-btn.active {
+  color: #38bdf8;
+  border-bottom-color: #38bdf8;
+}
+.tab-count {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 9999px;
+  background: rgba(255,255,255,0.06);
+  color: var(--text-muted);
+}
+.tab-pane {
+  display: none;
+  padding: 14px 16px;
+}
+.tab-pane.active {
+  display: block;
+}
+.dense-table-container {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.table-toolbar {
+  padding: 8px 12px;
+  background: #0b101d;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.toolbar-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.filter-segmented {
+  display: inline-flex;
+  background: #070a12;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  padding: 1px;
+  gap: 1px;
+}
+.filter-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 3px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: inherit;
+}
+.filter-btn:hover { color: var(--text-main); }
+.filter-btn.active {
+  background: #1e293b;
+  color: #38bdf8;
+  font-weight: 600;
+}
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.filter-select, .filter-input {
+  height: 26px;
+  background: #070a12;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  color: var(--text-main);
+  font-size: 11px;
+  padding: 0 8px;
+  font-family: inherit;
+}
+.filter-select:focus, .filter-input:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+}
+.dense-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 12px;
+}
+.dense-table th {
+  background: #090e1a;
+  padding: 6px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border-subtle);
+  white-space: nowrap;
+}
+.dense-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+  color: #cbd5e1;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.dense-table tr:hover td {
+  background: var(--bg-hover);
+}
+.code-cell {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.quota-quad-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 380px;
+}
+.quota-mini-block {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.quota-mini-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-feature-settings: "tnum";
+}
+.quota-mini-track {
+  height: 4px;
+  background: #070a12;
+  border-radius: 2px;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.05);
+}
+.quota-mini-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+.badge-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+}
+.badge-ok {
+  background: rgba(16,185,129,0.12);
+  color: #34d399;
+  border: 1px solid rgba(16,185,129,0.25);
+}
+.badge-err {
+  background: rgba(239,68,68,0.12);
+  color: #f87171;
+  border: 1px solid rgba(239,68,68,0.25);
+}
+.badge-warn {
+  background: rgba(245,158,11,0.12);
+  color: #fbbf24;
+  border: 1px solid rgba(245,158,11,0.25);
+}
+.badge-neutral {
+  background: rgba(148,163,184,0.12);
+  color: #94a3b8;
+  border: 1px solid rgba(148,163,184,0.2);
+}
+.pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 6px #10b981;
+  display: inline-block;
+  animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.3; }
+  100% { opacity: 1; }
+}
+.modal {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.75);
+  backdrop-filter: blur(3px);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+.modal-content {
+  background: #0f1629;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  width: 100%;
+  max-width: 440px;
+  padding: 18px;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+}
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+}
+.modal-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #fff;
+}
+.form-field {
+  margin-bottom: 12px;
+}
+.form-field label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.form-control {
+  width: 100%;
+  height: 30px;
+  background: #070a12;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  color: #fff;
+  font-size: 12px;
+  padding: 0 10px;
+  font-family: inherit;
+}
+.form-control:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+}
+
+/* Master-Detail Sessions Layout */
+.sessions-layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 14px;
+  height: calc(100vh - 170px);
+  min-height: 550px;
+}
+.sessions-sidebar {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.sidebar-header {
+  padding: 8px 12px;
+  background: #0b101d;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.sessions-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.session-card {
+  background: #090e1a;
+  border: 1px solid var(--border-subtle);
+  border-radius: 5px;
+  padding: 8px 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.session-card:hover {
+  background: var(--bg-hover);
+  border-color: #3b82f6;
+}
+.session-card.active {
+  background: #111a2e;
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 1px #3b82f6;
+}
+.session-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.session-title {
+  font-weight: 700;
+  color: #38bdf8;
+}
+.session-time {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.session-card-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.session-agents-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 2px;
+}
+.session-detail-view {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.detail-header {
+  padding: 10px 14px;
+  background: #0b101d;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.detail-title-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.detail-summary-metrics {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.detail-table-wrap {
+  flex: 1;
+  overflow-y: auto;
+}
+</style>
+</head>
+<body>
+
+<header class="app-header">
+  <div class="brand-group">
+    <div class="brand-logo">
+      <span class="pulse-dot"></span>
+      SuperRelay Console
+    </div>
+    <span class="brand-badge">Cloud Engine v2.1</span>
+  </div>
+  <div class="header-actions">
+    <button onclick="triggerRefreshQuotas()" class="btn btn-secondary" title="Запустить фоновый опрос квот">🔄 Обновить квоты</button>
+    <button onclick="openModal('keyModal')" class="btn btn-secondary">🔑 Новый ключ</button>
+    <a href="/oauth/login" target="_blank" class="btn btn-primary">➕ Google OAuth</a>
+  </div>
+</header>
+
+<section class="kpi-strip">
+  <div class="kpi-tile">
+    <div class="kpi-label">Аккаунтов в пуле</div>
+    <div class="kpi-value-row">
+      <div id="statAccounts" class="kpi-value">-</div>
+      <div class="kpi-sub">Google CC</div>
+    </div>
+  </div>
+  <div class="kpi-tile">
+    <div class="kpi-label">Активных API-ключей</div>
+    <div class="kpi-value-row">
+      <div id="statKeys" class="kpi-value" style="color:#60a5fa;">-</div>
+      <div class="kpi-sub">Tenants</div>
+    </div>
+  </div>
+  <div class="kpi-tile">
+    <div class="kpi-label">Cache Hit Rate (Avg)</div>
+    <div class="kpi-value-row">
+      <div id="statCacheHit" class="kpi-value" style="color:#34d399;">-%</div>
+      <div class="kpi-sub">KV Prefix</div>
+    </div>
+  </div>
+  <div class="kpi-tile">
+    <div class="kpi-label">TTFT (Avg)</div>
+    <div class="kpi-value-row">
+      <div id="statTTFT" class="kpi-value" style="color:#fbbf24;">- ms</div>
+      <div class="kpi-sub">Latency</div>
+    </div>
+  </div>
+  <div class="kpi-tile">
+    <div class="kpi-label">Сессий в памяти</div>
+    <div class="kpi-value-row">
+      <div id="statSessions" class="kpi-value" style="color:#a78bfa;">-</div>
+      <div class="kpi-sub">Conversations</div>
+    </div>
+  </div>
+</section>
+
+<nav class="tabs-bar">
+  <button class="tab-btn active" onclick="switchTab('sessionsTab', this)">
+    <span>🗂️ Сессии и Дерево Агентов</span>
+    <span id="tabCountSessions" class="tab-count">0</span>
+  </button>
+  <button class="tab-btn" onclick="switchTab('logsTab', this)">
+    <span>⚡ Все запросы (Stream Log)</span>
+    <span id="tabCountLogs" class="tab-count">0</span>
+  </button>
+  <button class="tab-btn" onclick="switchTab('accountsTab', this)">
+    <span>👤 Пул Google аккаунтов & Квоты</span>
+    <span id="tabCountAccounts" class="tab-count">0</span>
+  </button>
+  <button class="tab-btn" onclick="switchTab('keysTab', this)">
+    <span>🔑 API-ключи & Sticky привязка</span>
+    <span id="tabCountKeys" class="tab-count">0</span>
+  </button>
+</nav>
+
+<!-- TAB 0: SESSIONS MASTER-DETAIL -->
+<div id="sessionsTab" class="tab-pane active">
+  <div class="sessions-layout">
+    <!-- LEFT: SESSIONS LIST -->
+    <div class="sessions-sidebar">
+      <div class="sidebar-header">
+        <span class="toolbar-title">Сессии CLI</span>
+        <button onclick="fetchSessions()" class="btn btn-secondary btn-icon-only" title="Обновить">🔄</button>
+      </div>
+      <div id="sessionsListContainer" class="sessions-list">
+        <div style="text-align:center;padding:30px;color:var(--text-dim);font-size:11px;">Загрузка сессий...</div>
+      </div>
+    </div>
+
+    <!-- RIGHT: SESSION DETAIL / TIMELINE -->
+    <div class="session-detail-view">
+      <div class="detail-header">
+        <div class="detail-title-group">
+          <span style="font-weight:700;font-size:13px;color:#f8fafc;" id="detailSessionTitle">Выберите сессию</span>
+          <span id="detailAccountBadge" class="badge-status badge-ok" style="display:none;"></span>
+        </div>
+        <div class="detail-summary-metrics" id="detailMetricsRow">
+          <!-- Populated dynamically -->
+        </div>
+      </div>
+      <div class="detail-table-wrap">
+        <table class="dense-table">
+          <thead>
+            <tr>
+              <th style="width:65px;">Время</th>
+              <th style="width:140px;">Агент / Роль</th>
+              <th style="width:110px;">Модель</th>
+              <th style="width:85px;">TTFT / Всего</th>
+              <th style="width:110px;">Токены (Вх / Исх)</th>
+              <th style="width:105px;">Кэш HIT %</th>
+              <th>Вызванные тулы</th>
+              <th style="width:80px;text-align:right;">Статус</th>
+            </tr>
+          </thead>
+          <tbody id="sessionTurnsBody">
+            <tr><td colspan="8" style="text-align:center;padding:40px;color:var(--text-dim);">Выберите сессию слева для инспекции истории ходов агентов</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TAB 1: ALL REQUESTS STREAM -->
+<div id="logsTab" class="tab-pane">
+  <div class="dense-table-container">
+    <div class="table-toolbar">
+      <div class="toolbar-title">
+        <span class="pulse-dot"></span>
+        Stream Inspector
+      </div>
+      <div class="filter-group">
+        <div class="filter-segmented" id="presetFilterButtons">
+          <button class="filter-btn active" onclick="setPresetFilter('all', this)">Все</button>
+          <button class="filter-btn" onclick="setPresetFilter('account', this)">По аккаунту</button>
+          <button class="filter-btn" onclick="setPresetFilter('key', this)">По ключу</button>
+          <button class="filter-btn" onclick="setPresetFilter('agent', this)">По агенту</button>
+          <button class="filter-btn" onclick="setPresetFilter('errors', this)">Ошибки / Паники</button>
+        </div>
+        <select id="filterAccount" class="filter-select" onchange="fetchLogs()" style="display:none;">
+          <option value="">Все аккаунты</option>
+        </select>
+        <select id="filterKey" class="filter-select" onchange="fetchLogs()" style="display:none;">
+          <option value="">Все ключи</option>
+        </select>
+        <select id="filterAgent" class="filter-select" onchange="fetchLogs()" style="display:none;">
+          <option value="">Все агенты</option>
+          <option value="main">Основной агент (Main)</option>
+          <option value="subagent">Все субагенты (Subagents)</option>
+          <option value="auxiliary">Вспомогательные (Auxiliary)</option>
+        </select>
+        <input id="filterSession" class="filter-input" placeholder="Сессия (hash)..." style="width:110px;" oninput="fetchLogs()">
+        <button onclick="fetchLogs()" class="btn btn-secondary btn-icon-only" title="Обновить сейчас">🔄</button>
+        <button onclick="clearLogs()" class="btn btn-secondary btn-icon-only" title="Очистить лог" style="color:#ef4444;">🗑️</button>
+      </div>
+    </div>
+    <table class="dense-table">
+      <thead>
+        <tr>
+          <th style="width:70px;">Время</th>
+          <th style="width:140px;">Ключ / Сессия</th>
+          <th style="width:130px;">Агент</th>
+          <th style="width:160px;">Аккаунт</th>
+          <th style="width:110px;">Модель</th>
+          <th style="width:85px;">TTFT / Всего</th>
+          <th style="width:105px;">Токены (Вх / Исх)</th>
+          <th style="width:105px;">Кэш HIT %</th>
+          <th>Тулы</th>
+          <th style="width:85px;text-align:right;">Статус</th>
+        </tr>
+      </thead>
+      <tbody id="logsTableBody">
+        <tr><td colspan="10" style="text-align:center;padding:24px;color:var(--text-dim);">Логи отсутствуют (ожидание входящих запросов)...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- TAB 2: ACCOUNTS -->
+<div id="accountsTab" class="tab-pane">
+  <div class="dense-table-container">
+    <div class="table-toolbar">
+      <div class="toolbar-title">Google CloudCode Квоты (7-дневное окно & 5-часовой лимит)</div>
+      <div class="filter-group">
+        <button onclick="triggerRefreshQuotas()" class="btn btn-secondary">🔄 Опросить все квоты</button>
+      </div>
+    </div>
+    <table class="dense-table">
+      <thead>
+        <tr>
+          <th style="width:180px;">Email</th>
+          <th style="width:130px;">Проект</th>
+          <th style="width:75px;">Статус</th>
+          <th style="width:380px;">Остатки квот (Gemini Wk | Gem 5h | 3P Wk | 3P 5h)</th>
+          <th style="width:75px;">Проверено</th>
+          <th style="width:85px;text-align:right;">Действия</th>
+        </tr>
+      </thead>
+      <tbody id="accountsTableBody">
+        <tr><td colspan="6" style="text-align:center;padding:24px;color:var(--text-dim);">Загрузка аккаунтов...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- TAB 3: KEYS -->
+<div id="keysTab" class="tab-pane">
+  <div class="dense-table-container">
+    <div class="table-toolbar">
+      <div class="toolbar-title">Клиентские Bearer Ключи & Ротация</div>
+      <button onclick="openModal('keyModal')" class="btn btn-primary">➕ Создать ключ</button>
+    </div>
+    <table class="dense-table">
+      <thead>
+        <tr>
+          <th>Клиент / Название</th>
+          <th>API-Ключ (Bearer)</th>
+          <th>Привязка аккаунта (KV Cache)</th>
+          <th>Модель</th>
+          <th style="text-align:right;">Управление</th>
+        </tr>
+      </thead>
+      <tbody id="keysTableBody">
+        <tr><td colspan="5" style="text-align:center;padding:24px;color:var(--text-dim);">Загрузка ключей...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- MODAL: CREATE KEY -->
+<div id="keyModal" class="modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <div class="modal-title">Создание API-ключа</div>
+      <button onclick="closeModal('keyModal')" class="btn btn-secondary btn-icon-only">✕</button>
+    </div>
+    <div class="form-field">
+      <label>Имя клиента / Workspace</label>
+      <input id="newKeyName" class="form-control" placeholder="Например: Claude Code MacBook Pro">
+    </div>
+    <div class="form-field">
+      <label>Модель по умолчанию</label>
+      <select id="newKeyModel" class="form-control">
+        <optgroup label="Google Gemini (Основная квота)">
+          <option value="gemini-2.5-flash" selected>gemini-2.5-flash (быстрая, огромная квота)</option>
+          <option value="gemini-3.8-flash-tiered">gemini-3.8-flash-tiered (автоматический тиринг)</option>
+          <option value="gemini-2.5-flash-thinking">gemini-2.5-flash-thinking (рассуждения)</option>
+          <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+          <option value="gemini-2.5-pro">gemini-2.5-pro (глубокие рассуждения)</option>
+        </optgroup>
+        <optgroup label="Claude & 3P (3P Квота Antigravity)">
+          <option value="claude-sonnet-4-6">claude-sonnet-4-6 (Нативный Claude Sonnet)</option>
+          <option value="claude-opus-4-6-thinking">claude-opus-4-6-thinking (Нативный Claude Opus)</option>
+          <option value="gpt-oss-120b-medium">gpt-oss-120b-medium</option>
+        </optgroup>
+      </select>
+    </div>
+    <div class="form-field">
+      <label>Стратегия привязки кэша</label>
+      <select id="newKeyStrategy" class="form-control">
+        <option value="sticky" selected>Sticky (1 аккаунт на 1 ключ пока есть квота) [Рекомендуется]</option>
+        <option value="round_robin">Round-Robin (ротация по кругу)</option>
+      </select>
+    </div>
+    <div class="form-field">
+      <label>Закрепить конкретный аккаунт (опционально)</label>
+      <select id="newKeyAccount" class="form-control">
+        <option value="">Автоматический подбор лучшего по квоте</option>
+      </select>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
+      <button onclick="closeModal('keyModal')" class="btn btn-secondary">Отмена</button>
+      <button onclick="submitNewKey()" class="btn btn-primary">Создать ключ</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let accountsData = [];
+let keysData = {};
+
+function switchTab(tabId, btn) {
+  document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById(tabId).classList.add('active');
+  btn.classList.add('active');
+}
+
+function openModal(id) {
+  document.getElementById(id).style.display = 'flex';
+}
+
+function closeModal(id) {
+  document.getElementById(id).style.display = 'none';
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function renderMiniBar(label, pct, reset) {
+  let color = '#10b981';
+  if (pct <= 10) color = '#ef4444';
+  else if (pct <= 40) color = '#f59e0b';
+
+  return `
+    <div class="quota-mini-block" title="${label}: ${pct}% (Сброс: ${reset || 'н/д'})">
+      <div class="quota-mini-label">
+        <span>${label}</span>
+        <span style="font-weight:600;color:${color};">${pct}%</span>
+      </div>
+      <div class="quota-mini-track">
+        <div class="quota-mini-fill" style="width:${pct}%;background:${color};"></div>
+      </div>
+    </div>
+  `;
+}
+
+function parseQuotas(quotas) {
+  let res = {
+    geminiWeekly: 100, geminiWeeklyReset: '',
+    gemini5h: 100, gemini5hReset: '',
+    tpWeekly: 100, tpWeeklyReset: '',
+    tp5h: 100, tp5hReset: '',
+    loaded: false
+  };
+
+  if (!quotas || quotas.length === 0) return res;
+  res.loaded = true;
+
+  for (const grp of quotas) {
+    for (const b of grp.buckets || []) {
+      const pct = Math.round((b.remaining_fraction || 0) * 100);
+      const id = (b.bucket_id || '').toLowerCase();
+      const win = (b.window || '').toLowerCase();
+      const rtime = b.reset_time ? b.reset_time.substring(11, 16) : '';
+
+      if (id.includes('gemini') || grp.display_name.includes('Gemini')) {
+        if (win.includes('week') || id.includes('week')) {
+          res.geminiWeekly = pct;
+          res.geminiWeeklyReset = rtime;
+        } else if (win.includes('5h') || id.includes('5h')) {
+          res.gemini5h = pct;
+          res.gemini5hReset = rtime;
+        }
+      } else {
+        if (win.includes('week') || id.includes('week')) {
+          res.tpWeekly = pct;
+          res.tpWeeklyReset = rtime;
+        } else if (win.includes('5h') || id.includes('5h')) {
+          res.tp5h = pct;
+          res.tp5hReset = rtime;
+        }
+      }
+    }
+  }
+  return res;
+}
+
+function fetchAccounts() {
+  fetch('/api/accounts')
+    .then(r => r.json())
+    .then(accounts => {
+      accountsData = accounts || [];
+      document.getElementById('tabCountAccounts').innerText = accountsData.length;
+      document.getElementById('statAccounts').innerText = accountsData.length;
+
+      const fAcc = document.getElementById('filterAccount');
+      const curFilter = fAcc.value;
+      const modalAcc = document.getElementById('newKeyAccount');
+
+      let accOptions = '<option value="">Все аккаунты</option>';
+      let modalOptions = '<option value="">Автоматический подбор лучшего по квоте</option>';
+
+      for (const a of accountsData) {
+        accOptions += `<option value="${escapeHtml(a.email)}">${escapeHtml(a.email)}</option>`;
+        if (!a.disabled) {
+          modalOptions += `<option value="${escapeHtml(a.email)}">${escapeHtml(a.email)}</option>`;
+        }
+      }
+      fAcc.innerHTML = accOptions;
+      fAcc.value = curFilter;
+      modalAcc.innerHTML = modalOptions;
+
+      const tbody = document.getElementById('accountsTableBody');
+      if (accountsData.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:24px;color:var(--text-dim);">Нет подключенных Google аккаунтов. Нажмите "Google OAuth" для добавления.</td></tr>';
+        return;
+      }
+
+      let html = '';
+      for (const a of accountsData) {
+        const q = parseQuotas(a.quotas);
+        let quadHtml = '';
+        if (!q.loaded) {
+          quadHtml = '<span style="color:var(--text-dim);font-size:11px;">Квоты не загружены (нажмите 🔄)</span>';
+        } else {
+          quadHtml = `
+            <div class="quota-quad-cell">
+              ${renderMiniBar('Gem Wk', q.geminiWeekly, q.geminiWeeklyReset)}
+              ${renderMiniBar('Gem 5h', q.gemini5h, q.gemini5hReset)}
+              ${renderMiniBar('3P Wk', q.tpWeekly, q.tpWeeklyReset)}
+              ${renderMiniBar('3P 5h', q.tp5h, q.tp5hReset)}
+            </div>
+          `;
+        }
+
+        const statusBadge = a.disabled
+          ? '<span class="badge-status badge-err">✕ Отключен</span>'
+          : '<span class="badge-status badge-ok">✓ Активен</span>';
+
+        let lastChecked = 'никогда';
+        if (a.last_checked && !a.last_checked.startsWith('0001')) {
+          lastChecked = a.last_checked.substring(11, 19);
+        }
+
+        html += `
+          <tr>
+            <td style="font-weight:600;color:#f8fafc;">${escapeHtml(a.email)}</td>
+            <td class="code-cell" style="color:var(--text-dim);">${escapeHtml(a.project_id || 'aicode-consumers')}</td>
+            <td>${statusBadge}</td>
+            <td>${quadHtml}</td>
+            <td class="code-cell" style="color:var(--text-dim);font-size:11px;">${lastChecked}</td>
+            <td style="text-align:right;">
+              <button onclick="warmupAccount('${escapeHtml(a.email)}', this)" class="btn btn-warm" style="height:24px;padding:0 8px;font-size:11px;">🔥 Прогреть</button>
+            </td>
+          </tr>
+        `;
+      }
+      tbody.innerHTML = html;
+    })
+    .catch(err => console.error('Error fetching accounts:', err));
+}
+
+function fetchKeys() {
+  fetch('/api/keys')
+    .then(r => r.json())
+    .then(keys => {
+      keysData = keys || {};
+      const keyCount = Object.keys(keysData).length;
+      document.getElementById('tabCountKeys').innerText = keyCount;
+      document.getElementById('statKeys').innerText = keyCount;
+
+      const fKey = document.getElementById('filterKey');
+      const curVal = fKey.value;
+      let filterOpts = '<option value="">Все ключи</option>';
+
+      const tbody = document.getElementById('keysTableBody');
+      if (keyCount === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:24px;color:var(--text-dim);">Нет созданных ключей.</td></tr>';
+        return;
+      }
+
+      let html = '';
+      for (const [key, t] of Object.entries(keysData)) {
+        filterOpts += `<option value="${escapeHtml(key)}">${escapeHtml(t.name || key)}</option>`;
+
+        let bindBadge = '<span class="badge-status badge-neutral">Auto Pool</span>';
+        if (t.sticky_account) {
+          bindBadge = `<span class="badge-status badge-ok" style="background:rgba(139,92,246,0.15);color:#c084fc;border-color:rgba(139,92,246,0.3);">Sticky: ${escapeHtml(t.sticky_account)}</span>`;
+        } else if (t.google_auth_type === 'api_key') {
+          bindBadge = '<span class="badge-status badge-warn">Google API Key</span>';
+        }
+
+        const masked = key.length > 20 ? key.substring(0, 10) + '...' + key.substring(key.length - 6) : key;
+
+        html += `
+          <tr>
+            <td style="font-weight:600;color:#f8fafc;">${escapeHtml(t.name || 'Default')}</td>
+            <td class="code-cell">
+              <span style="color:#fbbf24;">${masked}</span>
+              <button onclick="navigator.clipboard.writeText('${escapeHtml(key)}');alert('Ключ скопирован!');" style="background:none;border:none;cursor:pointer;color:var(--text-dim);margin-left:6px;" title="Скопировать">📋</button>
+            </td>
+            <td>${bindBadge}</td>
+            <td class="code-cell" style="color:var(--text-muted);">${escapeHtml(t.default_model || 'gemini-2.5-flash')}</td>
+            <td style="text-align:right;">
+              <button onclick="deleteKey('${escapeHtml(key)}')" class="btn btn-danger" style="height:24px;padding:0 8px;font-size:11px;">Удалить</button>
+            </td>
+          </tr>
+        `;
+      }
+      tbody.innerHTML = html;
+      fKey.innerHTML = filterOpts;
+      fKey.value = curVal;
+    })
+    .catch(err => console.error('Error fetching keys:', err));
+}
+
+let activeFilterMode = 'all';
+
+function setPresetFilter(mode, btn) {
+  activeFilterMode = mode;
+  document.querySelectorAll('#presetFilterButtons .filter-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+
+  const fAcc = document.getElementById('filterAccount');
+  const fKey = document.getElementById('filterKey');
+  const fAgent = document.getElementById('filterAgent');
+
+  fAcc.style.display = 'none';
+  fKey.style.display = 'none';
+  fAgent.style.display = 'none';
+  fAcc.value = '';
+  fKey.value = '';
+  fAgent.value = '';
+
+  if (mode === 'account') {
+    fAcc.style.display = 'inline-block';
+  } else if (mode === 'key') {
+    fKey.style.display = 'inline-block';
+  } else if (mode === 'agent') {
+    fAgent.style.display = 'inline-block';
+  }
+  fetchLogs();
+}
+
+function fetchLogs() {
+  const fAcc = document.getElementById('filterAccount').value;
+  const fKey = document.getElementById('filterKey').value;
+  const fAgent = document.getElementById('filterAgent').value;
+  const fSess = document.getElementById('filterSession').value;
+  const isErrOnly = (activeFilterMode === 'errors');
+
+  let url = '/api/logs?limit=100';
+  if (fAcc) url += '&account=' + encodeURIComponent(fAcc);
+  if (fKey) url += '&key=' + encodeURIComponent(fKey);
+  if (fAgent) url += '&agent=' + encodeURIComponent(fAgent);
+  if (fSess) url += '&session=' + encodeURIComponent(fSess);
+  if (isErrOnly) url += '&errors=1';
+
+  fetch(url)
+    .then(r => r.json())
+    .then(data => {
+      const logs = data.logs || [];
+      const stats = data.stats || {};
+
+      document.getElementById('tabCountLogs').innerText = logs.length;
+      if (stats.avg_cache_hit_rate !== undefined) {
+        document.getElementById('statCacheHit').innerText = stats.avg_cache_hit_rate.toFixed(1) + '%';
+      }
+      if (stats.avg_ttft_ms !== undefined) {
+        document.getElementById('statTTFT').innerText = stats.avg_ttft_ms + ' ms';
+      }
+      if (stats.active_sessions !== undefined) {
+        document.getElementById('statSessions').innerText = stats.active_sessions;
+      }
+
+      const tbody = document.getElementById('logsTableBody');
+      if (logs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--text-dim);">Логи отсутствуют (ожидание входящих запросов от Claude Code)...</td></tr>';
+        return;
+      }
+
+      let html = '';
+      for (const item of logs) {
+        const timeStr = item.timestamp ? item.timestamp.substring(11, 19) : '-';
+
+        let statusBadge = '<span class="badge-status badge-ok">200 OK</span>';
+        if (item.status >= 500) {
+          statusBadge = `<span class="badge-status badge-err">${item.status} ERR</span>`;
+        } else if (item.status >= 400) {
+          statusBadge = `<span class="badge-status badge-warn">${item.status}</span>`;
+        }
+
+        let badgesExtra = '';
+        if (item.was_panicked) {
+          badgesExtra += '<span class="badge-status badge-warn" title="Upstream TTFT > 30s: отправлен early keepalive ping" style="margin-left:4px;">⏱ 30s PING</span>';
+        }
+        if (item.shrunk) {
+          badgesExtra += '<span class="badge-status badge-neutral" title="tool_result усечен > 64KB (Middle-Truncation)" style="margin-left:4px;">✂ 64K</span>';
+        }
+
+        let agentBadge = '<span class="badge-status badge-neutral" style="font-size:10px;">👤 Main</span>';
+        if (item.agent_type === 'subagent' || (item.agent_key && item.agent_key.startsWith('sub:'))) {
+          const subTitle = item.subagent_name || item.agent_key.replace('sub:', '');
+          agentBadge = `<span class="badge-status badge-ok" style="background:rgba(59,130,246,0.15);color:#93c5fd;border-color:rgba(59,130,246,0.3);font-size:10px;">🤖 Sub: ${escapeHtml(subTitle)}</span>`;
+        } else if (item.agent_type === 'auxiliary') {
+          agentBadge = '<span class="badge-status badge-neutral" style="background:rgba(148,163,184,0.15);color:#cbd5e1;font-size:10px;">⚡ Aux</span>';
+        }
+
+        let toolsStr = '-';
+        if (item.tools && item.tools.length > 0) {
+          toolsStr = item.tools.map(t => {
+            if (t === 'googleSearch' || t === 'WebSearch') {
+              return `<span class="badge-status badge-ok" style="background:rgba(16,185,129,0.15);color:#34d399;border-color:rgba(16,185,129,0.3);font-family:var(--font-mono);font-size:9px;" title="Использован нативный Google Search Grounding">🌐 WebSearch</span>`;
+            }
+            return `<span class="badge-status badge-neutral" style="font-family:var(--font-mono);font-size:9px;">${escapeHtml(t)}</span>`;
+          }).join(' ');
+        }
+
+        const cacheRate = item.cache_hit_rate ? item.cache_hit_rate.toFixed(1) + '%' : '0%';
+        let cacheColor = 'var(--text-dim)';
+        if (item.cache_hit_rate > 50) cacheColor = '#34d399';
+        else if (item.cache_hit_rate > 0) cacheColor = '#fbbf24';
+
+        html += `
+          <tr>
+            <td class="code-cell" style="color:var(--text-dim);font-size:11px;">${timeStr}</td>
+            <td class="code-cell">
+              <div style="color:var(--text-main);">${escapeHtml(item.key_masked || item.key)}</div>
+              <div style="color:var(--text-dim);font-size:10px;">${escapeHtml(item.session_id || '-')}</div>
+            </td>
+            <td>${agentBadge}</td>
+            <td class="code-cell" style="color:#60a5fa;">${escapeHtml(item.account || '-')}</td>
+            <td class="code-cell" style="color:var(--text-muted);font-size:11px;">${escapeHtml(item.model || '-')}</td>
+            <td class="code-cell" style="font-size:11px;">
+              <span style="color:#fbbf24;">${item.ttft_ms}ms</span>
+              <span style="color:var(--text-dim);font-size:10px;"> / ${item.total_dur_ms}ms</span>
+            </td>
+            <td class="code-cell" style="font-size:11px;">
+              <span>${item.in_tokens}</span>
+              <span style="color:var(--text-dim);"> / </span>
+              <span style="color:#a78bfa;">${item.out_tokens}</span>
+            </td>
+            <td class="code-cell" style="font-size:11px;color:${cacheColor};font-weight:600;">
+              ${cacheRate}
+              <div style="font-size:10px;font-weight:normal;color:var(--text-dim);">${item.cache_read_tokens || 0} tok</div>
+            </td>
+            <td>${toolsStr}</td>
+            <td style="text-align:right;">
+              <div style="display:inline-flex;align-items:center;">
+                ${statusBadge}
+                ${badgesExtra}
+              </div>
+              ${item.error ? `<div style="color:#f87171;font-size:10px;margin-top:2px;max-width:140px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(item.error)}">${escapeHtml(item.error)}</div>` : ''}
+            </td>
+          </tr>
+        `;
+      }
+      tbody.innerHTML = html;
+    })
+    .catch(err => console.error('Error fetching logs:', err));
+}
+
+function triggerRefreshQuotas() {
+  fetch('/api/refresh-quotas')
+    .then(() => {
+      alert('🔄 Запущен фоновый опрос квот по всем аккаунтам. Данные обновятся через несколько секунд.');
+      setTimeout(fetchAccounts, 3000);
+    });
+}
+
+function clearLogs() {
+  if (!confirm('Очистить историю запросов?')) return;
+  fetch('/api/logs', { method: 'DELETE' })
+    .then(() => fetchLogs())
+    .catch(err => console.error('Error clearing logs:', err));
+}
+
+function warmupAccount(email, btn) {
+  const origText = btn.innerText;
+  btn.innerText = '⏳ ...';
+  btn.disabled = true;
+
+  fetch('/api/warmup?email=' + encodeURIComponent(email))
+    .then(r => r.json())
+    .then(data => {
+      if (data.success) {
+        alert('✓ ' + data.message);
+        fetchAccounts();
+      } else {
+        alert('Ошибка прогрева: ' + data.error);
+      }
+    })
+    .catch(err => alert('Ошибка сети: ' + err))
+    .finally(() => {
+      btn.innerText = origText;
+      btn.disabled = false;
+    });
+}
+
+function submitNewKey() {
+  const name = document.getElementById('newKeyName').value.trim();
+  if (!name) return alert('Введите имя клиента / Workspace');
+  const model = document.getElementById('newKeyModel').value;
+  const strategy = document.getElementById('newKeyStrategy').value;
+  const sticky_account = document.getElementById('newKeyAccount').value;
+
+  fetch('/api/keys', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, model, strategy, sticky_account })
+  })
+  .then(r => r.json())
+  .then(data => {
+    alert('Ключ успешно создан:\n' + data.key);
+    closeModal('keyModal');
+    fetchKeys();
+  })
+  .catch(err => alert('Ошибка создания ключа: ' + err));
+}
+
+function deleteKey(key) {
+  if (!confirm('Удалить API-ключ ' + key + '?')) return;
+  fetch('/api/keys?key=' + encodeURIComponent(key), { method: 'DELETE' })
+    .then(() => fetchKeys())
+    .catch(err => alert('Ошибка удаления: ' + err));
+}
+
+// Initial Boot
+let activeSelectedSession = '';
+
+function fetchSessions() {
+  fetch('/api/sessions')
+    .then(r => r.json())
+    .then(sessions => {
+      const listContainer = document.getElementById('sessionsListContainer');
+      const countEl = document.getElementById('tabCountSessions');
+      countEl.innerText = sessions ? sessions.length : 0;
+
+      if (!sessions || sessions.length === 0) {
+        listContainer.innerHTML = '<div style="text-align:center;padding:30px;color:var(--text-dim);font-size:11px;">Нет активных сессий</div>';
+        return;
+      }
+
+      let html = '';
+      for (const s of sessions) {
+        const isSelected = (s.session_id === activeSelectedSession);
+        const activeClass = isSelected ? 'active' : '';
+
+        let subsBadge = '';
+        if (s.subagent_names && s.subagent_names.length > 0) {
+          subsBadge = s.subagent_names.map(name => `<span class="badge-status badge-ok" style="background:rgba(59,130,246,0.15);color:#93c5fd;font-size:9px;">🤖 ${escapeHtml(name)}</span>`).join(' ');
+        } else if (s.sub_requests > 0) {
+          subsBadge = `<span class="badge-status badge-ok" style="font-size:9px;">🤖 ${s.sub_requests} sub-turns</span>`;
+        }
+
+        const lastTime = s.last_time ? s.last_time.substring(11, 19) : '-';
+        const hitRateStr = s.cache_hit_rate ? s.cache_hit_rate.toFixed(1) + '%' : '0%';
+
+        html += `
+          <div class="session-card ${activeClass}" onclick="selectSession('${escapeHtml(s.session_id)}')">
+            <div class="session-card-header">
+              <span class="session-title">${escapeHtml(s.session_id)}</span>
+              <span class="session-time">${lastTime}</span>
+            </div>
+            <div class="session-card-meta">
+              <span>Ключ: <b style="color:#fbbf24;">${escapeHtml(s.key_masked)}</b></span>
+              <span>Ходов: <b>${s.total_requests}</b></span>
+            </div>
+            <div class="session-card-meta">
+              <span>Google: <span style="color:#60a5fa;">${escapeHtml(s.account)}</span></span>
+              <span>Hit: <b style="color:#34d399;">${hitRateStr}</b></span>
+            </div>
+            ${subsBadge ? `<div class="session-agents-row">${subsBadge}</div>` : ''}
+          </div>
+        `;
+      }
+      listContainer.innerHTML = html;
+
+      // Auto select first session if none selected
+      if (!activeSelectedSession && sessions.length > 0) {
+        selectSession(sessions[0].session_id);
+      }
+    })
+    .catch(err => console.error('Error fetching sessions:', err));
+}
+
+function selectSession(sessionId) {
+  activeSelectedSession = sessionId;
+  document.querySelectorAll('.session-card').forEach(el => el.classList.remove('active'));
+
+  fetchSessionsQuiet();
+
+  document.getElementById('detailSessionTitle').innerText = 'Сессия: ' + sessionId;
+
+  fetch('/api/logs?session=' + encodeURIComponent(sessionId) + '&limit=200')
+    .then(r => r.json())
+    .then(data => {
+      const logs = data.logs || [];
+      const tbody = document.getElementById('sessionTurnsBody');
+
+      if (logs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;color:var(--text-dim);">Ходы не найдены</td></tr>';
+        return;
+      }
+
+      const accBadge = document.getElementById('detailAccountBadge');
+      accBadge.style.display = 'inline-block';
+      accBadge.innerText = 'Google: ' + logs[0].account;
+
+      let totalIn = 0, totalOut = 0, totalCache = 0;
+      let html = '';
+
+      for (const item of logs) {
+        totalIn += item.in_tokens || 0;
+        totalOut += item.out_tokens || 0;
+        totalCache += item.cache_read_tokens || 0;
+
+        const timeStr = item.timestamp ? item.timestamp.substring(11, 19) : '-';
+
+        let agentBadge = '<span class="badge-status badge-neutral" style="font-size:10px;">👤 Main Agent</span>';
+        if (item.agent_type === 'subagent' || (item.agent_key && item.agent_key.startsWith('sub:'))) {
+          const subTitle = item.subagent_name || item.agent_key.replace('sub:', '');
+          agentBadge = `<span class="badge-status badge-ok" style="background:rgba(59,130,246,0.15);color:#93c5fd;border-color:rgba(59,130,246,0.3);font-size:10px;">🤖 Sub: ${escapeHtml(subTitle)}</span>`;
+        } else if (item.agent_type === 'auxiliary') {
+          agentBadge = '<span class="badge-status badge-neutral" style="background:rgba(148,163,184,0.15);color:#cbd5e1;font-size:10px;">⚡ Aux</span>';
+        }
+
+        let statusBadge = '<span class="badge-status badge-ok">200 OK</span>';
+        if (item.status >= 500) {
+          statusBadge = `<span class="badge-status badge-err">${item.status}</span>`;
+        } else if (item.status >= 400) {
+          statusBadge = `<span class="badge-status badge-warn">${item.status}</span>`;
+        }
+
+        let badgesExtra = '';
+        if (item.was_panicked) {
+          badgesExtra += '<span class="badge-status badge-warn" title="Early keepalive ping 30s" style="margin-left:4px;">⏱ 30s</span>';
+        }
+        if (item.shrunk) {
+          badgesExtra += '<span class="badge-status badge-neutral" title="Truncated >64KB" style="margin-left:4px;">✂ 64K</span>';
+        }
+
+        let toolsStr = '-';
+        if (item.tools && item.tools.length > 0) {
+          toolsStr = item.tools.map(t => {
+            if (t === 'googleSearch' || t === 'WebSearch') {
+              return `<span class="badge-status badge-ok" style="background:rgba(16,185,129,0.15);color:#34d399;border-color:rgba(16,185,129,0.3);font-family:var(--font-mono);font-size:9px;" title="Использован нативный Google Search Grounding">🌐 WebSearch</span>`;
+            }
+            return `<span class="badge-status badge-neutral" style="font-family:var(--font-mono);font-size:9px;">${escapeHtml(t)}</span>`;
+          }).join(' ');
+        }
+
+        const cacheRate = item.cache_hit_rate ? item.cache_hit_rate.toFixed(1) + '%' : '0%';
+        let cacheColor = 'var(--text-dim)';
+        if (item.cache_hit_rate > 50) cacheColor = '#34d399';
+        else if (item.cache_hit_rate > 0) cacheColor = '#fbbf24';
+
+        html += `
+          <tr>
+            <td class="code-cell" style="color:var(--text-dim);font-size:11px;">${timeStr}</td>
+            <td>${agentBadge}</td>
+            <td class="code-cell" style="color:var(--text-muted);font-size:11px;">${escapeHtml(item.model || '-')}</td>
+            <td class="code-cell" style="font-size:11px;">
+              <span style="color:#fbbf24;">${item.ttft_ms}ms</span>
+              <span style="color:var(--text-dim);font-size:10px;"> / ${item.total_dur_ms}ms</span>
+            </td>
+            <td class="code-cell" style="font-size:11px;">
+              <span>${item.in_tokens}</span>
+              <span style="color:var(--text-dim);"> / </span>
+              <span style="color:#a78bfa;">${item.out_tokens}</span>
+            </td>
+            <td class="code-cell" style="font-size:11px;color:${cacheColor};font-weight:600;">
+              ${cacheRate}
+              <div style="font-size:10px;font-weight:normal;color:var(--text-dim);">${item.cache_read_tokens || 0} tok</div>
+            </td>
+            <td>${toolsStr}</td>
+            <td style="text-align:right;">
+              ${statusBadge}
+              ${badgesExtra}
+            </td>
+          </tr>
+        `;
+      }
+      tbody.innerHTML = html;
+
+      const metricsRow = document.getElementById('detailMetricsRow');
+      const effHit = totalIn > 0 ? ((totalCache / totalIn) * 100).toFixed(1) : '0';
+      metricsRow.innerHTML = `
+        <span>Ходов: <b style="color:#fff;">${logs.length}</b></span>
+        <span>Вход: <b style="color:#fff;">${totalIn} tok</b></span>
+        <span>Выход: <b style="color:#a78bfa;">${totalOut} tok</b></span>
+        <span>Кэш: <b style="color:#34d399;">${effHit}%</b></span>
+      `;
+    })
+    .catch(err => console.error('Error fetching session turns:', err));
+}
+
+function fetchSessionsQuiet() {
+  fetch('/api/sessions')
+    .then(r => r.json())
+    .then(sessions => {
+      document.getElementById('tabCountSessions').innerText = sessions ? sessions.length : 0;
+    })
+    .catch(err => console.error(err));
+}
+
+// Initial Boot
+fetchAccounts();
+fetchKeys();
+fetchSessions();
+fetchLogs();
+
+// Smooth Polling
+setInterval(() => {
+  fetchSessions();
+  fetchLogs();
+  if (activeSelectedSession) {
+    selectSession(activeSelectedSession);
+  }
+}, 2500);
+setInterval(() => {
+  fetchAccounts();
+  fetchKeys();
+}, 15000);
+
+</script>
+</body>
+</html>

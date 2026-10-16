@@ -1,0 +1,386 @@
+﻿package main
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type MitmCA struct {
+	caCert    *x509.Certificate
+	caKey     *rsa.PrivateKey
+	caPEM     []byte
+	caPEMPath string
+	certCache sync.Map
+}
+
+func InitMitmCA(caDir string) (*MitmCA, error) {
+	if err := os.MkdirAll(caDir, 0755); err != nil {
+		return nil, err
+	}
+	caCertPath := filepath.Join(caDir, "superrelay-ca.pem")
+	caKeyPath := filepath.Join(caDir, "superrelay-ca.key")
+
+	var caCert *x509.Certificate
+	var caKey *rsa.PrivateKey
+	var caPEM []byte
+
+	certBytes, errCert := os.ReadFile(caCertPath)
+	keyBytes, errKey := os.ReadFile(caKeyPath)
+
+	if errCert == nil && errKey == nil {
+		block, _ := pem.Decode(certBytes)
+		if block != nil {
+			caCert, _ = x509.ParseCertificate(block.Bytes)
+		}
+		keyBlock, _ := pem.Decode(keyBytes)
+		if keyBlock != nil {
+			caKey, _ = x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+		}
+		caPEM = certBytes
+	}
+
+	if caCert == nil || caKey == nil {
+		priv, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			return nil, err
+		}
+		template := x509.Certificate{
+			SerialNumber: big.NewInt(time.Now().UnixNano()),
+			Subject: pkix.Name{
+				Organization: []string{"SuperRelay Internal CA"},
+				CommonName:   "SuperRelay Local Root CA",
+			},
+			NotBefore:             time.Now().Add(-24 * time.Hour),
+			NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
+			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+			BasicConstraintsValid: true,
+			IsCA:                  true,
+			MaxPathLen:            2,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+		if err != nil {
+			return nil, err
+		}
+		caCert, _ = x509.ParseCertificate(der)
+		caKey = priv
+		caPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+
+		_ = os.WriteFile(caCertPath, caPEM, 0644)
+		_ = os.WriteFile(caKeyPath, keyPEM, 0600)
+	}
+
+	return &MitmCA{
+		caCert:    caCert,
+		caKey:     caKey,
+		caPEM:     caPEM,
+		caPEMPath: caCertPath,
+	}, nil
+}
+
+func (m *MitmCA) GetCAPath() string {
+	abs, err := filepath.Abs(m.caPEMPath)
+	if err == nil {
+		return abs
+	}
+	return m.caPEMPath
+}
+
+func (m *MitmCA) GetCertificate(domain string) (tls.Certificate, error) {
+	if val, ok := m.certCache.Load(domain); ok {
+		return val.(tls.Certificate), nil
+	}
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject: pkix.Name{
+			CommonName:   domain,
+			Organization: []string{"SuperRelay Internal Proxy"},
+		},
+		NotBefore:             time.Now().Add(-24 * time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{domain, "localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, m.caCert, &priv.PublicKey, m.caKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	m.certCache.Store(domain, tlsCert)
+	return tlsCert, nil
+}
+
+// proxyAuthOK accepts the secret either as "Bearer <secret>" (manual
+// testing, curl --proxy-header) or as HTTP Basic auth with the secret as
+// the username (what every HTTP client sends when HTTPS_PROXY is set to
+// http://<secret>:x@host:port — the standard way to embed proxy
+// credentials in the proxy URL).
+func proxyAuthOK(r *http.Request, secret string) bool {
+	header := r.Header.Get("Proxy-Authorization")
+	if bearer, ok := strings.CutPrefix(header, "Bearer "); ok {
+		return subtle.ConstantTimeCompare([]byte(bearer), []byte(secret)) == 1
+	}
+	if encoded, ok := strings.CutPrefix(header, "Basic "); ok {
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return false
+		}
+		user := decoded
+		if idx := bytes.IndexByte(decoded, ':'); idx >= 0 {
+			user = decoded[:idx]
+		}
+		return subtle.ConstantTimeCompare(user, []byte(secret)) == 1
+	}
+	return false
+}
+
+// HandleConnectTunnel implements native HTTP CONNECT proxying and TLS interception.
+// proxySecret, when non-empty, is required as a "Proxy-Authorization: Bearer
+// <secret>" header on every CONNECT request — without it, anyone who can
+// reach this port could use it as an open relay to the internet.
+func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, targetHandler http.Handler, proxySecret string) {
+	if proxySecret != "" && !proxyAuthOK(r, proxySecret) {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="SuperRelay Proxy"`)
+		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
+		return
+	}
+
+	host := r.Host
+	if h, _, err := net.SplitHostPort(r.Host); err == nil {
+		host = h
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	// 1. Send 200 Connection Established to client
+	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// 2. Intercept Anthropic and Claude API endpoints locally
+	if strings.Contains(host, "anthropic.com") || strings.Contains(host, "claude.ai") {
+		tlsCert, err := ca.GetCertificate(host)
+		if err != nil {
+			clientConn.Close()
+			return
+		}
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{tlsCert},
+		}
+		tlsConn := tls.Server(clientConn, tlsConfig)
+		go serveInterceptedTLS(tlsConn, targetHandler)
+		return
+	}
+
+	// 3. Transparent TCP tunnel for all other external hosts
+	targetConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	if err != nil {
+		clientConn.Close()
+		return
+	}
+	// Guard against either side going silent forever and leaking the
+	// goroutines/fds indefinitely (e.g. a client that opens a tunnel and
+	// never sends anything).
+	idleDeadline := 10 * time.Minute
+	_ = clientConn.SetDeadline(time.Now().Add(idleDeadline))
+	_ = targetConn.SetDeadline(time.Now().Add(idleDeadline))
+
+	go func() {
+		defer clientConn.Close()
+		defer targetConn.Close()
+		_, _ = io.Copy(targetConn, clientConn)
+	}()
+	go func() {
+		defer clientConn.Close()
+		defer targetConn.Close()
+		_, _ = io.Copy(clientConn, targetConn)
+	}()
+}
+
+func serveInterceptedTLS(tlsConn *tls.Conn, handler http.Handler) {
+	defer tlsConn.Close()
+	// A hung/malicious client inside the tunnel must not leak this
+	// goroutine or connection forever.
+	_ = tlsConn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			LogGateway("[SuperRelay Gateway] MITM handler panic (recovered): %v", rec)
+		}
+	}()
+
+	if err := tlsConn.Handshake(); err != nil {
+		LogGateway("[SuperRelay Gateway] MITM TLS handshake failed: %v", err)
+		return
+	}
+
+	reader := bufio.NewReader(tlsConn)
+	req, err := http.ReadRequest(reader)
+	if err != nil {
+		LogGateway("[SuperRelay Gateway] MITM request parse failed: %v", err)
+		return
+	}
+
+	rw := newMitmResponseWriter(tlsConn)
+	handler.ServeHTTP(rw, req)
+	rw.Flush()
+	// Always close after one request-response pair instead of looping for
+	// keep-alive reuse: these intercepted calls (oauth/usage, bootstrap) are
+	// low-frequency control calls, and a hand-rolled HTTP/1.1 writer sharing
+	// one TLS connection across multiple pipelined requests is a needless
+	// source of framing bugs that silently kill the tunnel with no log line.
+}
+
+// PassthroughToReal forwards a decrypted, intercepted request to the real
+// host it was originally addressed to (api.anthropic.com, claude.ai, ...).
+// Only /api/oauth/usage and /api/claude_cli/bootstrap are answered locally
+// with fabricated data (they depend on a real subscription we don't have);
+// every other path under these intercepted domains must reach the real
+// servers untouched, or background features (marketplaces, mcp-registry,
+// telemetry, first-run connectivity checks, ...) break with a local 404.
+func PassthroughToReal(w http.ResponseWriter, r *http.Request) {
+	target := *r.URL
+	target.Scheme = "https"
+	target.Host = r.Host
+
+	outReq, err := http.NewRequest(r.Method, target.String(), r.Body)
+	if err != nil {
+		http.Error(w, "proxy error", http.StatusBadGateway)
+		return
+	}
+	outReq.Header = r.Header.Clone()
+	outReq.Host = r.Host
+
+	resp, err := passthroughClient.Do(outReq)
+	if err != nil {
+		LogGateway("[SuperRelay Gateway] MITM passthrough to %s%s failed: %v", r.Host, r.URL.Path, err)
+		http.Error(w, "upstream unreachable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+var passthroughClient = &http.Client{
+	Timeout: 30 * time.Second,
+}
+
+// HandleBootstrapSpoof handles GET /api/claude_cli/bootstrap
+func HandleBootstrapSpoof(w http.ResponseWriter, r *http.Request) {
+	LogGateway("[SuperRelay Gateway] >>> Intercepted GET /api/claude_cli/bootstrap <<<")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("anthropic-organization-id", fakeOrgID)
+	w.Header().Set("anthropic-workspace-id", fakeWorkspaceID)
+	w.WriteHeader(http.StatusOK)
+
+	resp := map[string]interface{}{
+		"org_model_default": "claude-opus-5-5",
+		"additional_model_options": []interface{}{},
+		"model_access": []map[string]interface{}{
+			{"api_name": "claude-opus-5-5", "entitled": true},
+			{"api_name": "claude-sonnet-5-5", "entitled": true},
+			{"api_name": "claude-haiku-5-5", "entitled": true},
+			{"api_name": "claude-fable-5-1", "entitled": true},
+			{"api_name": "gemini-3.8-flash-tiered", "entitled": true},
+		},
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+type MitmResponseWriter struct {
+	conn        net.Conn
+	header      http.Header
+	buf         bytes.Buffer
+	statusCode  int
+	wroteHeader bool
+}
+
+func newMitmResponseWriter(conn net.Conn) *MitmResponseWriter {
+	return &MitmResponseWriter{
+		conn:       conn,
+		header:     make(http.Header),
+		statusCode: http.StatusOK,
+	}
+}
+
+func (w *MitmResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *MitmResponseWriter) Write(b []byte) (int, error) {
+	return w.buf.Write(b)
+}
+
+func (w *MitmResponseWriter) WriteHeader(statusCode int) {
+	if !w.wroteHeader {
+		w.statusCode = statusCode
+		w.wroteHeader = true
+	}
+}
+
+func (w *MitmResponseWriter) Flush() {
+	if w.header.Get("Content-Length") == "" {
+		w.header.Set("Content-Length", strconv.Itoa(w.buf.Len()))
+	}
+	w.header.Set("Connection", "close")
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("HTTP/1.1 %d %s\r\n", w.statusCode, http.StatusText(w.statusCode)))
+	for k, vv := range w.header {
+		for _, v := range vv {
+			sb.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+		}
+	}
+	sb.WriteString("\r\n")
+	_, _ = w.conn.Write([]byte(sb.String()))
+	if w.buf.Len() > 0 {
+		_, _ = w.conn.Write(w.buf.Bytes())
+	}
+}
