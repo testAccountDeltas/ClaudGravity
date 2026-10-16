@@ -135,6 +135,56 @@ func isSessionTokenWallError(status int, errText string) bool {
 		strings.Contains(lower, "1048576")
 }
 
+// needsGeminiWeeklyWarmup reports whether acc's Gemini Models weekly bucket
+// sits at 100% remaining — i.e. untouched, so the 7-day window was never
+// activated server-side (the exact condition WarmupSingleAccount exists to
+// fix). Matches the dashboard's own "Gem Wk" column (parseQuotas in
+// dashboard.html): only the Gemini group's weekly bucket, not the Claude/GPT
+// one, since the warmup ping itself only exercises a Gemini model.
+func needsGeminiWeeklyWarmup(acc *AccountRecord) bool {
+	for _, grp := range acc.Quotas {
+		if !strings.Contains(grp.DisplayName, "Gemini") {
+			continue
+		}
+		for _, b := range grp.Buckets {
+			if strings.Contains(strings.ToLower(b.Window), "week") && b.RemainingFraction >= 0.999 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// WarmupAllFreshAccounts warms up every non-disabled account whose Gemini
+// weekly window still sits at 100% (never activated), concurrently. Returns
+// the emails that were actually warmed and any per-account errors.
+func (am *AccountManager) WarmupAllFreshAccounts(ctx context.Context) (warmed []string, errs map[string]string) {
+	accounts := am.GetAccounts()
+	errs = make(map[string]string)
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, acc := range accounts {
+		if acc.Disabled || !needsGeminiWeeklyWarmup(acc) {
+			continue
+		}
+		wg.Add(1)
+		go func(email string) {
+			defer wg.Done()
+			_, err := am.WarmupSingleAccount(ctx, email)
+			mu.Lock()
+			if err != nil {
+				errs[email] = err.Error()
+			} else {
+				warmed = append(warmed, email)
+			}
+			mu.Unlock()
+		}(acc.Email)
+	}
+	wg.Wait()
+	return warmed, errs
+}
+
 // WarmupSingleAccount sends a 1-token lightweight query to activate the account's 7-day window.
 func (am *AccountManager) WarmupSingleAccount(ctx context.Context, email string) (string, error) {
 	am.mu.RLock()

@@ -724,6 +724,7 @@ body {
       <div class="toolbar-title">Google CloudCode Квоты (7-дневное окно & 5-часовой лимит)</div>
       <div class="filter-group">
         <button onclick="triggerRefreshQuotas()" class="btn btn-secondary">🔄 Опросить все квоты</button>
+        <button onclick="warmupAllFresh(this)" class="btn btn-warm" title="Прогреть все аккаунты, у которых недельный лимит Gemini ещё 100% (не активирован)">🔥 Прогреть недельные 100%</button>
       </div>
     </div>
     <table class="dense-table">
@@ -734,11 +735,10 @@ body {
           <th style="width:75px;">Статус</th>
           <th style="width:380px;">Остатки квот (Gemini Wk | Gem 5h | 3P Wk | 3P 5h)</th>
           <th style="width:75px;">Проверено</th>
-          <th style="width:85px;text-align:right;">Действия</th>
         </tr>
       </thead>
       <tbody id="accountsTableBody">
-        <tr><td colspan="6" style="text-align:center;padding:24px;color:var(--text-dim);">Загрузка аккаунтов...</td></tr>
+        <tr><td colspan="5" style="text-align:center;padding:24px;color:var(--text-dim);">Загрузка аккаунтов...</td></tr>
       </tbody>
     </table>
   </div>
@@ -926,7 +926,7 @@ function fetchAccounts() {
 
       const tbody = document.getElementById('accountsTableBody');
       if (accountsData.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:24px;color:var(--text-dim);">Нет подключенных Google аккаунтов. Нажмите "Google OAuth" для добавления.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:24px;color:var(--text-dim);">Нет подключенных Google аккаунтов. Нажмите "Google OAuth" для добавления.</td></tr>';
         return;
       }
 
@@ -963,9 +963,6 @@ function fetchAccounts() {
             <td>${statusBadge}</td>
             <td>${quadHtml}</td>
             <td class="code-cell" style="color:var(--text-dim);font-size:11px;">${lastChecked}</td>
-            <td style="text-align:right;">
-              <button onclick="warmupAccount('${escapeHtml(a.email)}', this)" class="btn btn-warm" style="height:24px;padding:0 8px;font-size:11px;">🔥 Прогреть</button>
-            </td>
           </tr>
         `;
       }
@@ -1189,20 +1186,25 @@ function clearLogs() {
     .catch(err => console.error('Error clearing logs:', err));
 }
 
-function warmupAccount(email, btn) {
+function warmupAllFresh(btn) {
   const origText = btn.innerText;
-  btn.innerText = '⏳ ...';
+  btn.innerText = '⏳ Прогрев...';
   btn.disabled = true;
 
-  fetch('/api/warmup?email=' + encodeURIComponent(email))
+  fetch('/api/warmup-all')
     .then(r => r.json())
     .then(data => {
-      if (data.success) {
-        alert('✓ ' + data.message);
-        fetchAccounts();
+      if (data.count === 0) {
+        alert('Нет аккаунтов с недельным лимитом Gemini на 100% — прогревать нечего.');
       } else {
-        alert('Ошибка прогрева: ' + data.error);
+        let msg = `✓ Прогрето аккаунтов: ${data.count}\n${data.warmed.join('\n')}`;
+        const errKeys = Object.keys(data.errors || {});
+        if (errKeys.length > 0) {
+          msg += `\n\nОшибки (${errKeys.length}):\n` + errKeys.map(e => `${e}: ${data.errors[e]}`).join('\n');
+        }
+        alert(msg);
       }
+      fetchAccounts();
     })
     .catch(err => alert('Ошибка сети: ' + err))
     .finally(() => {

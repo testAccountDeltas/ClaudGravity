@@ -38,6 +38,7 @@ func RegisterUIHandlers(mux *http.ServeMux, cfgMgr *ConfigManager) {
 	mux.HandleFunc("/api/accounts", requireDashboardAuth(cfgMgr, handleAPIAccounts))
 	mux.HandleFunc("/api/refresh-quotas", requireDashboardAuth(cfgMgr, handleAPIRefreshQuotas))
 	mux.HandleFunc("/api/warmup", requireDashboardAuth(cfgMgr, handleAPIWarmup))
+	mux.HandleFunc("/api/warmup-all", requireDashboardAuth(cfgMgr, handleAPIWarmupAll))
 	mux.HandleFunc("/api/logs", requireDashboardAuth(cfgMgr, func(w http.ResponseWriter, r *http.Request) { handleAPILogs(cfgMgr, w, r) }))
 	mux.HandleFunc("/api/sessions", requireDashboardAuth(cfgMgr, handleAPISessions))
 	mux.HandleFunc("/api/session", requireDashboardAuth(cfgMgr, handleAPISessionDetail))
@@ -168,6 +169,23 @@ func handleAPIWarmup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": msg})
+}
+
+// handleAPIWarmupAll warms up every non-disabled account whose Gemini weekly
+// window sits at 100% remaining (never activated) — the dashboard's single
+// "warm up stale accounts" button, replacing the old per-row warmup button.
+func handleAPIWarmupAll(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	warmed, errs := globalAccountManager.WarmupAllFreshAccounts(ctx)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"warmed":  warmed,
+		"errors":  errs,
+		"count":   len(warmed),
+	})
 }
 
 func handleAPIKeys(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
