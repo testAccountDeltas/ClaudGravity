@@ -370,11 +370,17 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 		return err
 	}
 
+	// MAX_TOKENS must win over tool_use: toolUseOccurred only means a
+	// functionCall part was seen, not that it arrived complete. If
+	// generation was cut off mid-arguments by the output ceiling, the
+	// client needs to know the JSON it's about to parse may be truncated —
+	// reporting "tool_use" here hides that and the client sees a plain
+	// JSON syntax error instead of a clear "hit the length limit".
 	stopReason := "end_turn"
-	if s.toolUseOccurred {
-		stopReason = "tool_use"
-	} else if finishReason == "MAX_TOKENS" {
+	if finishReason == "MAX_TOKENS" {
 		stopReason = "max_tokens"
+	} else if s.toolUseOccurred {
+		stopReason = "tool_use"
 	}
 
 	// Gemini's promptTokenCount is the FULL input (cached + uncached), but

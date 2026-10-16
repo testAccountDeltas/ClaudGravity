@@ -384,8 +384,14 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 
 	isStream := gjson.GetBytes(bodyBytes, "stream").Bool()
 	serverCfg := cfgMgr.GetServerConfig()
-	// Auto-detect and record session working directory for Edit repair
-	if cwd := ExtractCWDFromSystemPrompt(gjson.GetBytes(bodyBytes, "system").Raw); cwd != "" {
+	// Auto-detect and record session working directory for Edit repair.
+	// Was passing .Raw (undecoded source JSON bytes, escape sequences
+	// un-decoded — a real newline is still the literal two characters
+	// '\' 'n', not a newline byte) into a regex that stops at '\r'/'\n':
+	// it never matched a real line break and ran on to capture garbage
+	// from the rest of the JSON structure. ExtractSystemPromptText decodes
+	// properly via gjson's .String() first.
+	if cwd := ExtractCWDFromSystemPrompt(ExtractSystemPromptText(bodyBytes)); cwd != "" {
 		RecordSessionCWD(sessionID, cwd)
 	}
 	RecordSessionFileSnapshots(sessionID, bodyBytes)
@@ -1063,7 +1069,12 @@ func executeNonStreaming(
 						"name":  fname,
 						"input": argsObj,
 					})
-					claudeResp["stop_reason"] = "tool_use"
+					// Same MAX_TOKENS-wins-over-tool_use priority as sse.go's
+					// FinishStream: a functionCall part being present
+					// doesn't mean it arrived complete.
+					if claudeResp["stop_reason"] != "max_tokens" {
+						claudeResp["stop_reason"] = "tool_use"
+					}
 				}
 			}
 		}

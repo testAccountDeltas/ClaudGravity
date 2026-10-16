@@ -101,6 +101,15 @@ func sweepStaleSessionSnapshots() {
 	}
 }
 
+// canonicalSnapshotKey normalizes a tool-supplied file path before it's used
+// as a map key: a model that Read a file as "src/app.ts" and later Edit'd it
+// as "src\app.ts" or an absolute "H:\project\src\app.ts" previously missed
+// the snapshot entirely on an exact-string-match lookup, since nothing
+// normalized slash direction or relative/absolute form between calls.
+func canonicalSnapshotKey(path string) string {
+	return filepath.Clean(filepath.ToSlash(strings.TrimSpace(path)))
+}
+
 func getSessionSnapshot(sessionID, path string) (string, bool) {
 	sessionSnapLock.RLock()
 	defer sessionSnapLock.RUnlock()
@@ -108,7 +117,7 @@ func getSessionSnapshot(sessionID, path string) (string, bool) {
 	if m == nil {
 		return "", false
 	}
-	v, ok := m[path]
+	v, ok := m[canonicalSnapshotKey(path)]
 	return v, ok
 }
 
@@ -123,7 +132,7 @@ func setSessionSnapshot(sessionID, path, content string) {
 		m = make(map[string]string)
 		sessionSnapMap[sessionID] = m
 	}
-	m[path] = content
+	m[canonicalSnapshotKey(path)] = content
 	sessionSnapSeen[sessionID] = time.Now()
 }
 
@@ -254,6 +263,31 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 	})
 }
 
+// ExtractSystemPromptText pulls the plain-text system prompt out of an
+// Anthropic request body, decoding whichever shape Claude Code sent it in
+// (a bare string, or an array of {"type":"text","text":...} blocks with
+// cache_control metadata). Callers must use this — or gjson's .String(), not
+// .Raw — before handing text to any regex/string search: .Raw returns the
+// literal source JSON bytes with escape sequences un-decoded (a real
+// newline inside the prompt is still the two ASCII characters '\' 'n' in
+// .Raw, not a newline byte), which silently breaks any "stop at \n" pattern.
+func ExtractSystemPromptText(bodyBytes []byte) string {
+	sys := gjson.GetBytes(bodyBytes, "system")
+	if sys.Type == gjson.String {
+		return sys.String()
+	}
+	if sys.IsArray() {
+		var sb strings.Builder
+		sys.ForEach(func(_, block gjson.Result) bool {
+			sb.WriteString(block.Get("text").String())
+			sb.WriteString("\n")
+			return true
+		})
+		return sb.String()
+	}
+	return ""
+}
+
 // ExtractCWDFromSystemPrompt extracts the user session working directory from Claude Code environment preamble
 func ExtractCWDFromSystemPrompt(systemPrompt string) string {
 	if systemPrompt == "" {
@@ -263,7 +297,7 @@ func ExtractCWDFromSystemPrompt(systemPrompt string) string {
 	m := re.FindStringSubmatch(systemPrompt)
 	if len(m) > 1 {
 		p := strings.TrimSpace(m[1])
-		p = strings.Trim(p, "\"'`")
+		p = strings.Trim(p, "\"'`\\")
 		return filepath.Clean(p)
 	}
 	return ""

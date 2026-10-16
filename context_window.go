@@ -49,10 +49,31 @@ func conservativeTokenEstimate(v interface{}) int {
 // correctly; this is the gateway-side backstop so an oversized request
 // gets trimmed here instead of failing upstream with a raw context-length
 // error from Google.
+// fallbackMaxTokens covers the known Gemini model family ceilings for the
+// rare case globalModelCatalog is empty (startup FetchAvailableModels
+// failed, or ran before the network was up) — without this, truncation
+// silently disabled itself entirely rather than erring conservative, and a
+// request would sail right past the 1M-token wall into a raw Google 400
+// instead of being proactively trimmed here.
+var fallbackMaxTokens = map[string]int64{
+	"gemini-3.8-flash":        1048576,
+	"gemini-3.8-flash-tiered": 1048576,
+	"gemini-3.8-flash-low":    1048576,
+	"gemini-3.8-flash-medium": 1048576,
+	"gemini-3.8-flash-high":   1048576,
+	"gemini-2.5-flash":        1048576,
+	"gemini-2.5-pro":          2097152,
+	"gemini-2.5-flash-lite":   1048576,
+}
+
 func TruncateConversationToFit(reqMap map[string]interface{}, modelName string, requestedMaxOutput int64) (droppedCount int, truncated bool) {
 	modelMeta, hasMeta := globalModelCatalog.GetModel(modelName)
-	if !hasMeta || modelMeta.MaxTokens <= 0 {
-		return 0, false
+	maxTokens := modelMeta.MaxTokens
+	if !hasMeta || maxTokens <= 0 {
+		maxTokens = fallbackMaxTokens[modelName]
+		if maxTokens <= 0 {
+			return 0, false
+		}
 	}
 
 	msgsRaw, ok := reqMap["messages"]
@@ -66,9 +87,9 @@ func TruncateConversationToFit(reqMap map[string]interface{}, modelName string, 
 		return 0, false
 	}
 
-	budget := modelMeta.MaxTokens - requestedMaxOutput - contextSafetyMarginTokens
+	budget := maxTokens - requestedMaxOutput - contextSafetyMarginTokens
 	if budget <= 0 {
-		budget = modelMeta.MaxTokens / 2
+		budget = maxTokens / 2
 	}
 
 	systemTokens := 0
@@ -110,7 +131,7 @@ func TruncateConversationToFit(reqMap map[string]interface{}, modelName string, 
 		"role": "user",
 		"content": fmt.Sprintf(
 			"[Gateway notice: %d earlier message(s) were dropped from this conversation to fit inside the %s model's %d-token context window. The conversation continues below.]",
-			dropped, modelName, modelMeta.MaxTokens,
+			dropped, modelName, maxTokens,
 		),
 	}
 	reqMap["messages"] = append([]interface{}{notice}, remaining...)
