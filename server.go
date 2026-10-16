@@ -518,7 +518,6 @@ func executeStreamingWithWatchdog(
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
@@ -549,7 +548,21 @@ func executeStreamingWithWatchdog(
 			}
 		}
 	}()
-	defer func() { <-idleWatchdogDone }()
+	// MUST cancel() before waiting on idleWatchdogDone: the watchdog
+	// goroutine only exits via ctx.Done() (or its own timeout firing), so a
+	// plain `defer cancel()` registered before this would run AFTER this
+	// defer (defers are LIFO) — deadlocking this function for up to
+	// idleTimeout/maxStreamDuration on every single successful request. A
+	// real deadlock of exactly this kind shipped: the response had already
+	// been fully written and displayed client-side, but this handler never
+	// returned, so Go's http.Server never sent the final chunk/closed the
+	// connection — the client saw an unterminated stream and surfaced its
+	// own "Waiting for API response... will retry" after already showing
+	// the complete, correct reply.
+	defer func() {
+		cancel()
+		<-idleWatchdogDone
+	}()
 
 	upReq, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(geminiBody))
 	if err != nil {
