@@ -124,30 +124,55 @@ func searchWithGoogleGrounding(ctx context.Context, query string, googleToken st
 	}
 
 	wrapped := WrapAntigravityPayload("gemini-2.5-flash", reqBytes, projectID, 0, "")
-	endpointURL := "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:generateContent"
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpointURL, bytes.NewReader(wrapped))
-	if err != nil {
-		return nil, "", err
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+googleToken)
-	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
-	httpReq.Header.Set("User-Agent", "vscode/1.X.X (Antigravity/4.3.0)")
-	httpReq.Header.Set("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
-	httpReq.Header.Set("Client-Metadata", `{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`)
+	// Previously pinned to the sandbox host only — a location-gated or
+	// transiently 429'd sandbox response fell straight through to the
+	// Wikipedia/DuckDuckGo fallback without ever trying the other host,
+	// unlike every regular request (server.go's retry loop), which already
+	// treats this exact host list as one pool to fail over across.
+	var respBytes []byte
+	var lastErr error
+	for _, host := range antigravityHosts {
+		endpointURL := host + "/v1internal:generateContent"
 
-	resp, err := httpClient.Do(httpReq)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", endpointURL, bytes.NewReader(wrapped))
+		if err != nil {
+			return nil, "", err
+		}
+		httpReq.Header.Set("Authorization", "Bearer "+googleToken)
+		httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
+		httpReq.Header.Set("User-Agent", "vscode/1.X.X (Antigravity/4.3.0)")
+		httpReq.Header.Set("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+		httpReq.Header.Set("Client-Metadata", `{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`)
 
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", err
+		resp, err := httpClient.Do(httpReq)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			errText := string(body)
+			lastErr = fmt.Errorf("Google Grounding status %d: %s", resp.StatusCode, errText)
+			if isAntigravityLocationGateError(resp.StatusCode, errText) {
+				continue
+			}
+			return nil, "", lastErr
+		}
+		respBytes = body
+		lastErr = nil
+		break
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("Google Grounding status %d: %s", resp.StatusCode, string(respBytes))
+	if respBytes == nil {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("Google Grounding: no hosts available")
+		}
+		return nil, "", lastErr
 	}
 
 	root := gjson.ParseBytes(respBytes)

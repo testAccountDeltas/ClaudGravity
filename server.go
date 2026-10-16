@@ -293,7 +293,11 @@ func main() {
 		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 		<-sigChan
 		LogGateway("[SuperRelay Gateway] Shutting down...")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 5s was too tight for this gateway's own normal traffic: a single
+		// heavy ModeAuto generation routinely runs 30-170s+ (seen live in
+		// superrelay.log all session), so a restart during one would force-
+		// close the SSE stream mid-answer instead of letting it finish.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
 		if tlsSrv != nil {
