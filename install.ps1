@@ -205,6 +205,7 @@ $launchLines = @(
     "set ""CLAUDE_CODE_ENABLE_TODO_TOOLS=1""",
     "set ""CLAUDE_CODE_USE_POWERSHELL_TOOL=1""",
     "set ""CLAUDE_CODE_ATTRIBUTION_HEADER=0""",
+    "set ""CLAUDE_CODE_EFFORT_LEVEL=xhigh""",
     "set ""DISABLE_AUTOUPDATER=1""",
     "",
     "echo ClaudGravity -^> $ConnectHost`:$ConnectPort ($foundVia)",
