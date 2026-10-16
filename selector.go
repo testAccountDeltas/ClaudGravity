@@ -345,7 +345,7 @@ func hasRemainingQuota(acc *AccountRecord) bool {
 		return true // assume ok if unprobed
 	}
 	for _, grp := range acc.Quotas {
-		if grp.DisplayName == "Gemini Models" {
+		if strings.Contains(strings.ToLower(grp.DisplayName), "gemini") {
 			for _, b := range grp.Buckets {
 				if b.RemainingFraction <= 0.05 {
 					return false

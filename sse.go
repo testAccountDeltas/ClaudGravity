@@ -446,6 +446,24 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 		root = respNode
 	}
 
+	// Google can send an in-band error chunk mid-stream (e.g. a 429
+	// RESOURCE_EXHAUSTED that only surfaces once generation is already
+	// underway) and then just close the connection. That chunk has no
+	// "candidates" node, so without this check the code fell straight
+	// through to the candidates-empty early return, the read loop then hit
+	// a normal EOF, and FinishStream("STOP") reported a clean "end_turn" —
+	// the client saw a successful, if truncated, response instead of
+	// learning the generation actually failed.
+	if errNode := root.Get("error"); errNode.Exists() {
+		msg := errNode.Get("message").String()
+		if msg == "" {
+			msg = errNode.Raw
+		}
+		errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":%q}}`, "Upstream stream error: "+msg)
+		_ = s.SendRaw("error", errPayload)
+		return fmt.Errorf("upstream stream error: %s", msg)
+	}
+
 	// Update token usage
 	if um := root.Get("usageMetadata"); um.Exists() {
 		if pt := um.Get("promptTokenCount").Int(); pt > 0 {

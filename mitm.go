@@ -243,21 +243,44 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 	}
 	// Guard against either side going silent forever and leaking the
 	// goroutines/fds indefinitely (e.g. a client that opens a tunnel and
-	// never sends anything).
-	idleDeadline := 10 * time.Minute
-	_ = clientConn.SetDeadline(time.Now().Add(idleDeadline))
-	_ = targetConn.SetDeadline(time.Now().Add(idleDeadline))
+	// never sends anything) — but net.Conn.SetDeadline is an ABSOLUTE
+	// deadline, not an idle timeout: it is never reset by Read/Write, so a
+	// single SetDeadline call before io.Copy killed any tunnel still
+	// actively transferring data (git clone of a large repo, npm install,
+	// downloading model weights) the instant 10 minutes of wall-clock time
+	// passed, no matter how busy the connection was. idleCopy resets the
+	// deadline before every read instead.
+	const idleDeadline = 10 * time.Minute
+	go func() {
+		defer clientConn.Close()
+		defer targetConn.Close()
+		idleCopy(targetConn, clientConn, idleDeadline)
+	}()
+	go func() {
+		defer clientConn.Close()
+		defer targetConn.Close()
+		idleCopy(clientConn, targetConn, idleDeadline)
+	}()
+}
 
-	go func() {
-		defer clientConn.Close()
-		defer targetConn.Close()
-		_, _ = io.Copy(targetConn, clientConn)
-	}()
-	go func() {
-		defer clientConn.Close()
-		defer targetConn.Close()
-		_, _ = io.Copy(clientConn, targetConn)
-	}()
+// idleCopy is io.Copy with a true idle timeout: the deadline is pushed
+// forward before every read, so it only fires after idleDeadline of
+// genuine silence, never on total connection lifetime.
+func idleCopy(dst net.Conn, src net.Conn, idleDeadline time.Duration) {
+	buf := make([]byte, 32*1024)
+	for {
+		_ = src.SetReadDeadline(time.Now().Add(idleDeadline))
+		n, err := src.Read(buf)
+		if n > 0 {
+			_ = dst.SetWriteDeadline(time.Now().Add(idleDeadline))
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func serveInterceptedTLS(tlsConn *tls.Conn, handler http.Handler) {

@@ -99,11 +99,32 @@ func recoverMiddleware(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				LogGateway("[SuperRelay Gateway] PANIC recovered on %s %s: %v", r.Method, r.URL.Path, rec)
-				http.Error(w, `{"error":{"type":"internal_error","message":"internal gateway error"}}`, http.StatusInternalServerError)
+				writeAnthropicError(w, http.StatusInternalServerError, "internal_error", "internal gateway error")
 			}
 		}()
 		next.ServeHTTP(w, r)
 	})
+}
+
+// writeAnthropicError writes an error body matching Anthropic's actual
+// wire format ({"type":"error","error":{"type":...,"message":...}}) with
+// Content-Type: application/json. http.Error always forces
+// "Content-Type: text/plain; charset=utf-8" regardless of what's in the
+// body, which is what every one of this gateway's JSON-shaped error
+// responses was using — a client SDK that checks Content-Type before
+// attempting to parse a 4xx/5xx body (as Anthropic's own TypeScript SDK
+// does) never even tries to read the structured error out of it.
+func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	body, _ := json.Marshal(map[string]interface{}{
+		"type": "error",
+		"error": map[string]string{
+			"type":    errType,
+			"message": message,
+		},
+	})
+	_, _ = w.Write(body)
 }
 
 func nextReqID() uint64 {
@@ -296,7 +317,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	tenant, ok := cfgMgr.GetTenant(clientKey)
 	if !ok {
 		LogGateway("[#%d] Unauthorized: invalid or missing Bearer token", rid)
-		http.Error(w, `{"error":{"type":"authentication_error","message":"Invalid or missing API key"}}`, http.StatusUnauthorized)
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
 		globalLogStore.Add(RequestLog{
 			Timestamp: t0,
 			Key:       clientKey,
@@ -317,7 +338,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, `{"error":{"message":"Failed to read request body"}}`, http.StatusBadRequest)
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
 
@@ -378,7 +399,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	geminiBody, modelName, budget, wasShrunk, err := ConvertClaudeRequestToGemini(bodyBytes, tenant, reqClass, agentKey, sessionID, instanceID)
 	if err != nil {
 		LogGateway("[#%d] Translation error: %v", rid, err)
-		http.Error(w, fmt.Sprintf(`{"error":{"message":"Translation error: %v"}}`, err), http.StatusBadRequest)
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Translation error: %v", err))
 		return
 	}
 
@@ -428,6 +449,21 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				continue
 			}
 			googleToken = tok
+
+			// The sticky-affinity peek above the account-selection loop only
+			// catches an established multi-turn conversation whose sticky
+			// account happens to be known; a brand-new conversation's first
+			// turn has no affinity entry yet, so it slipped through to
+			// whichever account SelectAccountExcluding actually picked. If
+			// THAT account's 3P quota is exhausted, sending the native
+			// passthrough model anyway gets a 429 — and the 429 handler
+			// below cools the whole account down for 15 minutes, locking it
+			// out of its still-100%-free Gemini quota too. Catch it here,
+			// against the account that's actually about to be used.
+			if (modelName == "claude-sonnet-4-6" || modelName == "claude-opus-4-6-thinking" || modelName == "gpt-oss-120b-medium") && isNative3PModelExhausted(activeAcc) {
+				LogGateway("[#%d] !! Native 3P model %s has exhausted quota on selected account %s, remapping to gemini-3.8-flash-tiered", rid, modelName, acc.Email)
+				modelName = "gemini-3.8-flash-tiered"
+			}
 		}
 
 		accLabel := "DirectAPIKey"
@@ -577,7 +613,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	// If all attempts failed and nothing was sent yet
 	if lastErr != nil {
 		LogGateway("[#%d] !! All pre-stream failover attempts failed: %v", rid, lastErr)
-		http.Error(w, fmt.Sprintf(`{"error":{"type":"api_error","message":"Upstream failed after retries: %v"}}`, lastErr), lastStatus)
+		writeAnthropicError(w, lastStatus, "api_error", fmt.Sprintf("Upstream failed after retries: %v", lastErr))
 	}
 }
 
@@ -1597,7 +1633,7 @@ func handleEmbeddings(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Requ
 	}
 
 	if len(inputs) == 0 {
-		http.Error(w, `{"error":{"message":"input is required","type":"invalid_request_error"}}`, http.StatusBadRequest)
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "input is required")
 		return
 	}
 
