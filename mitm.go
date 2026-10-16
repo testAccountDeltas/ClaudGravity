@@ -25,6 +25,11 @@ import (
 	"time"
 )
 
+// globalMitmCA is set once in main() right after InitMitmCA succeeds, so
+// other handlers (the /api/bootstrap installer endpoint in ui.go) can hand
+// out the CA's PEM without needing mitmCA threaded through as a parameter.
+var globalMitmCA *MitmCA
+
 type MitmCA struct {
 	caCert    *x509.Certificate
 	caKey     *rsa.PrivateKey
@@ -96,6 +101,13 @@ func InitMitmCA(caDir string) (*MitmCA, error) {
 		caPEM:     caPEM,
 		caPEMPath: caCertPath,
 	}, nil
+}
+
+// GetCAPEM returns the CA certificate in PEM form, for handing to clients
+// that need to trust it (e.g. the /api/bootstrap installer endpoint) rather
+// than reading the file off whatever disk the gateway happens to run on.
+func (m *MitmCA) GetCAPEM() string {
+	return string(m.caPEM)
 }
 
 func (m *MitmCA) GetCAPath() string {

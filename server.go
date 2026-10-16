@@ -110,6 +110,7 @@ func main() {
 	} else {
 		LogGateway("[SuperRelay Gateway] Native MITM CA ready: %s", mitmCA.GetCAPath())
 	}
+	globalMitmCA = mitmCA
 
 	serverCfg := cfgMgr.GetServerConfig()
 

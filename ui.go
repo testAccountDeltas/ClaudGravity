@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -54,6 +55,56 @@ func RegisterUIHandlers(mux *http.ServeMux, cfgMgr *ConfigManager) {
 	}))
 	mux.HandleFunc("/oauth/login", requireDashboardAuth(cfgMgr, handleOAuthLogin))
 	mux.HandleFunc("/oauth/callback", requireDashboardAuth(cfgMgr, handleOAuthCallback))
+
+	// /api/bootstrap is deliberately NOT behind requireDashboardAuth: the
+	// installer scripts (install.ps1/install.sh) only ever have the end
+	// user's own tenant key, never the admin dashboard password. It's
+	// gated on that tenant key instead (see handleAPIBootstrap) so a
+	// random caller without a valid key can't scrape proxy_secret/CA PEM.
+	mux.HandleFunc("/api/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+		handleAPIBootstrap(cfgMgr, w, r)
+	})
+}
+
+// handleAPIBootstrap hands the installer scripts everything they need to
+// configure a Claude Code client against this gateway, given nothing but
+// the gateway's own base URL and a valid tenant key: the proxy secret
+// (CONNECT-proxy auth), the MITM CA in PEM form (so the client can trust
+// the TLS API port), and which host/ports to actually point at. Without
+// this, distributing a gateway meant anyone had to be handed the CA file
+// and proxy_secret out of band in addition to their API key.
+func handleAPIBootstrap(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			key = strings.TrimPrefix(auth, "Bearer ")
+		}
+	}
+	if key == "" {
+		http.Error(w, `{"error":"missing ?key=<your tenant API key>"}`, http.StatusUnauthorized)
+		return
+	}
+	if _, ok := cfgMgr.GetTenant(key); !ok {
+		http.Error(w, `{"error":"invalid or unknown API key"}`, http.StatusUnauthorized)
+		return
+	}
+
+	serverCfg := cfgMgr.GetServerConfig()
+	caPEM := ""
+	if globalMitmCA != nil {
+		caPEM = globalMitmCA.GetCAPEM()
+	}
+
+	resp := map[string]interface{}{
+		"public_host":  serverCfg.PublicHost,
+		"connect_port": serverCfg.Port,
+		"tls_port":     serverCfg.TLSPort,
+		"proxy_secret": serverCfg.ProxySecret,
+		"ca_pem":       caPEM,
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleAPIModelCatalog exposes the real per-model limits (context window,

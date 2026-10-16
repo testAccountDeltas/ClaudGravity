@@ -50,7 +50,27 @@ Claude Code (claude.exe)
 
 ---
 
-## Быстрый старт
+## Установка клиента (одна команда)
+
+Админ шлюза выдаёт пользователю только два значения: **адрес шлюза** и **его API-ключ** (`sk-...`). Больше ничего передавать не нужно — установщик сам забирает `proxy_secret` и CA-сертификат у шлюза через `/api/bootstrap?key=<ключ>`, сам ищет установку Claude Code на машине (VS Code extension → PATH/переменные среды → нативная установка) и сам прописывает переменные окружения.
+
+**Windows** (PowerShell):
+```powershell
+irm https://raw.githubusercontent.com/testAccountDeltas/ClaudGravity/main/install.ps1 | iex
+```
+Добавляет в контекстное меню папок пункт **«ClaudGravity: Запустить Claude Code тут»** — если на машине есть Windows Terminal, запуск идёт через него, иначе через обычный `cmd.exe`. Удаление: `.\install.ps1 -Uninstall` (скачать файл заранее, т.к. `-Uninstall` не прокидывается через пайп `iex`).
+
+**macOS / Linux**:
+```bash
+curl -fsSL https://raw.githubusercontent.com/testAccountDeltas/ClaudGravity/main/install.sh | bash
+```
+Добавляет команду `claudgravity` в `~/.zshrc`/`~/.bashrc` (запускать из нужной папки в новом терминале), плюс на Linux — пункт в Nautilus Scripts, на macOS — `ClaudGravity.command` на Desktop. Удаление: `curl -fsSL .../install.sh | bash -s -- --uninstall`.
+
+Неинтерактивно (CI/скрипты) — задать `CLAUDGRAVITY_URL`/`CLAUDGRAVITY_KEY` переменными окружения перед запуском любого из установщиков.
+
+---
+
+## Быстрый старт (запуск самого шлюза)
 
 ### Локально (шлюз и Claude Code на одной машине)
 
