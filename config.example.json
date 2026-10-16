@@ -5,6 +5,7 @@
     "ttft_timeout_seconds": 180,
     "read_timeout_seconds": 600,
     "tls_port": 8900,
+    "public_host": "localhost",
     "max_stream_duration_seconds": 1800
   },
   "tenants": {

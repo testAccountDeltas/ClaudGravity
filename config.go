@@ -15,6 +15,7 @@ type ServerConfig struct {
 	TTFTTimeoutSeconds       int    `json:"ttft_timeout_seconds"`
 	ReadTimeoutSeconds       int    `json:"read_timeout_seconds"`
 	TLSPort                  int    `json:"tls_port"`                              // HTTPS listener for ANTHROPIC_BASE_URL (CA-signed, separate from the plain CONNECT-proxy port)
+	PublicHost               string `json:"public_host,omitempty"`                 // hostname/IP clients will actually connect to (e.g. a remote server's IP); included as a cert SAN so TLS hostname verification passes. Defaults to "localhost".
 	DashboardPassword        string `json:"dashboard_password"`                    // HTTP Basic Auth password for the web UI (username: admin); auto-generated on first run
 	ProxySecret              string `json:"proxy_secret"`                          // required as Proxy-Authorization bearer on CONNECT requests; auto-generated on first run
 	GoogleOAuthClientID      string `json:"google_oauth_client_id,omitempty"`      // overrides auth_manager.go's AntigravityClientID default if set
@@ -70,6 +71,9 @@ func LoadConfig(path string) (*ConfigManager, error) {
 	}
 	if cfg.Server.TLSPort == 0 {
 		cfg.Server.TLSPort = cfg.Server.Port + 2
+	}
+	if cfg.Server.PublicHost == "" {
+		cfg.Server.PublicHost = "localhost"
 	}
 	if cfg.Tenants == nil {
 		cfg.Tenants = make(map[string]TenantConfig)

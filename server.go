@@ -187,7 +187,7 @@ func main() {
 	// convention — wrapping that same port in TLS would break proxying.
 	if mitmCA != nil {
 		tlsPort := serverCfg.TLSPort
-		gwCert, err := mitmCA.GetCertificate("localhost")
+		gwCert, err := mitmCA.GetCertificate(serverCfg.PublicHost)
 		if err != nil {
 			LogGateway("[SuperRelay Gateway] Warning: could not mint gateway TLS cert: %v", err)
 		} else {
@@ -247,7 +247,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	agentKey, agentType, subagentName := ParseAgentInfo(r)
+	agentKey, agentType, subagentName, instanceID := ParseAgentInfo(r)
 	reqClass := r.Header.Get("x-claude-code-request-class")
 
 	bodyBytes, err := io.ReadAll(r.Body)
@@ -297,6 +297,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	if cwd := ExtractCWDFromSystemPrompt(gjson.GetBytes(bodyBytes, "system").Raw); cwd != "" {
 		RecordSessionCWD(sessionID, cwd)
 	}
+	RecordSessionFileSnapshots(sessionID, bodyBytes)
 
 	hasSafeguards := gjson.GetBytes(bodyBytes, "safeguards").Exists()
 	flusher, hasFlusher := w.(http.Flusher)
@@ -411,9 +412,9 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				rid, attempt+1, maxAttempts, bump, tenant.Name, accLabel, modelName, budget, isStreaming, len(geminiBody), agentKey)
 
 			if isStreaming {
-				success, lastStatus, lastErr = executeStreamingWithWatchdog(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, wasShrunk, hasSafeguards, w, flusher)
+				success, lastStatus, lastErr = executeStreamingWithWatchdog(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher)
 			} else {
-				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, wasShrunk, hasSafeguards, w)
+				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w)
 			}
 
 			if success || !isAntigravity {
@@ -494,6 +495,7 @@ func executeStreamingWithWatchdog(
 	agentKey string,
 	agentType string,
 	subagentName string,
+	instanceID string,
 	wasShrunk bool,
 	hasSafeguards bool,
 	w http.ResponseWriter,
@@ -639,6 +641,7 @@ func executeStreamingWithWatchdog(
 						AgentKey:     agentKey,
 						AgentType:    agentType,
 						SubagentName: subagentName,
+						InstanceID:   instanceID,
 						Model:        modelName,
 						TTFT:         time.Since(t0).Milliseconds(),
 						TotalDur:     time.Since(t0).Milliseconds(),
@@ -674,6 +677,7 @@ func executeStreamingWithWatchdog(
 					AgentKey:     agentKey,
 					AgentType:    agentType,
 					SubagentName: subagentName,
+					InstanceID:   instanceID,
 					Model:        modelName,
 					TTFT:         time.Since(t0).Milliseconds(),
 					TotalDur:     time.Since(t0).Milliseconds(),
@@ -717,6 +721,7 @@ UpstreamReady:
 			AgentKey:     agentKey,
 			AgentType:    agentType,
 			SubagentName: subagentName,
+			InstanceID:   instanceID,
 			Model:        modelName,
 			TTFT:         time.Since(t0).Milliseconds(),
 			TotalDur:     time.Since(t0).Milliseconds(),
@@ -745,8 +750,16 @@ UpstreamReady:
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	totalDur := time.Since(t0)
 
-	isOnlyRead := len(streamer.toolNames) == 1 && streamer.toolNames[0] == "Read" && streamer.textChars == 0 && streamer.thinkingChars == 0
-	globalLoopGuard.RecordReadTurn(agentKey, isOnlyRead)
+	readCount := 0
+	madeProgress := streamer.textChars > 200 // a real explanation, not just "let me check X"
+	for _, t := range streamer.toolNames {
+		if t == "Read" {
+			readCount++
+		} else if t == "Write" || t == "Edit" || t == "NotebookEdit" {
+			madeProgress = true
+		}
+	}
+	globalLoopGuard.RecordReadTurn(agentKey, readCount, madeProgress)
 
 	hasIgnoreTag := strings.Contains(streamer.lastText, OscIgnoreTag)
 	globalLoopGuard.RecordToolCalls(agentKey, streamer.toolCallSignatures, hasIgnoreTag)
@@ -770,6 +783,7 @@ UpstreamReady:
 		AgentKey:        agentKey,
 		AgentType:       agentType,
 		SubagentName:    subagentName,
+		InstanceID:      instanceID,
 		Model:           modelName,
 		TTFT:            ttft.Milliseconds(),
 		TotalDur:        totalDur.Milliseconds(),
@@ -807,6 +821,7 @@ func executeNonStreaming(
 	agentKey string,
 	agentType string,
 	subagentName string,
+	instanceID string,
 	wasShrunk bool,
 	hasSafeguards bool,
 	w http.ResponseWriter,
@@ -972,6 +987,7 @@ func executeNonStreaming(
 		AgentKey:        agentKey,
 		AgentType:       agentType,
 		SubagentName:    subagentName,
+		InstanceID:      instanceID,
 		Model:           modelName,
 		TTFT:            durMs,
 		TotalDur:        durMs,

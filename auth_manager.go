@@ -580,6 +580,70 @@ func (am *AccountManager) GetAccounts() []*AccountRecord {
 	return res
 }
 
+// DeleteAccount permanently removes the account JSON file from disk,
+// evicts it from the in-memory pool, unbinds any sticky affinities,
+// and notifies live dashboard clients via WebSocket.
+func (am *AccountManager) DeleteAccount(email string) error {
+	am.mu.Lock()
+	acc, ok := am.accounts[email]
+	if !ok {
+		am.mu.Unlock()
+		return fmt.Errorf("account %q not found", email)
+	}
+
+	filePath := acc.FilePath
+	delete(am.accounts, email)
+	am.mu.Unlock()
+
+	// Physical removal from disk
+	if filePath != "" {
+		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+			LogGateway("[AccountManager] Warning: failed to delete file %s: %v", filePath, err)
+		}
+	}
+
+	// Remove from sticky/affinity tables
+	globalSelector.UnstickAccount(email)
+
+	// Broadcast deletion over WebSocket
+	globalWSHub.BroadcastAccountDeleted(email)
+	globalWSHub.BroadcastAccounts(am.GetAccounts())
+
+	LogGateway("[AccountManager] Account deleted: %s (file: %s)", email, filePath)
+	return nil
+}
+
+// ToggleAccountDisabled toggles the disabled flag of an account, persists it
+// to the JSON credential file on disk, and broadcasts the update.
+func (am *AccountManager) ToggleAccountDisabled(email string, disabled bool) error {
+	am.mu.Lock()
+	acc, ok := am.accounts[email]
+	if !ok {
+		am.mu.Unlock()
+		return fmt.Errorf("account %q not found", email)
+	}
+	acc.Disabled = disabled
+	filePath := acc.FilePath
+	am.mu.Unlock()
+
+	if filePath != "" {
+		data, err := os.ReadFile(filePath)
+		if err == nil {
+			if updated, err := sjson.SetBytes(data, "disabled", disabled); err == nil {
+				_ = os.WriteFile(filePath, updated, 0644)
+			}
+		}
+	}
+
+	if disabled {
+		globalSelector.UnstickAccount(email)
+	}
+
+	globalWSHub.BroadcastAccounts(am.GetAccounts())
+	LogGateway("[AccountManager] Account %s disabled state set to: %v", email, disabled)
+	return nil
+}
+
 type AvailableModelInfo struct {
 	ID                string  `json:"id"`
 	DisplayName       string  `json:"display_name"`

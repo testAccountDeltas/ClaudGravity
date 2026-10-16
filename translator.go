@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"encoding/json"
@@ -53,7 +53,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// 2. Loop-Guard Nudges (Read-Loop & Oscillation)
 	if globalLoopGuard.CheckAndResetReadStreak(agentKey) {
 		InjectUserNudge(reqMap, NudgeReadLoop)
-		LogGateway(".. read-loop streak >= %d [%s] -> injecting stop-nudge", LoopStreakThreshold, agentKey)
+		LogGateway(".. read-loop window >= %d Read calls [%s] -> injecting stop-nudge", ReadWindowThreshold, agentKey)
 	}
 	if globalLoopGuard.CheckAndResetOscillation(agentKey) {
 		InjectUserNudge(reqMap, NudgeOscillation)
@@ -348,7 +348,6 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 
 	return []byte(out), modelName, budget, wasShrunk, nil
 }
-
 
 // ScrubBillingHeader strips out fingerprint headers and billing marks that trigger Google 429/Filter:
 // 1. x-anthropic-billing-header

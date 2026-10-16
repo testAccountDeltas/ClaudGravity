@@ -25,6 +25,7 @@ type RequestLog struct {
 	AgentKey        string    `json:"agent_key"`  // "main", "sub:fork", "sub:explore", "auxiliary"
 	AgentType       string    `json:"agent_type"` // "main", "subagent", "auxiliary"
 	SubagentName    string    `json:"subagent_name,omitempty"`
+	InstanceID      string    `json:"instance_id,omitempty"` // x-claude-code-prompt-id: stable per Task-tool invocation, distinguishes parallel same-named subagents
 	Model           string    `json:"model"`
 	TTFT            int64     `json:"ttft_ms"`
 	TotalDur        int64     `json:"total_dur_ms"`
@@ -67,6 +68,7 @@ func InitLogStore(dbPath string) error {
 		agent_key TEXT NOT NULL DEFAULT 'main',
 		agent_type TEXT NOT NULL DEFAULT 'main',
 		subagent_name TEXT NOT NULL DEFAULT '',
+		instance_id TEXT NOT NULL DEFAULT '',
 		model TEXT NOT NULL,
 		ttft_ms INTEGER NOT NULL DEFAULT 0,
 		total_dur_ms INTEGER NOT NULL DEFAULT 0,
@@ -89,6 +91,9 @@ func InitLogStore(dbPath string) error {
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("exec schema: %w", err)
 	}
+	// Migration for DBs created before instance_id existed; sqlite has no
+	// "ADD COLUMN IF NOT EXISTS", so just swallow the "duplicate column" error.
+	_, _ = db.Exec(`ALTER TABLE request_logs ADD COLUMN instance_id TEXT NOT NULL DEFAULT ''`)
 
 	globalLogStore.db = db
 
@@ -149,20 +154,29 @@ func parseSQLiteTime(s string) time.Time {
 	return time.Now()
 }
 
-func ParseAgentInfo(r *http.Request) (agentKey, agentType, subagentName string) {
+// ParseAgentInfo also returns instanceID, from x-claude-code-prompt-id: this
+// stays constant across every turn of one Task-tool invocation but differs
+// between concurrent invocations of the same subagent type (confirmed live —
+// two sequential turns of one "general-purpose" subagent shared one
+// Prompt-Id while x-claude-code-agent-id changed between them, so Agent-Id
+// is not the stable identifier despite the name). Without this, parallel
+// same-named subagents (e.g. 3 simultaneous Explore calls) are indistinguishable
+// in the logs — all tagged just "sub:Explore" with no way to tell them apart.
+func ParseAgentInfo(r *http.Request) (agentKey, agentType, subagentName, instanceID string) {
 	reqClass := r.Header.Get("x-claude-code-request-class")
 	rawAgentType := r.Header.Get("x-claude-code-agent-type")
+	promptID := r.Header.Get("x-claude-code-prompt-id")
 
 	if reqClass == "auxiliary" {
-		return "auxiliary", "auxiliary", ""
+		return "auxiliary", "auxiliary", "", promptID
 	}
 	if rawAgentType != "" {
-		return "sub:" + rawAgentType, "subagent", rawAgentType
+		return "sub:" + rawAgentType, "subagent", rawAgentType, promptID
 	}
 	if reqClass == "subagent" {
-		return "subagent", "subagent", "subagent"
+		return "subagent", "subagent", "subagent", promptID
 	}
-	return "main", "main", ""
+	return "main", "main", "", promptID
 }
 
 func DeriveSessionID(r *http.Request, bodyBytes []byte, geminiBody []byte) string {
@@ -230,10 +244,10 @@ func (s *SQLiteLogStore) Add(entry RequestLog) {
 	query := `
 	INSERT INTO request_logs (
 		timestamp, client_key, key_masked, account, session_id,
-		agent_key, agent_type, subagent_name, model,
+		agent_key, agent_type, subagent_name, instance_id, model,
 		ttft_ms, total_dur_ms, in_tokens, out_tokens, cache_read_tokens,
 		cache_hit_rate, tools_json, was_panicked, shrunk, error, status
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 	// Only the masked form of the key is ever persisted to disk, in both
 	// columns — storing the raw tenant API key in a plaintext SQLite file
@@ -242,10 +256,16 @@ func (s *SQLiteLogStore) Add(entry RequestLog) {
 	_, _ = s.db.Exec(
 		query,
 		entry.Timestamp, entry.KeyMasked, entry.KeyMasked, entry.Account, entry.SessionID,
-		entry.AgentKey, entry.AgentType, entry.SubagentName, entry.Model,
+		entry.AgentKey, entry.AgentType, entry.SubagentName, entry.InstanceID, entry.Model,
 		entry.TTFT, entry.TotalDur, entry.InTokens, entry.OutTokens, entry.CacheReadTokens,
 		entry.CacheHitRate, string(toolsBytes), wasPanickedInt, shrunkInt, entry.Error, entry.Status,
 	)
+
+	// Broadcast in real-time over WebSocket to dashboard clients
+	go func(e RequestLog) {
+		globalWSHub.BroadcastLog(&e)
+		globalWSHub.BroadcastSessionsUpdate()
+	}(entry)
 }
 
 func (s *SQLiteLogStore) Clear() {
@@ -482,7 +502,7 @@ func (s *SQLiteLogStore) GetSessionDetail(sessionID string) (*SessionSummary, []
 	detailQuery := `
 	SELECT
 		id, timestamp, client_key, key_masked, account, session_id,
-		agent_key, agent_type, subagent_name, model,
+		agent_key, agent_type, subagent_name, instance_id, model,
 		ttft_ms, total_dur_ms, in_tokens, out_tokens, cache_read_tokens,
 		cache_hit_rate, tools_json, was_panicked, shrunk, error, status
 	FROM request_logs
@@ -503,7 +523,7 @@ func (s *SQLiteLogStore) GetSessionDetail(sessionID string) (*SessionSummary, []
 		var wasPanickedInt, shrunkInt int
 		err := rows.Scan(
 			&item.ID, &item.Timestamp, &item.Key, &item.KeyMasked, &item.Account, &item.SessionID,
-			&item.AgentKey, &item.AgentType, &item.SubagentName, &item.Model,
+			&item.AgentKey, &item.AgentType, &item.SubagentName, &item.InstanceID, &item.Model,
 			&item.TTFT, &item.TotalDur, &item.InTokens, &item.OutTokens, &item.CacheReadTokens,
 			&item.CacheHitRate, &toolsJSON, &wasPanickedInt, &shrunkInt, &item.Error, &item.Status,
 		)
@@ -590,7 +610,7 @@ func (s *SQLiteLogStore) Query(keyFilter, accountFilter, sessionFilter, agentFil
 	query := fmt.Sprintf(`
 	SELECT
 		id, timestamp, client_key, key_masked, account, session_id,
-		agent_key, agent_type, subagent_name, model,
+		agent_key, agent_type, subagent_name, instance_id, model,
 		ttft_ms, total_dur_ms, in_tokens, out_tokens, cache_read_tokens,
 		cache_hit_rate, tools_json, was_panicked, shrunk, error, status
 	FROM request_logs
@@ -613,7 +633,7 @@ func (s *SQLiteLogStore) Query(keyFilter, accountFilter, sessionFilter, agentFil
 		var wasPanickedInt, shrunkInt int
 		err := rows.Scan(
 			&item.ID, &item.Timestamp, &item.Key, &item.KeyMasked, &item.Account, &item.SessionID,
-			&item.AgentKey, &item.AgentType, &item.SubagentName, &item.Model,
+			&item.AgentKey, &item.AgentType, &item.SubagentName, &item.InstanceID, &item.Model,
 			&item.TTFT, &item.TotalDur, &item.InTokens, &item.OutTokens, &item.CacheReadTokens,
 			&item.CacheHitRate, &toolsJSON, &wasPanickedInt, &shrunkInt, &item.Error, &item.Status,
 		)

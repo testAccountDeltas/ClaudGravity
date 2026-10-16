@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"golang.org/x/net/websocket"
 )
 
 // requireDashboardAuth gates the web UI (status page + its /api/* and
@@ -35,7 +37,11 @@ func RegisterUIHandlers(mux *http.ServeMux, cfgMgr *ConfigManager) {
 	mux.HandleFunc("/", requireDashboardAuth(cfgMgr, func(w http.ResponseWriter, r *http.Request) {
 		handleDashboard(cfgMgr, w, r)
 	}))
+	mux.Handle("/ws", requireDashboardAuth(cfgMgr, func(w http.ResponseWriter, r *http.Request) {
+		websocket.Handler(HandleWS).ServeHTTP(w, r)
+	}))
 	mux.HandleFunc("/api/accounts", requireDashboardAuth(cfgMgr, handleAPIAccounts))
+	mux.HandleFunc("/api/accounts/toggle", requireDashboardAuth(cfgMgr, handleAPIAccountToggle))
 	mux.HandleFunc("/api/refresh-quotas", requireDashboardAuth(cfgMgr, handleAPIRefreshQuotas))
 	mux.HandleFunc("/api/warmup", requireDashboardAuth(cfgMgr, handleAPIWarmup))
 	mux.HandleFunc("/api/warmup-all", requireDashboardAuth(cfgMgr, handleAPIWarmupAll))
@@ -58,10 +64,58 @@ func handleAPIModelCatalog(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(globalModelCatalog.GetAll())
 }
 
+// accountsDashboardStaleAfter is how old an account's quota snapshot can get
+// before a dashboard poll opportunistically refreshes it in the background.
+// Deliberately NOT a standalone server-side ticker: nothing needs this data
+// fresh except a human actually looking at the dashboard right now, and the
+// dashboard already polls this endpoint every 15s on its own — piggybacking
+// here means zero extra Google API calls while nobody has the page open,
+// same spirit as applyRateLimitHeaders' 45s trigger for active traffic, just
+// for accounts idle traffic never touches.
+const accountsDashboardStaleAfter = 2 * time.Minute
+
 func handleAPIAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodDelete {
+		email := r.URL.Query().Get("email")
+		if email == "" {
+			http.Error(w, `{"error":"missing required query param: email"}`, http.StatusBadRequest)
+			return
+		}
+		if err := globalAccountManager.DeleteAccount(email); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"success":true,"email":%q}`, email)))
+		return
+	}
+
 	accounts := globalAccountManager.GetAccounts()
+	for _, acc := range accounts {
+		globalAccountManager.TriggerAsyncQuotaRefresh(acc.Email, accountsDashboardStaleAfter)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(accounts)
+}
+
+func handleAPIAccountToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	email := r.URL.Query().Get("email")
+	disabledStr := r.URL.Query().Get("disabled")
+	if email == "" || disabledStr == "" {
+		http.Error(w, `{"error":"missing email or disabled parameter"}`, http.StatusBadRequest)
+		return
+	}
+	disabled := (disabledStr == "true" || disabledStr == "1")
+	if err := globalAccountManager.ToggleAccountDisabled(email, disabled); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(fmt.Sprintf(`{"success":true,"email":%q,"disabled":%v}`, email, disabled)))
 }
 
 func handleAPILogs(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {

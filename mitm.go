@@ -115,6 +115,17 @@ func (m *MitmCA) GetCertificate(domain string) (tls.Certificate, error) {
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+	// domain may be a hostname (goes in DNSNames) or a literal IP (goes in
+	// IPAddresses) — TLS hostname verification checks the IP SAN list, not
+	// DNSNames, when the client dials a bare IP (e.g. a remote server's
+	// public address), so a string match alone would still fail there.
+	dnsNames := []string{"localhost"}
+	ips := []net.IP{net.ParseIP("127.0.0.1")}
+	if ip := net.ParseIP(domain); ip != nil {
+		ips = append(ips, ip)
+	} else {
+		dnsNames = append(dnsNames, domain)
+	}
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject: pkix.Name{
@@ -126,8 +137,8 @@ func (m *MitmCA) GetCertificate(domain string) (tls.Certificate, error) {
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		DNSNames:              []string{domain, "localhost"},
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:              dnsNames,
+		IPAddresses:           ips,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &template, m.caCert, &priv.PublicKey, m.caKey)
 	if err != nil {

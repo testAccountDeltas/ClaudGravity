@@ -9,14 +9,24 @@ import (
 )
 
 const (
-	LoopStreakThreshold = 10
+	// ReadWindowSize/ReadWindowThreshold replace a strict "N consecutive
+	// pure-Read turns" counter: measured live (84 subagent requests, one
+	// real Explore session), Gemini rarely does 10 single-Read turns in an
+	// unbroken row — it interleaves Bash or batches 2-4 Reads per turn — so
+	// the old streak-based counter never fired even with 44 total Read
+	// calls scattered across the session. This instead sums Read calls
+	// over a sliding window of recent turns regardless of what's
+	// interspersed, and only resets on genuine progress (Write/Edit, or a
+	// substantial explanation) rather than on every non-Read turn.
+	ReadWindowSize      = 15
+	ReadWindowThreshold = 10
 	ToolCallHistMax     = 12
 	OscIgnoreTag        = "[ignoring loop detection]"
-	NudgeReadLoop       = "Notice from the gateway: you have just made many consecutive Read calls on small line ranges with no thinking or text in between — this looks like an unproductive read-loop. Stop reading slices. Use Grep/Bash to jump straight to the relevant symbol/section, or read larger ranges, or proceed with what you have."
+	NudgeReadLoop       = "Notice from the gateway: you have made many Read calls recently without writing/editing anything or giving a substantial answer — this looks like an unproductive read-loop. Stop reading slices. Use Grep/Bash to jump straight to the relevant symbol/section, or read larger ranges, or proceed with what you have."
 	NudgeOscillation    = "Notice from the gateway: your output is flagged for looping content (the exact same tool call or A/B oscillation repeated). If intentional, add the tag [ignoring loop detection]; otherwise stop and try a different approach."
 
 	// loopGuardStaleAfter/loopGuardSweepEvery bound the otherwise-unbounded
-	// growth of readStreaks/toolCallHist/lastSeen across the many distinct,
+	// growth of readWindows/toolCallHist/lastSeen across the many distinct,
 	// ephemeral agentKeys a long-running gateway process accumulates.
 	loopGuardStaleAfter = 2 * time.Hour
 	loopGuardSweepEvery = 30 * time.Minute
@@ -24,13 +34,13 @@ const (
 
 type LoopGuardManager struct {
 	mu           sync.Mutex
-	readStreaks  map[string]int       // agentKey -> count
+	readWindows  map[string][]int     // agentKey -> recent per-turn Read-tool-call counts (sliding, max ReadWindowSize)
 	toolCallHist map[string][]string  // agentKey -> list of turn call hashes
 	lastSeen     map[string]time.Time // agentKey -> last activity, for staleness sweeps
 }
 
 var globalLoopGuard = &LoopGuardManager{
-	readStreaks:  make(map[string]int),
+	readWindows:  make(map[string][]int),
 	toolCallHist: make(map[string][]string),
 	lastSeen:     make(map[string]time.Time),
 }
@@ -52,7 +62,7 @@ func (lg *LoopGuardManager) sweepStale() {
 	for k, t := range lg.lastSeen {
 		if t.Before(cutoff) {
 			delete(lg.lastSeen, k)
-			delete(lg.readStreaks, k)
+			delete(lg.readWindows, k)
 			delete(lg.toolCallHist, k)
 		}
 	}
@@ -63,7 +73,11 @@ func (lg *LoopGuardManager) touchLocked(agentKey string) {
 	lg.lastSeen[agentKey] = time.Now()
 }
 
-func (lg *LoopGuardManager) RecordReadTurn(agentKey string, isOnlyRead bool) {
+// RecordReadTurn appends this turn's Read-tool-call count to agentKey's
+// sliding window. madeProgress (a Write/Edit happened, or the turn carried a
+// substantial amount of actual explanatory text/thinking — not just "let me
+// check X") wipes the window: that's real forward motion, not skimming.
+func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeProgress bool) {
 	if agentKey == "" || agentKey == "auxiliary" {
 		return
 	}
@@ -71,11 +85,16 @@ func (lg *LoopGuardManager) RecordReadTurn(agentKey string, isOnlyRead bool) {
 	defer lg.mu.Unlock()
 	lg.touchLocked(agentKey)
 
-	if isOnlyRead {
-		lg.readStreaks[agentKey]++
-	} else {
-		lg.readStreaks[agentKey] = 0
+	if madeProgress {
+		delete(lg.readWindows, agentKey)
+		return
 	}
+
+	w := append(lg.readWindows[agentKey], readCount)
+	if len(w) > ReadWindowSize {
+		w = w[len(w)-ReadWindowSize:]
+	}
+	lg.readWindows[agentKey] = w
 }
 
 func (lg *LoopGuardManager) CheckAndResetReadStreak(agentKey string) bool {
@@ -85,8 +104,12 @@ func (lg *LoopGuardManager) CheckAndResetReadStreak(agentKey string) bool {
 	lg.mu.Lock()
 	defer lg.mu.Unlock()
 
-	if lg.readStreaks[agentKey] >= LoopStreakThreshold {
-		lg.readStreaks[agentKey] = 0
+	total := 0
+	for _, c := range lg.readWindows[agentKey] {
+		total += c
+	}
+	if total >= ReadWindowThreshold {
+		delete(lg.readWindows, agentKey)
 		return true
 	}
 	return false

@@ -57,6 +57,169 @@ func isWithinSessionCWD(path, sessionID string) bool {
 	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
 }
 
+// sessionFileSnapshotMap tracks, per session, the last content the MODEL
+// ITSELF has seen/produced for a given file path via Read/Write/Edit tool
+// calls already present in the conversation history sent with this very
+// request. Unlike reading the gateway's own disk, this works identically
+// whether the gateway and the client share a filesystem or not -- the
+// history is already inside the request body.
+var (
+	sessionSnapLock sync.RWMutex
+	sessionSnapMap  = make(map[string]map[string]string) // sessionID -> filePath -> content
+)
+
+func getSessionSnapshot(sessionID, path string) (string, bool) {
+	sessionSnapLock.RLock()
+	defer sessionSnapLock.RUnlock()
+	m := sessionSnapMap[sessionID]
+	if m == nil {
+		return "", false
+	}
+	v, ok := m[path]
+	return v, ok
+}
+
+func setSessionSnapshot(sessionID, path, content string) {
+	if sessionID == "" || path == "" {
+		return
+	}
+	sessionSnapLock.Lock()
+	defer sessionSnapLock.Unlock()
+	m := sessionSnapMap[sessionID]
+	if m == nil {
+		m = make(map[string]string)
+		sessionSnapMap[sessionID] = m
+	}
+	m[path] = content
+}
+
+// stripCatNPrefix reverses the Read tool's "cat -n"-style numbering
+// ("   123\tcontent") back into raw file text. Lines that don't match the
+// pattern (stray warnings etc.) are kept as-is rather than dropped.
+var catNLinePrefix = regexp.MustCompile(`^\s*\d+\t`)
+
+func stripCatNPrefix(dump string) string {
+	lines := strings.Split(dump, "\n")
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if loc := catNLinePrefix.FindStringIndex(l); loc != nil {
+			out = append(out, l[loc[1]:])
+		} else {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// RecordSessionFileSnapshots replays the Read/Write/Edit tool calls already
+// present in this request's own message history to reconstruct each file's
+// last known state AS THE MODEL ITSELF SAW/PRODUCED IT.
+//
+// This is the actually-correct ground truth for RepairEditToolCall: when
+// old_string fails to byte-match, it's because the model mis-transcribed
+// whitespace/tabs/newlines from content it already read earlier in this
+// same conversation -- not because the file is unreachable or "new". The
+// conversation already carries that content over the wire to the gateway
+// regardless of where the gateway runs, so this needs no local disk access
+// at all (works for a remote-deployed gateway, unlike os.ReadFile below).
+func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
+	if sessionID == "" {
+		return
+	}
+	messages := gjson.GetBytes(bodyBytes, "messages")
+	if !messages.IsArray() {
+		return
+	}
+
+	toolIDToName := make(map[string]string)
+	toolIDToPath := make(map[string]string)
+
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(_, p gjson.Result) bool {
+			switch p.Get("type").String() {
+			case "tool_use":
+				id := p.Get("id").String()
+				name := strings.ToLower(p.Get("name").String())
+				if id == "" {
+					return true
+				}
+				toolIDToName[id] = name
+
+				input := p.Get("input")
+				path := firstNonEmpty(input.Get("file_path").String(), input.Get("path").String(), input.Get("target_file").String())
+				if path == "" {
+					return true
+				}
+				toolIDToPath[id] = path
+
+				switch name {
+				case "write":
+					// Write hands the full new file content directly in the
+					// call itself -- no need to wait for the tool_result.
+					if c := input.Get("content"); c.Exists() {
+						setSessionSnapshot(sessionID, path, c.String())
+					}
+				case "edit", "update", "str_replace_editor", "notebookedit":
+					// Replay same-turn edits against whatever snapshot we
+					// already have, so a second Edit on a file touched
+					// earlier in this very request compares against
+					// up-to-date content instead of the stale initial Read.
+					oldStr := firstNonEmpty(input.Get("old_string").String(), input.Get("old_str").String(), input.Get("pattern").String())
+					newStr := firstNonEmpty(input.Get("new_string").String(), input.Get("new_str").String())
+					if oldStr != "" {
+						if cur, ok := getSessionSnapshot(sessionID, path); ok && strings.Contains(cur, oldStr) {
+							setSessionSnapshot(sessionID, path, strings.Replace(cur, oldStr, newStr, 1))
+						}
+					}
+				}
+
+			case "tool_result":
+				toolUseID := p.Get("tool_use_id").String()
+				if toolIDToName[toolUseID] != "read" {
+					return true
+				}
+				path := toolIDToPath[toolUseID]
+				if path == "" {
+					return true
+				}
+
+				var resText string
+				c := p.Get("content")
+				if c.IsArray() {
+					var sb strings.Builder
+					c.ForEach(func(_, item gjson.Result) bool {
+						if item.Get("type").String() == "text" {
+							sb.WriteString(item.Get("text").String())
+						}
+						return true
+					})
+					resText = sb.String()
+				} else if c.Exists() {
+					resText = c.String()
+				}
+				if resText != "" {
+					setSessionSnapshot(sessionID, path, stripCatNPrefix(resText))
+				}
+			}
+			return true
+		})
+		return true
+	})
+}
+
 // ExtractCWDFromSystemPrompt extracts the user session working directory from Claude Code environment preamble
 func ExtractCWDFromSystemPrompt(systemPrompt string) string {
 	if systemPrompt == "" {
@@ -156,17 +319,28 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 	// other tenants' config, ...) just by naming it in a fake Edit call.
 	// Require the resolved path to live inside the session's own recorded
 	// working directory; if that's unknown, refuse rather than guess.
-	if !isWithinSessionCWD(resolvedPath, sessionID) {
-		return argsRaw, false
+	//
+	// This check guards ONLY the disk-read path below. The snapshot
+	// fallback (getSessionSnapshot) touches no disk and exposes nothing the
+	// client didn't already send itself in this very request, so it's safe
+	// to use even when the sandbox check fails or the gateway has no
+	// filesystem access to the client's files at all (remote deployment).
+	var fileContent string
+	if isWithinSessionCWD(resolvedPath, sessionID) {
+		if data, err := os.ReadFile(resolvedPath); err == nil {
+			fileContent = string(data)
+		}
 	}
-
-	data, err := os.ReadFile(resolvedPath)
-	if err != nil {
-		// File does not exist or unreadable, cannot repair
-		return argsRaw, false
+	if fileContent == "" {
+		snap, ok := getSessionSnapshot(sessionID, targetPath)
+		if !ok {
+			snap, ok = getSessionSnapshot(sessionID, resolvedPath)
+		}
+		if !ok {
+			return argsRaw, false
+		}
+		fileContent = snap
 	}
-
-	fileContent := string(data)
 
 	// Direct byte-for-byte match already exists! No repair needed.
 	if strings.Contains(fileContent, oldStr) {

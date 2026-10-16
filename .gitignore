@@ -21,7 +21,16 @@ certs/
 # ===== Собранные бинарники =====
 gateway.exe
 gateway_new.exe
+gateway.exe.bak
+gateway.exe~
+gateway_linux*
 *.exe
+
+# ===== Деплойный конфиг с реальным public_host/секретами текущего сервера =====
+config.server.json
+
+# ===== Дамп реальных сессий с email-адресами аккаунтов =====
+session_check.json
 
 # ===== Runtime-данные / логи / БД — генерируются при работе шлюза =====
 superrelay.log
