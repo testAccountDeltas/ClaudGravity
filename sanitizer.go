@@ -32,6 +32,95 @@ var (
 	multiNewlinePattern         = regexp.MustCompile(`\n{3,}`)
 )
 
+// toolResultPlainText extracts the text out of a tool_result "content"
+// value, which can be either a bare string or an array of content blocks
+// (text/image/document — only "text" blocks contribute here).
+func toolResultPlainText(content interface{}) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []interface{}:
+		var sb strings.Builder
+		for _, item := range c {
+			block, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if block["type"] == "text" {
+				if t, ok := block["text"].(string); ok {
+					sb.WriteString(t)
+				}
+			}
+		}
+		return sb.String()
+	}
+	return ""
+}
+
+// firstNonEmptyFromMap returns the first non-empty string value found in m
+// among the given keys, in order.
+func firstNonEmptyFromMap(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// dedupedRepeatedReads collapses any Read tool_result whose content is
+// byte-identical to an earlier Read of the same (canonicalized) file path
+// elsewhere in this same conversation into a short marker, leaving the
+// first occurrence untouched. Returns true if anything was changed. A
+// change in content (the file genuinely changed between reads) is left
+// alone — only exact repeats are folded.
+func dedupedRepeatedReads(newMsgs []map[string]interface{}) bool {
+	toolIDToPath := make(map[string]string)
+	seenContent := make(map[string]string)
+	changed := false
+
+	for _, m := range newMsgs {
+		blocks, ok := m["content"].([]map[string]interface{})
+		if !ok {
+			continue
+		}
+		for _, b := range blocks {
+			switch b["type"] {
+			case "tool_use":
+				name, _ := b["name"].(string)
+				if !strings.EqualFold(name, "Read") {
+					continue
+				}
+				id, _ := b["id"].(string)
+				input, _ := b["input"].(map[string]interface{})
+				if id == "" || input == nil {
+					continue
+				}
+				if path := firstNonEmptyFromMap(input, "file_path", "path", "target_file"); path != "" {
+					toolIDToPath[id] = canonicalSnapshotKey(path)
+				}
+			case "tool_result":
+				tid, _ := b["tool_use_id"].(string)
+				path, ok := toolIDToPath[tid]
+				if !ok {
+					continue
+				}
+				text := toolResultPlainText(b["content"])
+				if text == "" {
+					continue
+				}
+				if prev, seen := seenContent[path]; seen && prev == text {
+					b["content"] = fmt.Sprintf("[Identical to the Read result already shown earlier in this conversation for %s — unchanged, see above. Do not re-read; proceed with what you already have.]", path)
+					changed = true
+					continue
+				}
+				seenContent[path] = text
+			}
+		}
+	}
+	return changed
+}
+
 // StripPollutedToolCallText strips out pseudo-tool call narrations
 // such as "[Called tool exec_command with input {...}]" which confuse models
 // into generating tool invocations as raw text instead of structured JSON calls.
@@ -307,6 +396,21 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 		}
 	}
 	newMsgs = rebuilt
+
+	// Collapse repeated identical Read results: re-reading the exact same
+	// unchanged file is the single most common shape of the "unproductive
+	// read-loop" LoopGuard exists to catch, and every repeat read bloats
+	// the very context that pushes the conversation toward auto-compaction
+	// — which then erases the detailed memory of having read the file,
+	// so the model reads it again. Confirmed real-world pattern
+	// (independent investigation into Claude Code's own read-loop issue).
+	// Folding duplicates into a short marker (instead of letting them sit
+	// in full every single turn) also reduces the temptation to re-read,
+	// since the model no longer has to scroll past a wall of old file text
+	// to find anything new.
+	if dedupedRepeatedReads(newMsgs) {
+		modified = true
+	}
 
 	// Gemini's generateContent requires the conversation to end on a "user"
 	// turn; Anthropic allows the last message to be "assistant" (prefill:

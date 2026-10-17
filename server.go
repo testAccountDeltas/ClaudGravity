@@ -954,13 +954,24 @@ UpstreamReady:
 	totalDur := time.Since(t0)
 
 	readCount := 0
-	madeProgress := streamer.textChars > 200 // a real explanation, not just "let me check X"
+	madeProgress := false
 	for _, t := range streamer.toolNames {
 		if t == "Read" {
 			readCount++
 		} else if t == "Write" || t == "Edit" || t == "NotebookEdit" {
 			madeProgress = true
 		}
+	}
+	// A turn with ZERO tool calls at all (readCount==0, no Write/Edit
+	// either) that's still a substantial text answer IS real progress —
+	// the agent explained something or finished. But textChars>200 used to
+	// count as progress even when the SAME turn also called Read N times:
+	// a model that narrates its own reading at length ("Let me carefully
+	// check lines 100-200 to be sure...") wiped the loop-detection window
+	// on every single read-loop turn purely by being verbose, which is
+	// exactly the chatty-but-stuck pattern this guard exists to catch.
+	if readCount == 0 && !madeProgress {
+		madeProgress = streamer.textChars > 200
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
 	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress)

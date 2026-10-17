@@ -163,9 +163,13 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 
 	// 2. Loop-Guard Nudges (Read-Loop & Oscillation)
-	if globalLoopGuard.CheckAndResetReadStreak(loopKey) {
-		InjectUserNudge(reqMap, NudgeReadLoop)
-		LogGateway(".. read-loop window >= %d Read calls [%s] -> injecting stop-nudge", ReadWindowThreshold, loopKey)
+	if level := globalLoopGuard.CheckAndResetReadStreak(loopKey); level > 0 {
+		nudgeText := NudgeReadLoop
+		if level >= 2 {
+			nudgeText = NudgeReadLoopEscalated
+		}
+		InjectUserNudge(reqMap, nudgeText)
+		LogGateway(".. read-loop window >= %d Read calls [%s] level=%d -> injecting stop-nudge", ReadWindowThreshold, loopKey, level)
 	}
 	if globalLoopGuard.CheckAndResetOscillation(loopKey) {
 		InjectUserNudge(reqMap, NudgeOscillation)

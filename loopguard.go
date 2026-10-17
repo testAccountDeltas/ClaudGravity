@@ -26,6 +26,13 @@ const (
 	NudgeReadLoop       = "Notice from the gateway: you have made many Read calls recently without writing/editing anything or giving a substantial answer — this looks like an unproductive read-loop. Stop reading slices. Use Grep/Bash to jump straight to the relevant symbol/section, or read larger ranges, or proceed with what you have."
 	NudgeOscillation    = "Notice from the gateway: your output is flagged for looping content (the exact same tool call or A/B oscillation repeated). If intentional, add the tag [ignoring loop detection]; otherwise stop and try a different approach."
 
+	// NudgeReadLoopEscalated fires when the soft nudge above already fired
+	// once for this agent and it slid right back into another full
+	// read-loop window without ever writing/editing anything in between —
+	// confirmed real-world pattern: a model politely acknowledges the soft
+	// nudge ("Understood, I'll proceed") and then immediately reads again.
+	NudgeReadLoopEscalated = "Notice from the gateway (repeated): you were already warned about an unproductive read-loop and went straight back into another one without writing, editing, or answering in between. Do not read anything else right now. In your very next turn, either call Write/Edit to make the change, or give your final answer with what you already have."
+
 	// loopGuardStaleAfter/loopGuardSweepEvery bound the otherwise-unbounded
 	// growth of readWindows/toolCallHist/lastSeen across the many distinct,
 	// ephemeral agentKeys a long-running gateway process accumulates.
@@ -38,12 +45,14 @@ type LoopGuardManager struct {
 	readWindows  map[string][]int     // agentKey -> recent per-turn Read-tool-call counts (sliding, max ReadWindowSize)
 	toolCallHist map[string][]string  // agentKey -> list of turn call hashes
 	lastSeen     map[string]time.Time // agentKey -> last activity, for staleness sweeps
+	nudgeCount   map[string]int       // agentKey -> how many read-loop nudges fired since the last genuine Write/Edit; escalates wording instead of staying a one-time whisper
 }
 
 var globalLoopGuard = &LoopGuardManager{
 	readWindows:  make(map[string][]int),
 	toolCallHist: make(map[string][]string),
 	lastSeen:     make(map[string]time.Time),
+	nudgeCount:   make(map[string]int),
 }
 
 func init() {
@@ -65,6 +74,7 @@ func (lg *LoopGuardManager) sweepStale() {
 			delete(lg.lastSeen, k)
 			delete(lg.readWindows, k)
 			delete(lg.toolCallHist, k)
+			delete(lg.nudgeCount, k)
 		}
 	}
 }
@@ -88,6 +98,7 @@ func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeP
 
 	if madeProgress {
 		delete(lg.readWindows, agentKey)
+		delete(lg.nudgeCount, agentKey) // genuine progress earns a clean slate for the nudge wording too
 		return
 	}
 
@@ -98,9 +109,17 @@ func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeP
 	lg.readWindows[agentKey] = w
 }
 
-func (lg *LoopGuardManager) CheckAndResetReadStreak(agentKey string) bool {
+// CheckAndResetReadStreak reports the nudge's escalation level: 0 means no
+// nudge fires. 1 is the first (soft) warning for this agent since its last
+// genuine Write/Edit; 2+ means the soft nudge already fired and the agent
+// slid straight back into another full read-loop window without ever
+// writing/editing in between — confirmed real pattern (the model politely
+// acknowledges the soft nudge, then immediately reads again), so the second
+// firing gets much more directive wording instead of repeating the same
+// whisper indefinitely.
+func (lg *LoopGuardManager) CheckAndResetReadStreak(agentKey string) int {
 	if agentKey == "" || agentKey == "auxiliary" || strings.HasPrefix(agentKey, "auxiliary|") {
-		return false
+		return 0
 	}
 	lg.mu.Lock()
 	defer lg.mu.Unlock()
@@ -111,9 +130,10 @@ func (lg *LoopGuardManager) CheckAndResetReadStreak(agentKey string) bool {
 	}
 	if total >= ReadWindowThreshold {
 		delete(lg.readWindows, agentKey)
-		return true
+		lg.nudgeCount[agentKey]++
+		return lg.nudgeCount[agentKey]
 	}
-	return false
+	return 0
 }
 
 // RecordToolCalls records tool calls executed in this turn.
