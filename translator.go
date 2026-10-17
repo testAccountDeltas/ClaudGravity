@@ -624,6 +624,15 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			normName := strings.ToLower(strings.ReplaceAll(name, "_", ""))
 			if normName == "websearch" || normName == "googlesearch" {
 				hasWebSearch = true
+				// Never declare this as a regular custom function too — it
+				// isn't one (this gateway has no handler for a "web_search"
+				// functionCall; it exists purely to flip hasWebSearch above
+				// so native Gemini googleSearch grounding can be used
+				// instead). Leaving it in decls meant decls was virtually
+				// NEVER empty (Claude Code always declares web_search), so
+				// the "only add googleSearch when there are no other tools"
+				// check below never actually fired either way.
+				return true
 			}
 			if tenant.StripSearchTools && DropSearchTools[name] {
 				return true
@@ -673,27 +682,21 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			// appears to be an inherent property of this specific
 			// undocumented endpoint, not something fixable client-side.
 		}
-		// Confirmed via Google's own docs: Gemini 3 models support combining
-		// custom functionDeclarations and the built-in googleSearch tool in
-		// the same tools array — previously this was an else-if, so any
-		// request that declared even one other tool (true for ~every real
-		// Claude Code call) silently dropped googleSearch grounding entirely.
-		if hasWebSearch {
-			idx := 0
-			if len(decls) > 0 {
-				idx = 1
-			}
-			out, _ = sjson.SetRaw(out, fmt.Sprintf("tools.%d.googleSearch", idx), "{}")
-			if len(decls) > 0 {
-				// Google now rejects a request mixing a built-in tool
-				// (googleSearch) with custom functionDeclarations unless
-				// this is explicitly set: 400 INVALID_ARGUMENT "Please
-				// enable tool_config.include_server_side_tool_invocations
-				// to use Built-in tools with Function calling." Hit on
-				// virtually every real request, since Claude Code declares
-				// its native web_search tool alongside everything else.
-				out, _ = sjson.Set(out, "toolConfig.includeServerSideToolInvocations", true)
-			}
+		// A prior attempt combined custom functionDeclarations with the
+		// built-in googleSearch tool in the same tools array (citing Google
+		// docs that Gemini 3 supports this), and a follow-up tried adding
+		// toolConfig.includeServerSideToolInvocations:true to satisfy
+		// Google's "Please enable tool_config.include_server_side_tool_
+		// invocations to use Built-in tools with Function calling" 400 —
+		// that flag did NOT fix it live (confirmed: same 400 recurred after
+		// deploying it), and the exact right fix for this undocumented
+		// internal endpoint isn't known. Reverted to mutually exclusive:
+		// real tool execution (Read/Write/Bash/...) matters far more than
+		// native search grounding, and declaring both together is what
+		// breaks every subagent spawn outright. Revisit only with a live-
+		// confirmed fix, not another guess at the field name/path.
+		if hasWebSearch && len(decls) == 0 {
+			out, _ = sjson.SetRaw(out, "tools.0.googleSearch", "{}")
 		}
 
 		// tool_choice was previously dropped entirely, so a client forcing
