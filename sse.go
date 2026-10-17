@@ -315,6 +315,7 @@ func (s *SSEStreamer) HandleText(text string) error {
 }
 
 func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSignature string) error {
+	argsRaw = coerceNumericEnumArgs(name, argsRaw)
 	if repaired, ok := RepairEditToolCall(name, argsRaw, s.sessionID); ok {
 		argsRaw = repaired
 	}
@@ -341,6 +342,14 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSig
 	}
 	if err := s.EnsureMessageStart(); err != nil {
 		return err
+	}
+	// Gemini 2.0/3.x Flash Thinking often attaches the open thinking block's
+	// thoughtSignature to the chunk carrying the functionCall itself rather
+	// than to a preceding thought chunk — if so, s.thoughtSignature is still
+	// empty here and closeCurrentBlock()'s signature_delta check below would
+	// silently drop it, closing the thinking block with no signature at all.
+	if s.currentType == TypeThinking && s.thoughtSignature == "" && thoughtSignature != "" {
+		s.thoughtSignature = thoughtSignature
 	}
 	if err := s.closeCurrentBlock(); err != nil {
 		return err
@@ -412,7 +421,9 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	// instead of a hard stream failure. If some content DID stream before
 	// the cutoff, let it through as end_turn: the client has something to
 	// show, which beats discarding it.
-	isEmptyRefusal := finishReason == "SAFETY" && !s.toolUseOccurred && s.textChars == 0 && s.thinkingChars == 0
+	isSafetyBlock := finishReason == "SAFETY" || finishReason == "RECITATION" || finishReason == "BLOCKLIST" ||
+		finishReason == "PROHIBITED_CONTENT" || finishReason == "SPII"
+	isEmptyRefusal := isSafetyBlock && !s.toolUseOccurred && s.textChars == 0 && s.thinkingChars == 0
 
 	// MAX_TOKENS must win over tool_use: toolUseOccurred only means a
 	// functionCall part was seen, not that it arrived complete. If

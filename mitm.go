@@ -25,6 +25,19 @@ import (
 	"time"
 )
 
+// bufferedConn prepends bytes net/http's bufio.Reader already pulled off the
+// socket (see HandleConnectTunnel's Hijack() call) ahead of further reads
+// from the raw connection, so nothing read during CONNECT header parsing is
+// lost to the TLS handshake that follows.
+type bufferedConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) {
+	return b.r.Read(p)
+}
+
 // globalMitmCA is set once in main() right after InitMitmCA succeeds, so
 // other handlers (the /api/bootstrap installer endpoint in ui.go) can hand
 // out the CA's PEM without needing mitmCA threaded through as a parameter.
@@ -211,10 +224,19 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return
 	}
-	clientConn, _, err := hijacker.Hijack()
+	rawConn, rw, err := hijacker.Hijack()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
+	}
+	// A client that pipelines its TLS ClientHello right behind the CONNECT
+	// request (same TCP read) already has those bytes sitting in net/http's
+	// internal bufio.Reader by the time Hijack() returns — discarding that
+	// reader here would drop them forever, and the TLS handshake below would
+	// then read from an empty, silent socket until it times out.
+	var clientConn net.Conn = rawConn
+	if rw != nil && rw.Reader != nil && rw.Reader.Buffered() > 0 {
+		clientConn = &bufferedConn{Conn: rawConn, r: io.MultiReader(rw.Reader, rawConn)}
 	}
 
 	// 1. Send 200 Connection Established to client

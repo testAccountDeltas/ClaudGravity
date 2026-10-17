@@ -7,12 +7,86 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 var gjsonPathKeyReplacer = strings.NewReplacer(".", "\\.", "*", "\\*", "?", "\\?")
+
+// numericEnumFields remembers, per declared tool name, which top-level
+// argument fields had a non-string enum (integer/number/boolean) in the
+// ORIGINAL Claude tool schema before convertEnumValuesToStrings forced them
+// to TYPE_STRING for Gemini — Gemini only allows enum on STRING fields, but
+// it then returns the value back as a JSON string ("1") on a function call,
+// which Claude Code's own schema validator (still expecting the original
+// integer/number/boolean type) rejects. A tool's schema is static for the
+// life of the conversation that declared it, so a global cache (same
+// pattern as sse.go's toolSignatureCache) needs no request/session
+// plumbing through ConvertClaudeRequestToGemini's return values.
+var (
+	numericEnumFieldsMu sync.Mutex
+	numericEnumFields   = make(map[string]map[string]string) // toolName -> fieldName -> original JSON type
+)
+
+// recordNumericEnumFields scans a tool's ORIGINAL (pre-clean) input_schema
+// for top-level properties with a non-string enum, so the type can be
+// restored on the way back in coerceNumericEnumArgs.
+func recordNumericEnumFields(toolName, inputSchemaRaw string) {
+	props := gjson.Get(inputSchemaRaw, "properties")
+	if !props.IsObject() {
+		return
+	}
+	var fields map[string]string
+	props.ForEach(func(key, val gjson.Result) bool {
+		t := val.Get("type").String()
+		if val.Get("enum").IsArray() && (t == "integer" || t == "number" || t == "boolean") {
+			if fields == nil {
+				fields = make(map[string]string)
+			}
+			fields[key.String()] = t
+		}
+		return true
+	})
+	numericEnumFieldsMu.Lock()
+	defer numericEnumFieldsMu.Unlock()
+	if fields == nil {
+		delete(numericEnumFields, toolName)
+		return
+	}
+	numericEnumFields[toolName] = fields
+}
+
+// coerceNumericEnumArgs restores a function call's string-coerced enum
+// fields back to their declared integer/number/boolean type before the
+// args are handed to the client as a tool_use block.
+func coerceNumericEnumArgs(toolName, argsRaw string) string {
+	numericEnumFieldsMu.Lock()
+	fields := numericEnumFields[toolName]
+	numericEnumFieldsMu.Unlock()
+	for field, origType := range fields {
+		v := gjson.Get(argsRaw, field)
+		if v.Type != gjson.String {
+			continue
+		}
+		switch origType {
+		case "integer":
+			if n, err := strconv.ParseInt(v.String(), 10, 64); err == nil {
+				argsRaw, _ = sjson.Set(argsRaw, field, n)
+			}
+		case "number":
+			if f, err := strconv.ParseFloat(v.String(), 64); err == nil {
+				argsRaw, _ = sjson.Set(argsRaw, field, f)
+			}
+		case "boolean":
+			if b, err := strconv.ParseBool(v.String()); err == nil {
+				argsRaw, _ = sjson.Set(argsRaw, field, b)
+			}
+		}
+	}
+	return argsRaw
+}
 
 const placeholderReasonDescription = "Brief explanation of why you are calling this tool"
 
@@ -204,12 +278,17 @@ func resolveLocalRef(jsonStr, refVal string) string {
 	switch {
 	case strings.HasPrefix(refVal, defsPrefix):
 		name = refVal[len(defsPrefix):]
-		if def := gjson.Get(jsonStr, "$defs."+name); def.Exists() {
+		// A def name containing a literal "." (Pydantic nests these as
+		// "Outer.Inner") would otherwise be read by gjson as a multi-level
+		// path ($defs.Outer.Inner) instead of the single key "$defs" ->
+		// "Outer.Inner" it actually is, silently failing to resolve and
+		// degrading the referenced schema to an empty {"type":"object"}.
+		if def := gjson.Get(jsonStr, "$defs."+escapeGJSONPathKey(name)); def.Exists() {
 			return def.Raw
 		}
 	case strings.HasPrefix(refVal, definitionsPrefix):
 		name = refVal[len(definitionsPrefix):]
-		if def := gjson.Get(jsonStr, "definitions."+name); def.Exists() {
+		if def := gjson.Get(jsonStr, "definitions."+escapeGJSONPathKey(name)); def.Exists() {
 			return def.Raw
 		}
 	}
@@ -343,7 +422,7 @@ func mergeAllOf(jsonStr string) string {
 			// got deleted below with its type/enum/format never merged
 			// anywhere, leaving the parameter with no "type" at all and
 			// Google rejecting it outright.
-			for _, kw := range []string{"type", "enum", "format"} {
+			for _, kw := range []string{"type", "enum", "format", "description"} {
 				if v := item.Get(kw); v.Exists() && !gjson.Get(jsonStr, joinPath(parentPath, kw)).Exists() {
 					jsonStr, _ = sjson.SetRaw(jsonStr, joinPath(parentPath, kw), v.Raw)
 				}

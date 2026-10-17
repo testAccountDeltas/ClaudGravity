@@ -24,6 +24,43 @@ func conservativeTokenEstimate(v interface{}) int {
 	if v == nil {
 		return 0
 	}
+	// A message's "content" array can hold image/document blocks whose
+	// base64 payload is pure byte bulk with none of the 2-chars/token
+	// density the flat-rate fallback below assumes — a single 3MB
+	// screenshot (~4,000,000 base64 chars) would price out at ~2,000,000
+	// "tokens" even though Gemini bills it ~258-1600 tokens, which made the
+	// truncation loop below mistake one attached image for a context
+	// overflow and drop the entire rest of the conversation to compensate.
+	if m, ok := v.(map[string]interface{}); ok {
+		if blocks, isList := m["content"].([]interface{}); isList {
+			total := 0
+			counted := false
+			for _, b := range blocks {
+				bMap, isMap := b.(map[string]interface{})
+				if !isMap {
+					continue
+				}
+				switch bMap["type"] {
+				case "image":
+					total += 1600
+					counted = true
+				case "document":
+					total += 2500
+					counted = true
+				default:
+					total += flatTokenEstimate(bMap)
+					counted = true
+				}
+			}
+			if counted {
+				return total
+			}
+		}
+	}
+	return flatTokenEstimate(v)
+}
+
+func flatTokenEstimate(v interface{}) int {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return 0
@@ -111,12 +148,16 @@ func TruncateConversationToFit(reqMap map[string]interface{}, modelName string, 
 		return 0, false
 	}
 
-	// Drop oldest messages first. SanitizeMessagesAndGraph runs right after
-	// this in ConvertClaudeRequestToGemini and repairs any orphaned
-	// tool_use/tool_result pairing or role-alternation issue this leaves
-	// behind, so a simple prefix-drop here is sufficient.
+	// Drop oldest INTERMEDIATE messages first, starting at index 1: index 0
+	// is the user's original task statement for this conversation, and
+	// erasing it left the agent with no idea what it was asked to do once
+	// enough history piled up to trigger truncation — it would start asking
+	// the user to restate the goal mid-task. SanitizeMessagesAndGraph runs
+	// right after this in ConvertClaudeRequestToGemini and repairs any
+	// orphaned tool_use/tool_result pairing or role-alternation issue this
+	// leaves behind, so a simple prefix-drop here is sufficient.
 	dropped := 0
-	i := 0
+	i := 1
 	for total > int(budget) && i < len(msgsList)-2 {
 		total -= msgTokens[i]
 		dropped++
@@ -134,6 +175,6 @@ func TruncateConversationToFit(reqMap map[string]interface{}, modelName string, 
 			dropped, modelName, maxTokens,
 		),
 	}
-	reqMap["messages"] = append([]interface{}{notice}, remaining...)
+	reqMap["messages"] = append([]interface{}{msgsList[0], notice}, remaining...)
 	return dropped, true
 }

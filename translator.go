@@ -536,6 +536,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				return true
 			}
 			desc := t.Get("description").String()
+			recordNumericEnumFields(name, t.Get("input_schema").Raw)
 			schemaRaw := CleanJSONSchemaForAntigravity(t.Get("input_schema").Raw)
 			if strings.TrimSpace(schemaRaw) == "" || schemaRaw == "null" {
 				// Google rejects an OBJECT-type schema with empty properties
@@ -773,6 +774,14 @@ func ScrubBillingHeader(txt string) string {
 					strings.Contains(lower, "shell:") ||
 					strings.Contains(lower, "os version:") ||
 					strings.Contains(lower, "working directory:") ||
+					// Dropped silently like every other unlisted Environment
+					// line — but these two are load-bearing: without "is a
+					// git repository" Gemini doesn't know git commands are
+					// even on the table, and without "scratchpad directory"
+					// it has no designated place for temp files and starts
+					// littering the repo root or /tmp instead.
+					strings.Contains(lower, "is a git repository:") ||
+					strings.Contains(lower, "scratchpad directory:") ||
 					// Dropping this line left Gemini with no idea what the
 					// real current date/year is, so it would default to
 					// whatever's baked into its training data — guessing

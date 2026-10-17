@@ -40,13 +40,14 @@ const (
 	loopGuardSweepEvery = 30 * time.Minute
 
 	// exploreReadWindowSize/exploreReadWindowThreshold are the read-loop
-	// limits for a research subagent (Explore/Plan role) instead of the
-	// main-agent ReadWindowSize/ReadWindowThreshold above. These roles are
-	// deliberately built to read 20-40+ files in a row with no Write/Edit
-	// at all — that IS the job, not a loop — so the main agent's
-	// 10-reads-in-15-turns threshold was firing on legitimate
-	// investigation and forcing an incomplete answer back to the parent
-	// agent well before the subagent had actually finished exploring.
+	// limits for any subagent role instead of the main-agent
+	// ReadWindowSize/ReadWindowThreshold above. Originally scoped to just
+	// Explore/Plan, but "general-purpose" (the most commonly spawned
+	// subagent — the Agent tool's own catch-all for "researching complex
+	// questions, searching for code, and executing multi-step tasks") is
+	// built for the exact same kind of long, unsupervised read-heavy
+	// investigation and was still hitting the main agent's tight
+	// 10-reads-in-15-turns threshold and getting cut off mid-investigation.
 	exploreReadWindowSize      = 50
 	exploreReadWindowThreshold = 40
 )
@@ -57,7 +58,7 @@ const (
 // the role is already encoded in the same string LoopGuard keys its state
 // by.
 func readLoopLimits(agentKey string) (windowSize, threshold int) {
-	if strings.HasPrefix(agentKey, "sub:Explore") || strings.HasPrefix(agentKey, "sub:Plan") {
+	if strings.HasPrefix(agentKey, "sub:") {
 		return exploreReadWindowSize, exploreReadWindowThreshold
 	}
 	return ReadWindowSize, ReadWindowThreshold

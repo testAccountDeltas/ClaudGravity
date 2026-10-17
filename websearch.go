@@ -141,7 +141,7 @@ func searchWithGoogleGrounding(ctx context.Context, query string, googleToken st
 		}
 		httpReq.Header.Set("Authorization", "Bearer "+googleToken)
 		httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
-		httpReq.Header.Set("User-Agent", "vscode/1.X.X (Antigravity/4.3.0)")
+		httpReq.Header.Set("User-Agent", AntigravityUserAgent)
 		httpReq.Header.Set("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
 		httpReq.Header.Set("Client-Metadata", `{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`)
 
@@ -313,6 +313,7 @@ func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, dat
 
 // handleClaudeCodeDirectWebSearch fulfills Claude Code's native search sub-request.
 func handleClaudeCodeDirectWebSearch(
+	baseCtx context.Context,
 	rid uint64,
 	t0 time.Time,
 	clientKey string,
@@ -325,7 +326,7 @@ func handleClaudeCodeDirectWebSearch(
 	query string,
 	w http.ResponseWriter,
 ) {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(baseCtx, 25*time.Second)
 	defer cancel()
 
 	results, summaryText, err := PerformWebSearch(ctx, query, googleToken, isAntigravity, activeAcc, tenant)

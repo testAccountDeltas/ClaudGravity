@@ -131,7 +131,7 @@ func commonAPIMiddleware(next http.Handler) http.Handler {
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE, PUT")
 		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, x-claude-code-request-class, x-claude-code-agent-type, x-claude-code-agent-id, x-claude-code-prompt-id, x-session-id, x-claude-code-session-id")
-		h.Set("Access-Control-Expose-Headers", "anthropic-version, request-id, anthropic-ratelimit-unified-5h-status, anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, anthropic-ratelimit-unified-7d-status, anthropic-ratelimit-unified-7d-utilization, anthropic-ratelimit-unified-7d-reset, anthropic-ratelimit-unified-status, anthropic-ratelimit-unified-representative-claim, anthropic-ratelimit-unified-reset")
+		h.Set("Access-Control-Expose-Headers", "anthropic-version, request-id, retry-after, anthropic-ratelimit-requests-limit, anthropic-ratelimit-requests-remaining, anthropic-ratelimit-requests-reset, anthropic-ratelimit-tokens-limit, anthropic-ratelimit-tokens-remaining, anthropic-ratelimit-tokens-reset, anthropic-ratelimit-unified-5h-status, anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, anthropic-ratelimit-unified-7d-status, anthropic-ratelimit-unified-7d-utilization, anthropic-ratelimit-unified-7d-reset, anthropic-ratelimit-unified-status, anthropic-ratelimit-unified-representative-claim, anthropic-ratelimit-unified-reset")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -170,9 +170,61 @@ func anthropicErrorTypeForStatus(status int) string {
 		return "permission_error"
 	case http.StatusNotFound:
 		return "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
 	default:
 		return "api_error"
 	}
+}
+
+// stripThoughtFieldsForPublicAPI removes {"thought":true,...} parts'
+// thought/thoughtSignature keys before a request goes to the public Gemini
+// Developer API, which documents "thought" as output-only on input contents
+// and 400s with "Field 'thought' is not supported for input contents" if a
+// replayed conversation still carries it (translator.go always emits it
+// regardless of which upstream the request will hit).
+func stripThoughtFieldsForPublicAPI(geminiBody []byte) []byte {
+	if !gjson.GetBytes(geminiBody, "contents").Exists() {
+		return geminiBody
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(geminiBody, &root); err != nil {
+		return geminiBody
+	}
+	contents, ok := root["contents"].([]interface{})
+	if !ok {
+		return geminiBody
+	}
+	changed := false
+	for _, c := range contents {
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		parts, ok := cm["parts"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, p := range parts {
+			pm, ok := p.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, hasThought := pm["thought"]; hasThought {
+				delete(pm, "thought")
+				delete(pm, "thoughtSignature")
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return geminiBody
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return geminiBody
+	}
+	return out
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
@@ -490,7 +542,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			accLabel = activeAcc.Email
 		}
 		LogGateway("[#%d] >> INTERCEPT Claude Code Direct WebSearch: query=%q account=%s", rid, searchQuery, accLabel)
-		handleClaudeCodeDirectWebSearch(rid, t0, clientKey, accLabel, tenant, googleToken, isAntigravity, activeAcc, bodyBytes, searchQuery, w)
+		handleClaudeCodeDirectWebSearch(r.Context(), rid, t0, clientKey, accLabel, tenant, googleToken, isAntigravity, activeAcc, bodyBytes, searchQuery, w)
 		return
 	}
 
@@ -653,7 +705,13 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		//    it's an estimate; if it still undershoots, bump the
 		//    deterministic session id instead of losing history or burning
 		//    an account-rotation slot on it.
-		const maxSessionBumps = 2
+		// Each bump just retries the same account with a fresh session
+		// bucket -- it costs a lost prefix cache on that one retry, not an
+		// account-rotation slot, so there is little downside to allowing
+		// more of them. 2 ran out within 1-2 hours of a long, subagent-
+		// heavy session hitting the wall repeatedly, forcing the request
+		// to fall through to full account rotation instead.
+		const maxSessionBumps = 8
 		const maxLocationGatePasses = 2 // full passes over antigravityHosts
 		hostIdx := 0
 		locationGatePasses := 0
@@ -677,9 +735,28 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 
 			var finalPayload []byte
 			if isAntigravity {
-				finalPayload = WrapAntigravityPayload(modelName, geminiBody, projectID, bump, sessionID)
+				// Google's Antigravity session cache is shared and capped
+				// (~1,048,576 tokens) per sessionId. sessionID alone is the
+				// terminal-wide x-claude-code-session-id, identical across
+				// every parallel subagent spawned from the same orchestrator
+				// turn — without qualifying by instanceID, N concurrent
+				// subagents' contexts all land in the same server-side
+				// session bucket and collectively blow the wall even though
+				// each one individually fits comfortably.
+				antigravitySessionKey := sessionID
+				if instanceID != "" {
+					antigravitySessionKey = sessionID + ":" + instanceID
+				}
+				finalPayload = WrapAntigravityPayload(modelName, geminiBody, projectID, bump, antigravitySessionKey)
 			} else {
-				finalPayload = geminiBody
+				// The public Gemini Developer API documents "thought" as
+				// output-only; translator.go always emits replayed
+				// extended-thinking history as {"thought":true,...} parts
+				// regardless of which upstream will see them, so a history
+				// containing any thinking block 400s here with "Field
+				// 'thought' is not supported for input contents" unless
+				// stripped first.
+				finalPayload = stripThoughtFieldsForPublicAPI(geminiBody)
 			}
 
 			LogGateway("[#%d] >> POST /v1/messages [attempt %d/%d, session-gen %d] key=%s account=%s model=%s thinkBudget=%d stream=%v bytes=%d [%s]",
@@ -688,7 +765,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			if isStreaming {
 				success, lastStatus, lastErr = executeStreamingWithWatchdog(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes, syntheticReasonTools)
 			} else {
-				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes, syntheticReasonTools)
+				success, lastStatus, lastErr = executeNonStreaming(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes, syntheticReasonTools)
 			}
 
 			if success || !isAntigravity {
@@ -907,7 +984,7 @@ func executeStreamingWithWatchdog(
 		LogGateway("[#%d] .. upstream TTFT >= %ds -> panicking: early SSE headers + keepalive ping", rid, serverCfg.PanicTimeoutSeconds)
 		wMu.Lock()
 		applyRateLimitHeaders(w.Header(), activeAcc, modelName)
-		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusOK)
@@ -1031,7 +1108,7 @@ UpstreamReady:
 	wMu.Lock()
 	if !earlyHeadersSent {
 		applyRateLimitHeaders(w.Header(), activeAcc, modelName)
-		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusOK)
@@ -1121,6 +1198,7 @@ UpstreamReady:
 }
 
 func executeNonStreaming(
+	baseCtx context.Context,
 	rid uint64,
 	t0 time.Time,
 	activeAcc *AccountRecord,
@@ -1147,7 +1225,7 @@ func executeNonStreaming(
 	// Unlike the streaming path (which has the panic/TTFT watchdog), this had
 	// no deadline at all — a hung upstream could block the request forever.
 	timeout := time.Duration(serverCfg.TTFTTimeoutSeconds+serverCfg.ReadTimeoutSeconds) * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(baseCtx, timeout)
 	defer cancel()
 
 	upReq, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(geminiBody))
@@ -1235,9 +1313,10 @@ func executeNonStreaming(
 		"type":        "message",
 		"role":        "assistant",
 		"model":       modelName,
-		"content":     []map[string]interface{}{},
-		"usage":       usageMap,
-		"stop_reason": stopReason,
+		"content":       []map[string]interface{}{},
+		"usage":         usageMap,
+		"stop_reason":   stopReason,
+		"stop_sequence": nil,
 	}
 
 	var toolsCalled []string
@@ -1269,6 +1348,7 @@ func executeNonStreaming(
 					if argsRaw == "" {
 						argsRaw = "{}"
 					}
+					argsRaw = coerceNumericEnumArgs(fname, argsRaw)
 					if repairedArgs, ok := RepairEditToolCall(fname, argsRaw, sessionID); ok {
 						argsRaw = repairedArgs
 					}
@@ -1447,6 +1527,10 @@ var knownModels = []map[string]interface{}{
 	{"id": "claude-3-7-sonnet-latest", "type": "model", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z"},
 	{"id": "claude-3-opus-20240229", "type": "model", "display_name": "Claude 3 Opus", "created_at": "2024-02-29T00:00:00Z"},
 	{"id": "claude-opus-4-6-thinking", "type": "model", "display_name": "Claude Opus 4.6 Thinking", "created_at": "2026-01-01T00:00:00Z"},
+	{"id": "claude-opus-5-5", "type": "model", "display_name": "Claude Opus 5.5", "created_at": "2026-01-01T00:00:00Z"},
+	{"id": "claude-sonnet-5-5", "type": "model", "display_name": "Claude Sonnet 5.5", "created_at": "2026-01-01T00:00:00Z"},
+	{"id": "claude-haiku-5-5", "type": "model", "display_name": "Claude Haiku 5.5", "created_at": "2026-01-01T00:00:00Z"},
+	{"id": "claude-fable-5-1", "type": "model", "display_name": "Claude Fable 5.1", "created_at": "2026-01-01T00:00:00Z"},
 }
 
 // allModels merges the static Claude-alias/canonical-Gemini-name list with
@@ -1485,8 +1569,10 @@ func handleModels(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request)
 		// always false, but the fields themselves are still expected by
 		// the official SDKs' pagination handling.
 		"has_more": false,
-		"first_id": models[0]["id"],
-		"last_id":  models[len(models)-1]["id"],
+	}
+	if len(models) > 0 {
+		resp["first_id"] = models[0]["id"]
+		resp["last_id"] = models[len(models)-1]["id"]
 	}
 	b, _ := json.Marshal(resp)
 	w.Header().Set("Content-Type", "application/json")
@@ -1797,10 +1883,10 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 		const reqLimit, tokLimit = 1000, 1000000
 		header.Set("anthropic-ratelimit-requests-limit", fmt.Sprintf("%d", reqLimit))
 		header.Set("anthropic-ratelimit-requests-remaining", fmt.Sprintf("%d", int(float64(reqLimit)*(1-fiveHourFrac))))
-		header.Set("anthropic-ratelimit-requests-reset", fmt.Sprintf("%d", fiveHourReset))
+		header.Set("anthropic-ratelimit-requests-reset", time.Unix(fiveHourReset, 0).UTC().Format(time.RFC3339))
 		header.Set("anthropic-ratelimit-tokens-limit", fmt.Sprintf("%d", tokLimit))
 		header.Set("anthropic-ratelimit-tokens-remaining", fmt.Sprintf("%d", int(float64(tokLimit)*(1-fiveHourFrac))))
-		header.Set("anthropic-ratelimit-tokens-reset", fmt.Sprintf("%d", fiveHourReset))
+		header.Set("anthropic-ratelimit-tokens-reset", time.Unix(fiveHourReset, 0).UTC().Format(time.RFC3339))
 	}
 
 	// A real account's every response (bootstrap, oauth/usage, /v1/messages)

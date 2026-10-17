@@ -611,11 +611,54 @@ func (am *AccountManager) RefreshAllQuotas() {
 	wg.Wait()
 }
 
+// snapshot copies the fields callers outside auth_manager.go actually read
+// (email/tokens/quotas/status), so holders of the returned pointer never
+// race against FetchQuota/RefreshAccessToken writing the live *AccountRecord
+// under am.mu.Lock() from a different goroutine — selector.go's
+// hasRemainingQuota/getEffectiveQuotaFraction and server.go's
+// isNative3PModelExhausted/pickFiveHourAndWeekly used to walk acc.Quotas on
+// the live pointer with no lock at all. Deliberately skips refreshMu: it's
+// a sync.Mutex, and copying a struct containing one is a go vet copylocks
+// violation — field-by-field construction here never touches it, and a
+// snapshot is never locked/unlocked anyway.
+func (acc *AccountRecord) snapshot() *AccountRecord {
+	if acc == nil {
+		return nil
+	}
+	snap := &AccountRecord{
+		Email:           acc.Email,
+		ProjectID:       acc.ProjectID,
+		ProjectIDProbed: acc.ProjectIDProbed,
+		RefreshToken:    acc.RefreshToken,
+		AccessToken:     acc.AccessToken,
+		ExpiresAt:       acc.ExpiresAt,
+		Disabled:        acc.Disabled,
+		FilePath:        acc.FilePath,
+		CooldownUntil:   acc.CooldownUntil,
+		LastChecked:     acc.LastChecked,
+		LastError:       acc.LastError,
+	}
+	if len(acc.Quotas) > 0 {
+		snap.Quotas = make([]QuotaGroup, len(acc.Quotas))
+		for i, g := range acc.Quotas {
+			snap.Quotas[i] = g
+			if len(g.Buckets) > 0 {
+				snap.Quotas[i].Buckets = make([]QuotaBucket, len(g.Buckets))
+				copy(snap.Quotas[i].Buckets, g.Buckets)
+			}
+		}
+	}
+	return snap
+}
+
 func (am *AccountManager) GetAccount(email string) (*AccountRecord, bool) {
 	am.mu.RLock()
 	defer am.mu.RUnlock()
 	acc, ok := am.accounts[email]
-	return acc, ok
+	if !ok {
+		return nil, false
+	}
+	return acc.snapshot(), true
 }
 
 func (am *AccountManager) GetAccounts() []*AccountRecord {
@@ -623,7 +666,7 @@ func (am *AccountManager) GetAccounts() []*AccountRecord {
 	defer am.mu.RUnlock()
 	var res []*AccountRecord
 	for _, acc := range am.accounts {
-		res = append(res, acc)
+		res = append(res, acc.snapshot())
 	}
 	sort.Slice(res, func(i, j int) bool {
 		return res[i].Email < res[j].Email
