@@ -62,17 +62,22 @@ func blockTokenEstimate(bMap map[string]interface{}) int {
 	case "image":
 		return 1600
 	case "document":
-		// Unlike an image (flat ~258-1600 tokens from Gemini regardless of
-		// file size), a PDF's real cost scales with its page count — a
-		// flat 2500 badly undercounts a large multi-page PDF (Gemini bills
-		// roughly 258 tokens/page, so a 50-page PDF is already ~13,000
-		// real tokens), which is exactly backwards for a function whose
-		// whole job is to never undercount. Base64 byte length correlates
-		// with page count far better than a constant does; scale with the
-		// same pessimistic flat-rate estimate used elsewhere here, with
-		// 2500 as a floor for a small single-page attachment.
-		if est := flatTokenEstimate(bMap); est > 2500 {
-			return est
+		// If it's a base64 PDF, scale with realistic PDF token density (~258 tokens/page,
+		// ~1 token per 500 base64 chars) with a floor of 2500 tokens.
+		// Using flatTokenEstimate (len/2) treats base64 text as raw ASCII tokens, pricing a 2MB
+		// PDF at 1.33M tokens and instantly destroying conversation history.
+		if src, ok := bMap["source"].(map[string]interface{}); ok {
+			if dataStr, isStr := src["data"].(string); isStr {
+				if src["type"] == "base64" {
+					est := len(dataStr) / 500
+					if est < 2500 {
+						return 2500
+					}
+					return est
+				}
+				// Plain text document
+				return flatTokenEstimate(dataStr)
+			}
 		}
 		return 2500
 	case "tool_result":

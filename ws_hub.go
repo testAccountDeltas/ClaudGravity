@@ -53,6 +53,9 @@ func (h *WSHub) run() {
 	for {
 		select {
 		case client := <-h.register:
+			if client.IsClosed() {
+				continue
+			}
 			h.mu.Lock()
 			h.clients[client] = true
 			h.mu.Unlock()
@@ -116,6 +119,12 @@ func (c *WSClient) Close() {
 		close(c.send)
 		_ = c.ws.Close()
 	}
+}
+
+func (c *WSClient) IsClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 // SafeSend queues payload on the client's send channel, holding the same

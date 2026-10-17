@@ -78,7 +78,11 @@ func sweepStaleSessionBumps() {
 func getSessionBump(sessionID string) int {
 	sessionBumpMu.Lock()
 	defer sessionBumpMu.Unlock()
-	return sessionBumpMap[sessionID]
+	if bump, ok := sessionBumpMap[sessionID]; ok {
+		sessionBumpSeen[sessionID] = time.Now()
+		return bump
+	}
+	return 0
 }
 
 func setSessionBump(sessionID string, bump int) {
@@ -367,6 +371,38 @@ func main() {
 		handleEmbeddings(cfgMgr, w, r)
 	})
 
+	// Claude Code CLI internal control endpoints: when ANTHROPIC_BASE_URL is set,
+	// the CLI queries these paths. If unhandled on mux, they fall through to "/"
+	// (dashboard HTML), breaking profile validation, metrics, and remote settings.
+	handleProfileJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"account":{"uuid":"0bad747f-0000-4000-a000-000000000000","email_address":"user@claudgravity.local"},"organization":{"uuid":"0bad747f-0000-4000-a000-000000000000","name":"ClaudGravity Workspace"}}`))
+	}
+	handleValidateJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"valid":true}`))
+	}
+	handleMetricsJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"metrics_logging_enabled":false}`))
+	}
+	handleSettingsJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"uuid":"0bad747f-0000-4000-a000-000000000000","checksum":"none","settings":{}}`))
+	}
+	handleTelemetryJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}
+
+	mux.HandleFunc("/api/claude_cli_profile", handleProfileJSON)
+	mux.HandleFunc("/api/oauth/profile", handleProfileJSON)
+	mux.HandleFunc("/api/oauth/validate", handleValidateJSON)
+	mux.HandleFunc("/api/claude_code/organizations/metrics_enabled", handleMetricsJSON)
+	mux.HandleFunc("/api/claude_code/settings", handleSettingsJSON)
+	mux.HandleFunc("/managed/settings", handleSettingsJSON)
+	mux.HandleFunc("/api/event_logging/", handleTelemetryJSON)
+
 	// Separate mux for TLS-intercepted anthropic.com/claude.ai traffic (see
 	// HandleConnectTunnel). This must NOT be the same mux as above: that one
 	// has "/" bound to the web dashboard, which would otherwise swallow and
@@ -520,7 +556,11 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	clientKey := r.Header.Get("x-api-key")
 	if clientKey == "" {
 		authHeader := r.Header.Get("Authorization")
-		clientKey = strings.TrimPrefix(authHeader, "Bearer ")
+		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+			clientKey = strings.TrimSpace(authHeader[7:])
+		} else {
+			clientKey = authHeader
+		}
 	}
 	tenant, ok := cfgMgr.GetTenant(clientKey)
 	if !ok {
@@ -577,6 +617,19 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		}
 		LogGateway("[#%d] >> INTERCEPT Claude Code Direct WebSearch: query=%q account=%s", rid, searchQuery, accLabel)
 		handleClaudeCodeDirectWebSearch(r.Context(), rid, t0, clientKey, accLabel, tenant, googleToken, isAntigravity, activeAcc, bodyBytes, searchQuery, w)
+		return
+	}
+
+	// 2.2 Fast-Path Intercept: Claude Code 1-token rate-limit probe
+	msgsArr := gjson.GetBytes(bodyBytes, "messages").Array()
+	if len(msgsArr) == 1 &&
+		gjson.GetBytes(bodyBytes, "messages.0.content").String() == "quota" &&
+		gjson.GetBytes(bodyBytes, "max_tokens").Int() == 1 {
+		acc := globalSelector.GetOrAssignStickyAccount(clientKey, tenant)
+		applyRateLimitHeaders(w.Header(), acc, "gemini-3.8-flash-tiered")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"msg_probe","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"max_tokens","usage":{"input_tokens":1,"output_tokens":1}}`))
 		return
 	}
 
@@ -945,6 +998,19 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	}
 }
 
+func hasAssistantTurns(claudeBody []byte) bool {
+	msgs := gjson.GetBytes(claudeBody, "messages")
+	if !msgs.IsArray() {
+		return false
+	}
+	for _, m := range msgs.Array() {
+		if m.Get("role").String() == "assistant" {
+			return true
+		}
+	}
+	return false
+}
+
 func executeStreamingWithWatchdog(
 	baseCtx context.Context,
 	rid uint64,
@@ -1259,7 +1325,8 @@ UpstreamReady:
 	if respModel == "" {
 		respModel = modelName
 	}
-	streamer := NewSSEStreamer(w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools)
+	hasPrior := hasAssistantTurns(claudeBodyBytes)
+	streamer := NewSSEStreamer(w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior)
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	if err != nil {
@@ -1291,7 +1358,7 @@ UpstreamReady:
 		madeProgress = streamer.textChars > 200
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
-	readWindowSize, _ := readLoopLimits(agentKey)
+	readWindowSize, _ := readLoopLimits(agentKey, true)
 	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress, readWindowSize)
 
 	hasIgnoreTag := strings.Contains(streamer.lastText, OscIgnoreTag)
@@ -1303,8 +1370,16 @@ UpstreamReady:
 	}
 
 	errStr := ""
+	reportedStatus := http.StatusOK
 	if err != nil {
 		errStr = err.Error()
+		if strings.Contains(errStr, "RESOURCE_EXHAUSTED") || strings.Contains(errStr, "rate_limit_error") {
+			reportedStatus = http.StatusTooManyRequests
+		} else if strings.Contains(errStr, "UNAVAILABLE") || strings.Contains(errStr, "overloaded_error") {
+			reportedStatus = http.StatusServiceUnavailable
+		} else {
+			reportedStatus = http.StatusInternalServerError
+		}
 	}
 
 	globalLogStore.Add(RequestLog{
@@ -1328,13 +1403,13 @@ UpstreamReady:
 		WasPanicked:     earlyHeadersSent,
 		Shrunk:          wasShrunk,
 		Error:           errStr,
-		Status:          http.StatusOK,
+		Status:          reportedStatus,
 	})
 
-	LogGateway("[#%d] << SSE done (%.1fs [ttft=%.1fs], in_tok=%d, out_tok=%d, cache_read=%d, tools=%v, err=%v)",
-		rid, totalDur.Seconds(), ttft.Seconds(), streamer.inputTokens, streamer.outputTokens, streamer.cacheTokens, streamer.toolNames, err)
+	LogGateway("[#%d] << SSE done (%.1fs [ttft=%.1fs], in_tok=%d, out_tok=%d, cache_read=%d, tools=%v, status=%d, err=%v)",
+		rid, totalDur.Seconds(), ttft.Seconds(), streamer.inputTokens, streamer.outputTokens, streamer.cacheTokens, streamer.toolNames, reportedStatus, err)
 
-	return true, http.StatusOK, nil
+	return true, reportedStatus, err
 }
 
 func executeNonStreaming(
@@ -1451,8 +1526,18 @@ func executeNonStreaming(
 	// ceiling looked identical to one that finished normally, so the client
 	// had no signal to know its answer was truncated.
 	stopReason := "end_turn"
-	if geminiJSON.Get("candidates.0.finishReason").String() == "MAX_TOKENS" {
+	var stopDetails map[string]interface{}
+	finishReason := geminiJSON.Get("candidates.0.finishReason").String()
+	if finishReason == "MAX_TOKENS" {
 		stopReason = "max_tokens"
+	} else if finishReason == "SAFETY" || finishReason == "RECITATION" || finishReason == "BLOCKLIST" ||
+		finishReason == "PROHIBITED_CONTENT" || finishReason == "SPII" {
+		stopReason = "refusal"
+		stopDetails = map[string]interface{}{
+			"type":        "refusal",
+			"category":    "general_harms",
+			"explanation": "Content blocked by safety policy",
+		}
 	}
 
 	// Same reasoning as the streaming path's respModel (executeStreamingWithWatchdog):
@@ -1472,50 +1557,68 @@ func executeNonStreaming(
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
 	}
+	if stopDetails != nil {
+		claudeResp["stop_details"] = stopDetails
+	}
 
 	var toolsCalled []string
 	var toolCallIDs []string
 	var toolCallSignatures []string
 	var textChars int
 	var lastText string
+	var lastTurnThoughtSig string
 	cand := geminiJSON.Get("candidates.0")
 	if cand.Exists() {
 		parts := cand.Get("content.parts")
 		if parts.IsArray() {
 			for _, p := range parts.Array() {
+				partSig := p.Get("thoughtSignature").String()
+				if partSig != "" {
+					lastTurnThoughtSig = partSig
+				}
 				if p.Get("thought").Bool() {
-					if t := p.Get("text").String(); t != "" {
-						sig := p.Get("thoughtSignature").String()
-						contentBlocks := claudeResp["content"].([]map[string]interface{})
-						// Anthropic allows at most ONE thinking block per
-						// message, and it must come first — but Gemini can
-						// split one thinking chain across several adjacent
-						// "thought" parts in the same candidate. sse.go's
-						// streaming path already coalesces these (it only
-						// opens a new content_block when the type changes);
-						// this path used to create a brand new block per
-						// part instead, producing multiple thinking blocks
-						// that fail Pydantic/Zod schema validation outright.
-						if n := len(contentBlocks); n > 0 && contentBlocks[n-1]["type"] == "thinking" {
-							last := contentBlocks[n-1]
-							last["thinking"] = last["thinking"].(string) + t
-							if sig != "" {
-								last["signature"] = sig
-							}
-						} else {
-							block := map[string]interface{}{
-								"type":     "thinking",
-								"thinking": t,
-							}
-							// Same reasoning as sse.go's closeCurrentBlock: a
-							// missing "signature" fails Pydantic/Zod schema
-							// validation outright, not just a wrong one.
-							if sig == "" {
-								sig = "skip_thought_signature_validator"
-							}
-							block["signature"] = sig
-							claudeResp["content"] = append(contentBlocks, block)
+					t := p.Get("text").String()
+					sig := partSig
+					if sig == "" {
+						sig = lastTurnThoughtSig
+					}
+					contentBlocks := claudeResp["content"].([]map[string]interface{})
+					// Anthropic allows at most ONE thinking block per
+					// message, and it must come first — but Gemini can
+					// split one thinking chain across several adjacent
+					// "thought" parts in the same candidate. sse.go's
+					// streaming path already coalesces these (it only
+					// opens a new content_block when the type changes);
+					// this path used to create a brand new block per
+					// part instead, producing multiple thinking blocks
+					// that fail Pydantic/Zod schema validation outright.
+					// Anthropic strictly mandates at most ONE thinking block per message,
+					// and it MUST be the very first block. If a thinking block already exists,
+					// concatenate to it. If it doesn't exist yet, insert it at index 0.
+					var existingThinking map[string]interface{}
+					for _, b := range contentBlocks {
+						if b["type"] == "thinking" {
+							existingThinking = b
+							break
 						}
+					}
+					if existingThinking != nil {
+						if t != "" {
+							existingThinking["thinking"] = existingThinking["thinking"].(string) + t
+						}
+						if sig != "" && (existingThinking["signature"] == "" || existingThinking["signature"] == "skip_thought_signature_validator") {
+							existingThinking["signature"] = sig
+						}
+					} else if t != "" || sig != "" {
+						if sig == "" {
+							sig = "skip_thought_signature_validator"
+						}
+						block := map[string]interface{}{
+							"type":      "thinking",
+							"thinking":  t,
+							"signature": sig,
+						}
+						claudeResp["content"] = append([]map[string]interface{}{block}, contentBlocks...)
 					}
 				} else if t := p.Get("text").String(); t != "" {
 					claudeResp["content"] = append(claudeResp["content"].([]map[string]interface{}), map[string]interface{}{
@@ -1567,7 +1670,11 @@ func executeNonStreaming(
 					toolCallSignatures = append(toolCallSignatures, fmt.Sprintf("%s:%s", fname, argsRaw))
 					callID := nextToolCallID(fname)
 					toolCallIDs = append(toolCallIDs, callID)
-					setToolSignature(callID, p.Get("thoughtSignature").String())
+					callSig := partSig
+					if callSig == "" {
+						callSig = lastTurnThoughtSig
+					}
+					setToolSignature(callID, callSig)
 					claudeResp["content"] = append(claudeResp["content"].([]map[string]interface{}), map[string]interface{}{
 						"type":  "tool_use",
 						"id":    callID,
@@ -1653,7 +1760,7 @@ func executeNonStreaming(
 		madeProgress = textChars > 200
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
-	readWindowSize, _ := readLoopLimits(agentKey)
+	readWindowSize, _ := readLoopLimits(agentKey, true)
 	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress, readWindowSize)
 	hasIgnoreTag := strings.Contains(lastText, OscIgnoreTag)
 	globalLoopGuard.RecordToolCalls(loopKey, toolCallSignatures, hasIgnoreTag)
@@ -1736,22 +1843,22 @@ func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Req
 // schema (Pydantic/Zod) and raise a deserialization error on the OpenAI-style
 // "object" field this used to send instead.
 var knownModels = []map[string]interface{}{
-	{"id": "gemini-2.5-flash", "type": "model", "display_name": "Gemini 2.5 Flash", "created_at": "2025-01-01T00:00:00Z"},
-	{"id": "gemini-2.5-pro", "type": "model", "display_name": "Gemini 2.5 Pro", "created_at": "2025-01-01T00:00:00Z"},
-	{"id": "gemini-3.8-flash-tiered", "type": "model", "display_name": "Gemini 3.8 Flash Tiered", "created_at": "2026-01-01T00:00:00Z"},
-	{"id": "claude-3-5-haiku-20241022", "type": "model", "display_name": "Claude 3.5 Haiku", "created_at": "2024-10-22T00:00:00Z"},
-	{"id": "claude-3-5-haiku-latest", "type": "model", "display_name": "Claude 3.5 Haiku", "created_at": "2024-10-22T00:00:00Z"},
-	{"id": "claude-3-5-sonnet-20241022", "type": "model", "display_name": "Claude 3.5 Sonnet", "created_at": "2024-10-22T00:00:00Z"},
-	{"id": "claude-3-5-sonnet-latest", "type": "model", "display_name": "Claude 3.5 Sonnet", "created_at": "2024-10-22T00:00:00Z"},
-	{"id": "claude-3-7-sonnet-20250219", "type": "model", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z"},
-	{"id": "claude-3-7-sonnet-latest", "type": "model", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z"},
-	{"id": "claude-3-opus-20240229", "type": "model", "display_name": "Claude 3 Opus", "created_at": "2024-02-29T00:00:00Z"},
-	{"id": "claude-opus-4-6-thinking", "type": "model", "display_name": "Claude Opus 4.6 Thinking", "created_at": "2026-01-01T00:00:00Z"},
-	{"id": "claude-sonnet-4-6", "type": "model", "display_name": "Claude Sonnet 4.6", "created_at": "2026-01-01T00:00:00Z"},
-	{"id": "claude-opus-5-5", "type": "model", "display_name": "Claude Opus 5.5", "created_at": "2026-01-01T00:00:00Z"},
-	{"id": "claude-sonnet-5-5", "type": "model", "display_name": "Claude Sonnet 5.5", "created_at": "2026-01-01T00:00:00Z"},
-	{"id": "claude-haiku-5-5", "type": "model", "display_name": "Claude Haiku 5.5", "created_at": "2026-01-01T00:00:00Z"},
-	{"id": "claude-fable-5-1", "type": "model", "display_name": "Claude Fable 5.1", "created_at": "2026-01-01T00:00:00Z"},
+	{"id": "gemini-2.5-flash", "type": "model", "display_name": "Gemini 2.5 Flash", "created_at": "2025-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "gemini-2.5-pro", "type": "model", "display_name": "Gemini 2.5 Pro", "created_at": "2025-01-01T00:00:00Z", "max_input_tokens": 2097152, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "gemini-3.8-flash-tiered", "type": "model", "display_name": "Gemini 3.8 Flash Tiered", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-3-5-haiku-20241022", "type": "model", "display_name": "Claude 3.5 Haiku", "created_at": "2024-10-22T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 8192, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
+	{"id": "claude-3-5-haiku-latest", "type": "model", "display_name": "Claude 3.5 Haiku", "created_at": "2024-10-22T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 8192, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
+	{"id": "claude-3-5-sonnet-20241022", "type": "model", "display_name": "Claude 3.5 Sonnet", "created_at": "2024-10-22T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 8192, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
+	{"id": "claude-3-5-sonnet-latest", "type": "model", "display_name": "Claude 3.5 Sonnet", "created_at": "2024-10-22T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 8192, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
+	{"id": "claude-3-7-sonnet-20250219", "type": "model", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-3-7-sonnet-latest", "type": "model", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-3-opus-20240229", "type": "model", "display_name": "Claude 3 Opus", "created_at": "2024-02-29T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 4096, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
+	{"id": "claude-opus-4-6-thinking", "type": "model", "display_name": "Claude Opus 4.6 Thinking", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-sonnet-4-6", "type": "model", "display_name": "Claude Sonnet 4.6", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-opus-5-5", "type": "model", "display_name": "Claude Opus 5.5", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 128000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-sonnet-5-5", "type": "model", "display_name": "Claude Sonnet 5.5", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 128000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-haiku-5-5", "type": "model", "display_name": "Claude Haiku 5.5", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-fable-5-1", "type": "model", "display_name": "Claude Fable 5.1", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 128000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 }
 
 // allModels merges the static Claude-alias/canonical-Gemini-name list with
@@ -2143,7 +2250,11 @@ func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) 
 	clientKey := r.Header.Get("x-api-key")
 	if clientKey == "" {
 		authHeader := r.Header.Get("Authorization")
-		clientKey = strings.TrimPrefix(authHeader, "Bearer ")
+		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+			clientKey = strings.TrimSpace(authHeader[7:])
+		} else {
+			clientKey = authHeader
+		}
 	}
 	tenant, _ := cfgMgr.GetTenant(clientKey)
 
@@ -2330,7 +2441,11 @@ func handleOAuthUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Requ
 	clientKey := r.Header.Get("x-api-key")
 	if clientKey == "" {
 		authHeader := r.Header.Get("Authorization")
-		clientKey = strings.TrimPrefix(authHeader, "Bearer ")
+		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+			clientKey = strings.TrimSpace(authHeader[7:])
+		} else {
+			clientKey = authHeader
+		}
 	}
 	tenant, _ := cfgMgr.GetTenant(clientKey)
 
@@ -2453,6 +2568,34 @@ func handleOAuthUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Requ
 			"scope":     nil,
 			"is_active": !fiveHourIsBinding,
 		})
+		// Provide model-scoped weekly limits so Claude Code can render
+		// individual progress bars for Opus and Sonnet tiers in /usage
+		limits = append(limits, map[string]interface{}{
+			"kind":      "weekly_scoped",
+			"group":     "weekly",
+			"percent":   weeklyWindow["utilization"],
+			"severity":  severityFor(weeklyFrac),
+			"resets_at": weeklyWindow["resets_at"],
+			"scope": map[string]interface{}{
+				"model": map[string]interface{}{
+					"display_name": "Opus",
+				},
+			},
+			"is_active": false,
+		})
+		limits = append(limits, map[string]interface{}{
+			"kind":      "weekly_scoped",
+			"group":     "weekly",
+			"percent":   weeklyWindow["utilization"],
+			"severity":  severityFor(weeklyFrac),
+			"resets_at": weeklyWindow["resets_at"],
+			"scope": map[string]interface{}{
+				"model": map[string]interface{}{
+					"display_name": "Sonnet",
+				},
+			},
+			"is_active": false,
+		})
 	}
 
 	resp := map[string]interface{}{
@@ -2463,10 +2606,10 @@ func handleOAuthUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Requ
 		"seven_day_sonnet":     nil,
 		"extra_usage": map[string]interface{}{
 			"is_enabled":           false,
-			"monthly_limit":        nil,
-			"used_credits":         nil,
-			"utilization":          nil,
-			"currency":             nil,
+			"monthly_limit":        0,
+			"used_credits":         0,
+			"utilization":          0,
+			"currency":             "USD",
 			"decimal_places":       nil,
 			"disabled_reason":      nil,
 			"user_disabled":        false,
@@ -2493,6 +2636,7 @@ func handleOAuthUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Requ
 
 	b, _ := json.Marshal(resp)
 	LogGateway("[QuotaDebug] oauth/usage RESPONSE body: %s", string(b))
+	applyRateLimitHeaders(w.Header(), acc, "gemini-3.8-flash-tiered")
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(b)

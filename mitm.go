@@ -217,31 +217,27 @@ func isAnthropicHost(host string) bool {
 	return false
 }
 
-// isBlockedConnectTarget reports whether host resolves to a private,
-// link-local, loopback, or cloud-metadata address — this gateway only ever
-// legitimately proxies to public internet hosts, so a CONNECT tunnel to
-// anything in these ranges has no real use case and is refused outright
-// rather than handed to net.DialTimeout.
-func isBlockedConnectTarget(host string) bool {
+// checkConnectTarget reports whether host resolves to a public, safe address.
+// It returns the first verified safe IP, or an error if the target is private,
+// loopback, link-local, unresolvable, or cloud metadata.
+func checkConnectTarget(host string) (net.IP, error) {
 	ips := []net.IP{net.ParseIP(host)}
 	if ips[0] == nil {
 		resolved, err := net.LookupIP(host)
 		if err != nil {
-			// Can't resolve it at all — DialTimeout will fail the exact
-			// same way a moment later; nothing to block here.
-			return false
+			return nil, err
 		}
 		ips = resolved
 	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no addresses found for %s", host)
+	}
 	for _, ip := range ips {
-		if ip == nil {
-			continue
-		}
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-			return true
+		if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return nil, fmt.Errorf("blocked target address: %s", ip)
 		}
 	}
-	return false
+	return ips[0], nil
 }
 
 // HandleConnectTunnel implements native HTTP CONNECT proxying and TLS interception.
@@ -256,8 +252,10 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 	}
 
 	host := r.Host
-	if h, _, err := net.SplitHostPort(r.Host); err == nil {
+	port := "443"
+	if h, p, err := net.SplitHostPort(r.Host); err == nil {
 		host = h
+		port = p
 	}
 
 	// This gateway's whole job is proxying to public hosts
@@ -267,10 +265,15 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 	// secret can't use this as an SSRF pivot into the host's own internal
 	// network or cloud metadata endpoint (169.254.169.254). Checked before
 	// Hijack() so a normal HTTP error response still works here.
-	if !isAnthropicHost(host) && isBlockedConnectTarget(host) {
-		LogGateway("[SuperRelay Gateway] Refused CONNECT to private/internal address: %s", host)
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
+	var verifiedIP net.IP
+	if !isAnthropicHost(host) {
+		ip, err := checkConnectTarget(host)
+		if err != nil {
+			LogGateway("[SuperRelay Gateway] Refused CONNECT to target %s: %v", host, err)
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		verifiedIP = ip
 	}
 
 	hijacker, ok := w.(http.Hijacker)
@@ -317,9 +320,13 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 		return
 	}
 
-	// 3. Transparent TCP tunnel for all other external hosts (private/
-	// internal targets already refused above, before Hijack()).
-	targetConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	// 3. Transparent TCP tunnel for all other external hosts. Dial the pre-verified IP
+	// to prevent TOCTOU DNS rebinding SSRF attacks.
+	dialAddr := r.Host
+	if verifiedIP != nil {
+		dialAddr = net.JoinHostPort(verifiedIP.String(), port)
+	}
+	targetConn, err := net.DialTimeout("tcp", dialAddr, 10*time.Second)
 	if err != nil {
 		clientConn.Close()
 		return
@@ -437,7 +444,8 @@ func serveInterceptedTLS(tlsConn *tls.Conn, handler http.Handler) {
 		// client is done with this tunnel either way, so stop the upstream
 		// call.
 		buf := make([]byte, 1)
-		if _, err := tlsConn.Read(buf); err != nil {
+		n, err := tlsConn.Read(buf)
+		if err != nil || n == 0 {
 			cancel()
 		}
 	}()
@@ -538,7 +546,7 @@ func HandleBootstrapSpoof(w http.ResponseWriter, r *http.Request) {
 			"override_user_selection": false,
 		},
 		"oauth_account": map[string]interface{}{
-			"account_uuid":                 "0bad747f-0000-4000-a000-000000000000",
+			"account_uuid":                 nil,
 			"account_email":                "user@claudgravity.local",
 			"organization_uuid":            fakeOrgID,
 			"organization_name":            "ClaudGravity Workspace",

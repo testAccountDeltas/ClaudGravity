@@ -18,7 +18,7 @@ import (
 type RequestLog struct {
 	ID              uint64    `json:"id"`
 	Timestamp       time.Time `json:"timestamp"`
-	Key             string    `json:"key"`
+	Key             string    `json:"-"`
 	KeyMasked       string    `json:"key_masked"`
 	Account         string    `json:"account"`
 	SessionID       string    `json:"session_id"`
@@ -202,6 +202,15 @@ func ParseAgentInfo(r *http.Request) (agentKey, agentType, subagentName, instanc
 	rawAgentType := r.Header.Get("x-claude-code-agent-type")
 	promptID := r.Header.Get("x-claude-code-prompt-id")
 	agentID := r.Header.Get("x-claude-code-agent-id")
+	if agentID == "" {
+		agentID = r.Header.Get("x-claude-subagent-id")
+	}
+	if agentID == "" {
+		agentID = r.Header.Get("x-subagent-id")
+	}
+	if agentID == "" {
+		agentID = r.Header.Get("anthropic-subagent-id")
+	}
 
 	if reqClass == "auxiliary" {
 		return "auxiliary", "auxiliary", "", ""

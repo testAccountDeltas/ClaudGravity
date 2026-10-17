@@ -26,7 +26,6 @@ var (
 var AntigravityHosts = []string{
 	"https://daily-cloudcode-pa.sandbox.googleapis.com",
 	"https://daily-cloudcode-pa.googleapis.com",
-	"https://cloudcode-pa.googleapis.com",
 }
 
 // antigravityHosts is the fallback order for the main inference path

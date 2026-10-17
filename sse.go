@@ -167,35 +167,37 @@ func getSessionCacheFraction(sessionID string) (float64, bool) {
 }
 
 type SSEStreamer struct {
-	w                    http.ResponseWriter
-	flusher              http.Flusher
-	mu                   sync.Mutex
-	hasStarted           bool
-	currentType          int // 0: none, 1: text, 2: thinking, 3: tool_use
-	currentIndex         int
-	messageID            string
-	model                string
-	inputTokens          int64
-	outputTokens         int64
-	cacheTokens          int64
-	toolUseOccurred      bool
-	textChars            int
-	thinkingChars        int
-	toolNames            []string
-	toolCallSignatures   []string
-	lastText             string
-	lastEventTime        time.Time
-	searchQueries        []string
-	groundingSources     []GroundingSource
-	sessionID            string
-	requestedSafeguards  bool
-	toolCallIDs          []string
-	hasFinished          bool
-	thoughtSignature     string          // most recent thoughtSignature seen for the open thinking block, flushed as signature_delta on close
-	thinkingFinished     bool            // true once a thinking block has been opened and closed — Anthropic allows at most one, so a later "thought" chunk (Gemini can interleave thought->text->thought) must not reopen a second one
-	estInputTokens       int             // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
-	preferRussian        bool            // conversation's own language, detected from the user's latest message — picks which language gateway-synthesized text (grounding footer) uses, since that text bypasses the model entirely
-	syntheticReasonTools map[string]bool // tool names whose Gemini-bound schema got our synthetic "reason" placeholder injected (translator.go); that key is stripped back out of the model's actual function-call args before handing them to Claude Code
+	w                        http.ResponseWriter
+	flusher                  http.Flusher
+	mu                       sync.Mutex
+	hasStarted               bool
+	currentType              int // 0: none, 1: text, 2: thinking, 3: tool_use
+	currentIndex             int
+	messageID                string
+	model                    string
+	inputTokens              int64
+	outputTokens             int64
+	cacheTokens              int64
+	toolUseOccurred          bool
+	textChars                int
+	thinkingChars            int
+	toolNames                []string
+	toolCallSignatures       []string
+	lastText                 string
+	lastEventTime            time.Time
+	searchQueries            []string
+	groundingSources         []GroundingSource
+	sessionID                string
+	requestedSafeguards      bool
+	toolCallIDs              []string
+	hasFinished              bool
+	thoughtSignature         string          // most recent thoughtSignature seen for the open thinking block, flushed as signature_delta on close
+	lastTurnThoughtSignature string          // durable across the turn; inherited by function calls and parallel tool calls
+	thinkingFinished         bool            // true once a thinking block has been opened and closed — Anthropic allows at most one, so a later "thought" chunk (Gemini can interleave thought->text->thought) must not reopen a second one
+	hasPriorTurns            bool            // whether request had assistant messages in history (prior turns in the conversation)
+	estInputTokens           int             // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
+	preferRussian            bool            // conversation's own language, detected from the user's latest message — picks which language gateway-synthesized text (grounding footer) uses, since that text bypasses the model entirely
+	syntheticReasonTools     map[string]bool // tool names whose Gemini-bound schema got our synthetic "reason" placeholder injected (translator.go); that key is stripped back out of the model's actual function-call args before handing them to Claude Code
 }
 
 type GroundingSource struct {
@@ -210,7 +212,7 @@ const (
 	TypeToolUse  = 3
 )
 
-func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool) *SSEStreamer {
+func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool) *SSEStreamer {
 	return &SSEStreamer{
 		w:                    w,
 		flusher:              flusher,
@@ -223,6 +225,7 @@ func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, s
 		estInputTokens:       estInputTokens,
 		preferRussian:        preferRussian,
 		syntheticReasonTools: syntheticReasonTools,
+		hasPriorTurns:        hasPriorTurns,
 	}
 }
 
@@ -269,11 +272,16 @@ func (s *SSEStreamer) EnsureMessageStart() error {
 	// message_delta still corrects to the real number either way.
 	cachedEstimate := int64(0)
 	uncachedEstimate := int64(s.estInputTokens)
-	if frac, ok := getSessionCacheFraction(s.sessionID); ok && frac > 0 {
-		cachedEstimate = int64(float64(s.estInputTokens) * frac)
-		uncachedEstimate = int64(s.estInputTokens) - cachedEstimate
-		if uncachedEstimate < 0 {
-			uncachedEstimate = 0
+	// Only estimate cache read if prompt is large enough to be cache-eligible (>1024 tokens)
+	// and the conversation has prior assistant turns. A brand new prompt or cold turn
+	// must not inherit a false 85% cache hit.
+	if s.estInputTokens >= 1024 && s.hasPriorTurns {
+		if frac, ok := getSessionCacheFraction(s.sessionID); ok && frac > 0 {
+			cachedEstimate = int64(float64(s.estInputTokens) * frac)
+			uncachedEstimate = int64(s.estInputTokens) - cachedEstimate
+			if uncachedEstimate < 0 {
+				uncachedEstimate = 0
+			}
 		}
 	}
 	startPayload := map[string]interface{}{
@@ -312,15 +320,9 @@ func (s *SSEStreamer) closeCurrentBlock() error {
 		s.thinkingFinished = true
 		sig := s.thoughtSignature
 		if sig == "" {
-			// A thinking block with no signature at all isn't a smaller
-			// problem than a wrong one — Anthropic's schema declares
-			// "signature" required on every thinking block, and an SDK's
-			// Pydantic/Zod model raises a validation error on a missing
-			// field, not just a mismatched one. Gemini not returning a
-			// thoughtSignature for this turn (happens on the public API and
-			// some model versions) used to skip signature_delta entirely;
-			// fall back to the same placeholder translator.go already uses
-			// when replaying history with no real signature to round-trip.
+			sig = s.lastTurnThoughtSignature
+		}
+		if sig == "" {
 			sig = "skip_thought_signature_validator"
 		}
 		sigPayload := map[string]interface{}{
@@ -380,6 +382,7 @@ func (s *SSEStreamer) HandleThinking(text string, thoughtSignature string) error
 	}
 	if thoughtSignature != "" {
 		s.thoughtSignature = thoughtSignature
+		s.lastTurnThoughtSignature = thoughtSignature
 	}
 
 	deltaPayload := map[string]interface{}{
@@ -464,13 +467,15 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSig
 	if err := s.EnsureMessageStart(); err != nil {
 		return err
 	}
-	// Gemini 2.0/3.x Flash Thinking often attaches the open thinking block's
-	// thoughtSignature to the chunk carrying the functionCall itself rather
-	// than to a preceding thought chunk — if so, s.thoughtSignature is still
-	// empty here and closeCurrentBlock()'s signature_delta check below would
-	// silently drop it, closing the thinking block with no signature at all.
-	if s.currentType == TypeThinking && s.thoughtSignature == "" && thoughtSignature != "" {
-		s.thoughtSignature = thoughtSignature
+	effectiveSig := thoughtSignature
+	if effectiveSig == "" && s.currentType == TypeThinking {
+		effectiveSig = s.thoughtSignature
+	}
+	if effectiveSig == "" {
+		effectiveSig = s.lastTurnThoughtSignature
+	}
+	if s.currentType == TypeThinking && s.thoughtSignature == "" && effectiveSig != "" {
+		s.thoughtSignature = effectiveSig
 	}
 	if err := s.closeCurrentBlock(); err != nil {
 		return err
@@ -483,7 +488,7 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSig
 
 	callID := nextToolCallID(name)
 	s.toolCallIDs = append(s.toolCallIDs, callID)
-	setToolSignature(callID, thoughtSignature)
+	setToolSignature(callID, effectiveSig)
 
 	startPayload := map[string]interface{}{
 		"type":  "content_block_start",
@@ -566,40 +571,27 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	// cleanly with it is friendlier to a client than aborting the whole
 	// stream with event:error, since the client still gets a complete,
 	// well-formed message it can display ("the model declined to answer")
-	// instead of a hard stream failure. If some content DID stream before
-	// the cutoff, let it through as end_turn: the client has something to
-	// show, which beats discarding it.
+	// instead of a hard stream failure.
 	isSafetyBlock := finishReason == "SAFETY" || finishReason == "RECITATION" || finishReason == "BLOCKLIST" ||
 		finishReason == "PROHIBITED_CONTENT" || finishReason == "SPII"
-	isGenuinelyEmpty := !s.toolUseOccurred && s.textChars == 0 && s.thinkingChars == 0
-	isEmptyRefusal := isSafetyBlock && isGenuinelyEmpty
 
-	// MAX_TOKENS must win over tool_use: toolUseOccurred only means a
-	// functionCall part was seen, not that it arrived complete. If
-	// generation was cut off mid-arguments by the output ceiling, the
-	// client needs to know the JSON it's about to parse may be truncated —
-	// reporting "tool_use" here hides that and the client sees a plain
-	// JSON syntax error instead of a clear "hit the length limit".
 	stopReason := "end_turn"
-	if isEmptyRefusal {
+	if isSafetyBlock {
 		stopReason = "refusal"
-		// Anthropic's Message.content has minItems:1 — a refusal with
-		// NOTHING ever streamed (no text_delta/thinking_delta/tool_use)
-		// would otherwise leave the client reconstructing a genuinely
-		// empty content array from zero content_block_start/stop events,
-		// which a strict SDK's schema validation rejects outright.
-		if err := s.HandleText("I'm not able to help with that request."); err != nil {
-			return err
+		if s.currentIndex < 0 {
+			if err := s.HandleText("I'm not able to help with that request."); err != nil {
+				return err
+			}
+			if err := s.closeCurrentBlock(); err != nil {
+				return err
+			}
 		}
-		if err := s.closeCurrentBlock(); err != nil {
-			return err
-		}
-	} else if isGenuinelyEmpty {
-		// Same minItems:1 problem, but for a non-safety finishReason
-		// (plain "STOP" or anything else) that still ended with literally
-		// nothing ever streamed — a rarer edge case than the safety-block
-		// one above, but the empty-content array is exactly as invalid
-		// either way.
+	} else if s.currentIndex < 0 {
+		// Anthropic Messages API requires at least one content block (minItems: 1).
+		// If generation finished without emitting any thinking, text, or tool_use block,
+		// emit a fallback block. If a thinking block or tool call was already streamed,
+		// minItems: 1 is already satisfied and we must NEVER inject synthetic dots ("...")
+		// which would be visible in Claude Code's terminal output.
 		if err := s.HandleText("(empty response)"); err != nil {
 			return err
 		}
@@ -614,15 +606,7 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 
 	// Gemini's promptTokenCount is the FULL input (cached + uncached), but
 	// Anthropic's input_tokens means only the uncached delta — cached reads
-	// are reported separately via cache_read_input_tokens. Sending the full
-	// count in both fields double-counts the cached portion: a client
-	// computing total = input_tokens + cache_read_input_tokens (per
-	// Anthropic's own documented formula) sees the cache tokens twice, and
-	// the displayed cache-hit-rate comes out roughly half of the real one.
-	// If the stream ended (e.g. a dropped connection) without Gemini ever
-	// sending a final usageMetadata chunk, s.inputTokens stays at its zero
-	// value — falling back to 0 here would contradict the non-zero
-	// estInputTokens estimate message_start already told the client.
+	// are reported separately via cache_read_input_tokens.
 	if s.inputTokens == 0 && s.estInputTokens > 0 {
 		s.inputTokens = int64(s.estInputTokens)
 	}
@@ -630,24 +614,27 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	if uncachedInputTokens < 0 {
 		uncachedInputTokens = 0
 	}
-	// Record this turn's real cache fraction for the NEXT turn's
-	// message_start estimate (see EnsureMessageStart).
-	if s.inputTokens > 0 {
-		setSessionCacheFraction(s.sessionID, float64(s.cacheTokens)/float64(s.inputTokens))
-	}
-	// Gemini never reports a distinct "tokens newly written to cache"
-	// counter — only cachedContentTokenCount (tokens actually READ from an
-	// existing cache). On a cache miss (nothing read yet) with a prompt
-	// large enough that Google's implicit caching will cache it going
-	// forward, approximate cache_creation_input_tokens as the uncached
-	// amount; without this, Claude Code saw 0% caching on a session's
-	// first turn even though Google silently caches it for every turn
-	// after.
+
 	var cacheCreationTokens int64
 	if s.cacheTokens == 0 && uncachedInputTokens > 1024 {
 		cacheCreationTokens = uncachedInputTokens
+		// In Anthropic's formula: Total prompt tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens.
+		// Tokens that created cache must NOT be counted in input_tokens as well, or SDKs double-count every token.
 		uncachedInputTokens = 0
 	}
+
+	// Record this turn's real cache fraction for the NEXT turn's message_start estimate
+	if s.inputTokens > 0 {
+		if s.cacheTokens > 0 {
+			setSessionCacheFraction(s.sessionID, float64(s.cacheTokens)/float64(s.inputTokens))
+		} else if cacheCreationTokens > 0 {
+			// Turn 1 created cache for this prompt. On Turn 2, the vast majority
+			// of the prompt will be a cache hit. Seed with 0.85 so message_start on Turn 2
+			// accurately reflects prompt caching instead of latching 0%.
+			setSessionCacheFraction(s.sessionID, 0.85)
+		}
+	}
+
 	usage := map[string]interface{}{
 		"input_tokens":  uncachedInputTokens,
 		"output_tokens": s.outputTokens,
@@ -662,6 +649,13 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	deltaMap := map[string]interface{}{
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
+	}
+	if stopReason == "refusal" {
+		deltaMap["stop_details"] = map[string]interface{}{
+			"type":        "refusal",
+			"category":    "general_harms",
+			"explanation": "Content blocked by safety policy",
+		}
 	}
 
 	if s.requestedSafeguards {
@@ -758,10 +752,10 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 	// "end_turn" instead of learning the prompt was blocked.
 	if pf := root.Get("promptFeedback"); pf.Exists() {
 		if br := pf.Get("blockReason").String(); br != "" && br != "BLOCK_REASON_UNSPECIFIED" {
-			msg := "Google safety filters blocked this prompt: " + br
-			errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":%q}}`, msg)
-			_ = s.SendRaw("error", errPayload)
-			return fmt.Errorf("prompt blocked by Google safety filters: %s", br)
+			_ = s.EnsureMessageStart()
+			_ = s.HandleText("I am unable to complete this request because it was flagged by upstream safety filters: " + br)
+			_ = s.closeCurrentBlock()
+			return s.FinishStream("SAFETY")
 		}
 	}
 
@@ -787,12 +781,19 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 	parts := cand.Get("content.parts")
 	if parts.IsArray() {
 		for _, part := range parts.Array() {
+			partSig := part.Get("thoughtSignature").String()
+			if partSig != "" {
+				s.lastTurnThoughtSignature = partSig
+				if s.thoughtSignature == "" {
+					s.thoughtSignature = partSig
+				}
+			}
 			if part.Get("thought").Bool() {
 				// The signature is often carried on a trailing chunk whose
 				// text is empty ("") — Google's own docs warn that filtering
 				// on an empty chunk.text silently drops it. Capture it
 				// either way; only emit a thinking_delta when there's text.
-				sig := part.Get("thoughtSignature").String()
+				sig := partSig
 				if t := part.Get("text").String(); t != "" {
 					if err := s.HandleThinking(t, sig); err != nil {
 						return err
@@ -801,6 +802,7 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 					if err := s.EnsureMessageStart(); err != nil {
 						return err
 					}
+					s.lastTurnThoughtSignature = sig
 					if s.currentType == TypeThinking {
 						s.thoughtSignature = sig
 					}
@@ -811,10 +813,17 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 				if args == "" {
 					args = "{}"
 				}
-				if err := s.HandleFunctionCall(name, args, part.Get("thoughtSignature").String()); err != nil {
+				callSig := partSig
+				if callSig == "" {
+					callSig = s.lastTurnThoughtSignature
+				}
+				if err := s.HandleFunctionCall(name, args, callSig); err != nil {
 					return err
 				}
 			} else if t := part.Get("text").String(); t != "" {
+				if s.currentType == TypeThinking && s.thoughtSignature == "" && partSig != "" {
+					s.thoughtSignature = partSig
+				}
 				if err := s.HandleText(t); err != nil {
 					return err
 				}

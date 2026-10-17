@@ -392,7 +392,12 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 				if !toolUsesSeen[tid] {
 					b["type"] = "text"
 					cVal := b["content"]
-					b["text"] = fmt.Sprintf("[Tool output %s]: %v", tid, cVal)
+					txt := toolResultPlainText(cVal)
+					if txt != "" {
+						b["text"] = fmt.Sprintf("[Tool output %s]: %s", tid, txt)
+					} else {
+						b["text"] = fmt.Sprintf("[Tool output %s]", tid)
+					}
 					delete(b, "tool_use_id")
 					delete(b, "content")
 					modified = true
@@ -495,12 +500,22 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 			}
 			// A tool_result whose tool_use_id doesn't match any tool_use in
 			// m (answering a call from further back than the immediately
-			// preceding assistant turn) was silently dropped by only ever
-			// walking m's own tool_use list above — append anything real
-			// that was never matched instead of discarding it.
+			// preceding assistant turn) cannot be emitted as a live functionResponse,
+			// because Gemini strictly enforces that every functionResponse in turn N
+			// must match a functionCall in turn N-1. Convert it into a plain text block
+			// so the information is preserved without triggering a Gemini protobuf 400 error.
 			for tid, real := range realResults {
 				if !consumed[tid] {
-					ordered = append(ordered, real)
+					cVal := real["content"]
+					txt := toolResultPlainText(cVal)
+					textDesc := fmt.Sprintf("[Delayed tool output for %s]: %s", tid, txt)
+					if txt == "" {
+						textDesc = fmt.Sprintf("[Delayed tool output for %s]", tid)
+					}
+					ordered = append(ordered, map[string]interface{}{
+						"type": "text",
+						"text": textDesc,
+					})
 				}
 			}
 			ordered = append(ordered, otherBlocks...)

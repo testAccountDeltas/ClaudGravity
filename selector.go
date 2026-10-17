@@ -217,7 +217,29 @@ func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey
 		}
 	}
 
-	// 4. Select the best available account based on remaining quota
+	// 4. For subagents on their first turn, or if tenant strategy is round_robin,
+	// distribute across the pool using round-robin among healthy accounts rather than
+	// greedily picking the single account with highest quota fraction (which sends 3-5 concurrent
+	// subagents to the exact same account simultaneously, triggering 429s).
+	if isSubagentKey || tenant.Strategy == "round_robin" {
+		valid := make([]*AccountRecord, 0)
+		for _, acc := range accounts {
+			if !isExcluded(acc) && hasRemainingQuota(acc) {
+				valid = append(valid, acc)
+			}
+		}
+		if len(valid) > 0 {
+			as.roundRobinIdx = (as.roundRobinIdx + 1) % len(valid)
+			chosen := valid[as.roundRobinIdx]
+			if !isSubagentKey && apiKey != "" {
+				as.stickyMap[apiKey] = chosen.Email
+			}
+			as.bindAffinityLocked(conversationKey, chosen.Email, now)
+			return chosen, nil
+		}
+	}
+
+	// 4b. Select the best available account based on remaining quota
 	var bestAcc *AccountRecord
 	var maxQuota float64 = -1.0
 
@@ -233,7 +255,7 @@ func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey
 	}
 
 	if bestAcc != nil {
-		if apiKey != "" {
+		if !isSubagentKey && apiKey != "" {
 			as.stickyMap[apiKey] = bestAcc.Email
 		}
 		as.bindAffinityLocked(conversationKey, bestAcc.Email, now)
@@ -443,8 +465,16 @@ func getEffectiveQuotaFraction(acc *AccountRecord) float64 {
 			continue
 		}
 		for _, b := range grp.Buckets {
-			if b.RemainingFraction < minFrac {
-				minFrac = b.RemainingFraction
+			frac := b.RemainingFraction
+			if frac <= 0.05 && b.ResetTime != "" {
+				if t, err := time.Parse(time.RFC3339Nano, b.ResetTime); err == nil && time.Now().After(t) {
+					frac = 1.0
+				} else if t, err := time.Parse(time.RFC3339, b.ResetTime); err == nil && time.Now().After(t) {
+					frac = 1.0
+				}
+			}
+			if frac < minFrac {
+				minFrac = frac
 			}
 		}
 	}

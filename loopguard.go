@@ -27,8 +27,8 @@ const (
 	// defaults to true (see config.go), so Grep/Glob usually aren't even
 	// declared to the model; telling it to use a tool it doesn't have is
 	// useless advice at best and confusing at worst.
-	NudgeReadLoop = "Notice from the gateway: you have made many Read calls recently without writing/editing anything or giving a substantial answer — this looks like an unproductive read-loop. Stop reading slices. Use Bash (grep/rg) to jump straight to the relevant symbol/section, or read larger ranges, or proceed with what you have."
-	NudgeOscillation    = "Notice from the gateway: your output is flagged for looping content (the exact same tool call or A/B oscillation repeated). If intentional, add the tag [ignoring loop detection]; otherwise stop and try a different approach."
+	NudgeReadLoop    = "Notice from the gateway: you have made many Read calls recently without writing/editing anything or giving a substantial answer — this looks like an unproductive read-loop. Stop reading slices. Use Bash (grep/rg) to jump straight to the relevant symbol/section, or read larger ranges, or proceed with what you have."
+	NudgeOscillation = "Notice from the gateway: your output is flagged for looping content (the exact same tool call or A/B oscillation repeated). If intentional, add the tag [ignoring loop detection]; otherwise stop and try a different approach."
 
 	// NudgeEditFailureLoop fires when Edit has failed (old_string mismatch)
 	// several times in a row for the same agent — the read-loop guard above
@@ -67,13 +67,14 @@ const (
 // threshold for this turn's agent. agentKey is ParseAgentInfo's own output
 // ("sub:<agentType>" for any subagent), so this needs no extra plumbing —
 // the role is already encoded in the same string LoopGuard keys its state
-// by.
-func readLoopLimits(agentKey string) (windowSize, threshold int) {
+// by. If hasModifyingTools is false (e.g. Plan Mode, or an investigation agent
+// without edit permissions), we use the relaxed exploreReadWindow limits so
+// legitimate file inspection does not trigger false-positive read-loop warnings.
+func readLoopLimits(agentKey string, hasModifyingTools bool) (windowSize, threshold int) {
 	// ParseAgentInfo's fallback path (request-class "subagent" but no
 	// x-claude-code-agent-type header) returns the bare string "subagent"
-	// with no "sub:" prefix at all — missing that here silently dropped
-	// those subagents back to the tight main-agent threshold.
-	if strings.HasPrefix(agentKey, "sub:") || agentKey == "subagent" {
+	// with no "sub:" prefix at all.
+	if strings.HasPrefix(agentKey, "sub:") || agentKey == "subagent" || !hasModifyingTools {
 		return exploreReadWindowSize, exploreReadWindowThreshold
 	}
 	return ReadWindowSize, ReadWindowThreshold

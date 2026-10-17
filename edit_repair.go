@@ -261,7 +261,13 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					// Write hands the full new file content directly in the
 					// call itself -- no need to wait for the tool_result.
 					if c := input.Get("content"); c.Exists() {
-						setSessionSnapshot(sessionID, path, c.String())
+						contentStr := c.String()
+						setSessionSnapshot(sessionID, path, contentStr)
+						if !filepath.IsAbs(path) {
+							if cwd := GetSessionCWD(sessionID); cwd != "" {
+								setSessionSnapshot(sessionID, filepath.Join(cwd, path), contentStr)
+							}
+						}
 					}
 				case "edit", "update", "str_replace_editor", "notebookedit":
 					// Replay same-turn edits against whatever snapshot we
@@ -272,12 +278,26 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					newStr := firstNonEmpty(input.Get("new_string").String(), input.Get("new_str").String())
 					if oldStr != "" {
 						if cur, ok := getSessionSnapshot(sessionID, path); ok && strings.Contains(cur, oldStr) {
-							setSessionSnapshot(sessionID, path, strings.Replace(cur, oldStr, newStr, 1))
+							n := 1
+							if input.Get("replace_all").Bool() {
+								n = -1
+							}
+							updated := strings.Replace(cur, oldStr, newStr, n)
+							setSessionSnapshot(sessionID, path, updated)
+							if !filepath.IsAbs(path) {
+								if cwd := GetSessionCWD(sessionID); cwd != "" {
+									setSessionSnapshot(sessionID, filepath.Join(cwd, path), updated)
+								}
+							}
 						}
 					}
 				}
 
 			case "tool_result":
+				// Do not record snapshot if the tool call failed (e.g. file not found)
+				if p.Get("is_error").Bool() || failedToolIDs[p.Get("tool_use_id").String()] {
+					return true
+				}
 				toolUseID := p.Get("tool_use_id").String()
 				if toolIDToName[toolUseID] != "read" {
 					return true
@@ -302,7 +322,13 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					resText = c.String()
 				}
 				if resText != "" {
-					setSessionSnapshot(sessionID, path, stripCatNPrefix(resText))
+					cleanContent := stripCatNPrefix(resText)
+					setSessionSnapshot(sessionID, path, cleanContent)
+					if !filepath.IsAbs(path) {
+						if cwd := GetSessionCWD(sessionID); cwd != "" {
+							setSessionSnapshot(sessionID, filepath.Join(cwd, path), cleanContent)
+						}
+					}
 				}
 			}
 			return true
@@ -351,11 +377,22 @@ func ExtractCWDFromSystemPrompt(systemPrompt string) string {
 	return ""
 }
 
-// normalizeLineForMatch collapses all whitespace (spaces, tabs) into a single space and trims edges
+// normalizeLineForMatch collapses all whitespace (spaces, tabs) into a single space,
+// normalizes typographical/curly quotes and dashes, and trims edges.
 func normalizeLineForMatch(s string) string {
 	var b strings.Builder
 	inSpace := false
 	for _, r := range s {
+		switch r {
+		case '“', '”', '«', '»': // Left/right double curly quotes, guillemets
+			r = '"'
+		case '‘', '’', '‚', '‛': // Left/right single curly quotes
+			r = '\''
+		case '–', '—': // En-dash, em-dash
+			r = '-'
+		case ' ': // Non-breaking space
+			r = ' '
+		}
 		if unicode.IsSpace(r) {
 			if !inSpace {
 				b.WriteByte(' ')
@@ -524,6 +561,15 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 	if ok && repairedExact != "" {
 		repaired, err := sjson.Set(argsRaw, oldStrKey, repairedExact)
 		if err == nil {
+			// Ensure new_string matches CRLF if file is CRLF
+			if hasCRLF && newStrKey != "" {
+				newCRLFCandidate := strings.ReplaceAll(strings.ReplaceAll(newStr, "\r\n", "\n"), "\n", "\r\n")
+				if newCRLFCandidate != newStr {
+					if withNew, err2 := sjson.Set(repaired, newStrKey, newCRLFCandidate); err2 == nil {
+						repaired = withNew
+					}
+				}
+			}
 			LogGateway("[Auto-Repair Edit] Successfully fuzzy-repaired old_string for %s (%d -> %d bytes, tabs/spaces matched)",
 				filepath.Base(resolvedPath), len(oldStr), len(repairedExact))
 			return repaired, true

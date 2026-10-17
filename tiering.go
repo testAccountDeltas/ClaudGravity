@@ -25,7 +25,7 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 		model = "gemini-3.8-flash-tiered"
 	} else if strings.HasPrefix(model, "claude-sonnet") || strings.HasPrefix(model, "claude-3-5-sonnet") || strings.HasPrefix(model, "claude-3-7-sonnet") {
 		model = "gemini-3.8-flash-medium"
-	} else if strings.HasPrefix(model, "claude-haiku") || strings.HasPrefix(model, "claude-3-5-haiku") {
+	} else if strings.HasPrefix(model, "claude-haiku") || strings.HasPrefix(model, "claude-3-5-haiku") || strings.HasPrefix(model, "claude-3-haiku") {
 		model = "gemini-2.5-flash"
 	}
 

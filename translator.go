@@ -27,7 +27,7 @@ var currentLocalTimeMinuteSecondRe = regexp.MustCompile(`(T\d{2}):\d{2}:\d{2}`)
 // ("Given the user's message, you should use the tools available to
 // complete the task. Complete the task fully...") that a whole-line
 // replacement in ScrubBillingHeader used to discard along with it.
-var claudeCodeSelfIDRe = regexp.MustCompile(`(?i)you are claude code, anthropic's official cli for claude\.?`)
+var claudeCodeSelfIDRe = regexp.MustCompile(`(?i)you are (an agent for )?claude code, anthropic's official cli( for claude)?\.?`)
 
 // DropSearchTools is stripped from the declared tools when
 // tenant.StripSearchTools is true (default: true — see README.md's
@@ -234,14 +234,28 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 
 	// 2. Loop-Guard Nudges (Read-Loop & Oscillation)
-	_, readThreshold := readLoopLimits(agentKey)
-	if level := globalLoopGuard.CheckAndResetReadStreak(loopKey, readThreshold); level > 0 {
-		nudgeText := NudgeReadLoop
-		if level >= 2 {
-			nudgeText = NudgeReadLoopEscalated
+	hasModifyingTools := false
+	if toolsArr, ok := reqMap["tools"].([]interface{}); ok {
+		for _, t := range toolsArr {
+			if tMap, isMap := t.(map[string]interface{}); isMap {
+				name := strings.ToLower(fmt.Sprint(tMap["name"]))
+				if name == "edit" || name == "write" || name == "notebookedit" || name == "str_replace_editor" {
+					hasModifyingTools = true
+					break
+				}
+			}
 		}
-		InjectUserNudge(reqMap, nudgeText)
-		LogGateway(".. read-loop window >= %d Read calls [%s] level=%d -> injecting stop-nudge", readThreshold, loopKey, level)
+	}
+	_, readThreshold := readLoopLimits(agentKey, hasModifyingTools)
+	if hasModifyingTools {
+		if level := globalLoopGuard.CheckAndResetReadStreak(loopKey, readThreshold); level > 0 {
+			nudgeText := NudgeReadLoop
+			if level >= 2 {
+				nudgeText = NudgeReadLoopEscalated
+			}
+			InjectUserNudge(reqMap, nudgeText)
+			LogGateway(".. read-loop window >= %d Read calls [%s] level=%d -> injecting stop-nudge", readThreshold, loopKey, level)
+		}
 	}
 	if globalLoopGuard.CheckAndResetOscillation(loopKey) {
 		InjectUserNudge(reqMap, NudgeOscillation)
@@ -614,9 +628,35 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				var mergedFollowUp []string
 				combined, mergedFollowUp = sealFunctionResponseTurn(combined)
 				followUpImages = append(followUpImages, mergedFollowUp...)
+				if geminiRole == "model" {
+					// Google Antigravity strictly enforces that all thought parts must
+					// precede any other parts in a model turn, even after merging consecutive model turns.
+					var thoughtParts, otherParts []string
+					for _, pjson := range combined {
+						if gjson.Get(pjson, "thought").Bool() {
+							thoughtParts = append(thoughtParts, pjson)
+						} else {
+							otherParts = append(otherParts, pjson)
+						}
+					}
+					combined = append(thoughtParts, otherParts...)
+				}
 				combinedJSON := "[" + strings.Join(combined, ",") + "]"
 				out, _ = sjson.SetRaw(out, fmt.Sprintf("contents.%d.parts", targetIdx), combinedJSON)
 			} else {
+				if geminiRole == "model" {
+					// Google Antigravity strictly enforces that all thought parts must
+					// precede any other parts in a model turn.
+					var thoughtParts, otherParts []string
+					for _, pjson := range partsJSON {
+						if gjson.Get(pjson, "thought").Bool() {
+							thoughtParts = append(thoughtParts, pjson)
+						} else {
+							otherParts = append(otherParts, pjson)
+						}
+					}
+					partsJSON = append(thoughtParts, otherParts...)
+				}
 				out, _ = sjson.Set(out, fmt.Sprintf("contents.%d.role", contentIdx), geminiRole)
 				for _, pjson := range partsJSON {
 					out, _ = sjson.SetRaw(out, fmt.Sprintf("contents.%d.parts.-1", contentIdx), pjson)
@@ -697,15 +737,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				return true
 			}
 			desc := t.Get("description").String()
-			// A field declared via "const" (e.g. a Pydantic Literal) has no
-			// "enum" key yet at this point — recordNumericEnumFields only
-			// looks for "enum", and CleanJSONSchemaForAntigravity below is
-			// what actually promotes const into enum, internally, after
-			// this already ran. Run that one promotion pass first so a
-			// numeric/boolean const is recorded for restoration same as a
-			// real enum.
 			rawSchema := t.Get("input_schema").Raw
-			recordNumericEnumFields(name, convertConstToEnum(rawSchema))
 			schemaRaw := CleanJSONSchemaForAntigravity(name, rawSchema)
 			if strings.TrimSpace(schemaRaw) == "" || schemaRaw == "null" {
 				// Google rejects an OBJECT-type schema with empty properties
@@ -836,6 +868,17 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		if len(seqs) > 0 {
 			seqsJSON, _ := json.Marshal(seqs)
 			out, _ = sjson.SetRaw(out, "generationConfig.stopSequences", string(seqsJSON))
+		}
+	}
+
+	// 6.6 Structured Outputs: translate Anthropic output_config.format into Gemini responseSchema
+	if fmtNode := root.Get("output_config.format"); fmtNode.Exists() {
+		if fmtNode.Get("type").String() == "json_schema" {
+			out, _ = sjson.Set(out, "generationConfig.responseMimeType", "application/json")
+			if schemaNode := fmtNode.Get("schema"); schemaNode.Exists() {
+				cleanedSchema := CleanJSONSchemaForGemini(schemaNode.Raw)
+				out, _ = sjson.SetRaw(out, "generationConfig.responseSchema", cleanedSchema)
+			}
 		}
 	}
 
@@ -1008,7 +1051,7 @@ func ScrubBillingHeader(txt string) string {
 		// Normalize self-identification — replace only the identifying
 		// clause, keeping whatever real behavioral instructions follow it
 		// on the same line.
-		if strings.Contains(lower, "you are claude code, anthropic's official cli") {
+		if strings.Contains(lower, "claude code, anthropic's official cli") {
 			cleanLines = append(cleanLines, claudeCodeSelfIDRe.ReplaceAllString(line, "You are a helpful coding assistant."))
 			continue
 		}

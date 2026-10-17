@@ -154,8 +154,19 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 						} else if rc.IsArray() {
 							rc.ForEach(func(_, item gjson.Result) bool {
 								switch item.Get("type").String() {
-								case "image", "document":
+								case "image":
 									total += 1600
+								case "document":
+									src := item.Get("source")
+									if src.Get("type").String() == "base64" {
+										est := len(src.Get("data").String()) / 500
+										if est < 1600 {
+											est = 1600
+										}
+										total += est
+									} else {
+										total += estimateApproxTokens(src.Get("data").String())
+									}
 								default:
 									total += estimateApproxTokens(item.Get("text").String())
 								}
@@ -166,12 +177,18 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 						// Rough image token cost (typical Anthropic resolution ~1600 tokens)
 						total += 1600
 					case "document":
-						// PDF support (translator.go) was added without a
-						// matching estimate here — every document block
-						// was silently counted as 0 tokens. Same flat
-						// per-block guess as image; page count isn't known
-						// at this point.
-						total += 1600
+						src := part.Get("source")
+						if src.Get("type").String() == "base64" {
+							est := len(src.Get("data").String()) / 500
+							if est < 1600 {
+								est = 1600
+							}
+							total += est
+						} else {
+							total += estimateApproxTokens(src.Get("data").String())
+						}
+					case "redacted_thinking":
+						total += estimateApproxTokens(part.Get("data").String())
 					}
 					return true
 				})

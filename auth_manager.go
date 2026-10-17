@@ -75,9 +75,9 @@ type QuotaGroup struct {
 }
 
 type AccountRecord struct {
-	Email           string       `json:"email"`
-	ProjectID       string       `json:"project_id"`
-	ProjectIDProbed bool         `json:"project_id_probed"` // discovered via loadCodeAssist/onboardUser (or confirmed), not just the generic fallback — never re-probe once true
+	Email           string `json:"email"`
+	ProjectID       string `json:"project_id"`
+	ProjectIDProbed bool   `json:"project_id_probed"` // discovered via loadCodeAssist/onboardUser (or confirmed), not just the generic fallback — never re-probe once true
 	// Never serialized: GetAccounts()/GetAccount() snapshots of this struct
 	// go straight out over /api/accounts and the dashboard websocket
 	// (ws_hub.go's BroadcastAccounts) to anyone with the dashboard
@@ -85,15 +85,15 @@ type AccountRecord struct {
 	// display data, and nothing reads them back through JSON (on-disk
 	// persistence in auth_manager.go builds its own anonymous map, it
 	// never marshals AccountRecord itself).
-	RefreshToken string `json:"-"`
-	AccessToken  string `json:"-"`
-	ExpiresAt       time.Time    `json:"expires_at"`
-	Disabled        bool         `json:"disabled"`
-	FilePath        string       `json:"file_path"`
-	Quotas          []QuotaGroup `json:"quotas"`
-	CooldownUntil   time.Time    `json:"cooldown_until"` // do not route requests until this time if quota exhausted
-	LastChecked     time.Time    `json:"last_checked"`
-	LastError       string       `json:"last_error"`
+	RefreshToken  string       `json:"-"`
+	AccessToken   string       `json:"-"`
+	ExpiresAt     time.Time    `json:"expires_at"`
+	Disabled      bool         `json:"disabled"`
+	FilePath      string       `json:"file_path"`
+	Quotas        []QuotaGroup `json:"quotas"`
+	CooldownUntil time.Time    `json:"cooldown_until"` // do not route requests until this time if quota exhausted
+	LastChecked   time.Time    `json:"last_checked"`
+	LastError     string       `json:"last_error"`
 
 	// refreshMu serializes RefreshAccessToken calls for this one account:
 	// without it, N concurrent requests on the same account (e.g. parallel
@@ -199,7 +199,10 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 	data.Set("grant_type", "refresh_token")
 	data.Set("refresh_token", acc.RefreshToken)
 
-	req, err := http.NewRequest("POST", GoogleTokenEndpoint, strings.NewReader(data.Encode()))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", GoogleTokenEndpoint, strings.NewReader(data.Encode()))
 	if err != nil {
 		return "", err
 	}
@@ -455,7 +458,10 @@ func (am *AccountManager) FetchQuota(email string) error {
 	}
 	bodyJSON, _ := json.Marshal(payload)
 
-	req, err := http.NewRequest("POST", CloudCodeQuotaEndpoint, bytes.NewReader(bodyJSON))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", CloudCodeQuotaEndpoint, bytes.NewReader(bodyJSON))
 	if err != nil {
 		return err
 	}
@@ -536,12 +542,13 @@ func (am *AccountManager) FetchQuota(email string) error {
 		}
 		for _, b := range g.Buckets {
 			if b.RemainingFraction <= 0.05 && b.ResetTime != "" {
+				now := time.Now()
 				if t, err := time.Parse(time.RFC3339Nano, b.ResetTime); err == nil {
-					if t.After(maxCooldown) {
+					if t.After(now) && t.After(maxCooldown) {
 						maxCooldown = t
 					}
 				} else if t, err := time.Parse(time.RFC3339, b.ResetTime); err == nil {
-					if t.After(maxCooldown) {
+					if t.After(now) && t.After(maxCooldown) {
 						maxCooldown = t
 					}
 				}

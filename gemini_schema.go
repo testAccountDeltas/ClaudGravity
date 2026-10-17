@@ -167,7 +167,7 @@ const placeholderReasonDescription = "Brief explanation of why you are calling t
 // It handles unsupported keywords, type flattening, and schema simplification while preserving
 // semantic information as description hints.
 func CleanJSONSchemaForAntigravity(toolName, jsonStr string) string {
-	cleaned, nestedOpenDictFields := cleanJSONSchema(jsonStr, true)
+	cleaned, nestedOpenDictFields := cleanJSONSchema(toolName, jsonStr, true)
 	openDictArgFieldsMu.Lock()
 	if len(nestedOpenDictFields) > 0 {
 		openDictArgFields[toolName] = nestedOpenDictFields
@@ -181,7 +181,7 @@ func CleanJSONSchemaForAntigravity(toolName, jsonStr string) string {
 // CleanJSONSchemaForGemini transforms a JSON schema to be compatible with Gemini tool calling.
 // It removes unsupported keywords and simplifies schemas, without adding empty-schema placeholders.
 func CleanJSONSchemaForGemini(jsonStr string) string {
-	cleaned, _ := cleanJSONSchema(jsonStr, false)
+	cleaned, _ := cleanJSONSchema("", jsonStr, false)
 	return cleaned
 }
 
@@ -190,7 +190,7 @@ func CleanJSONSchemaForGemini(jsonStr string) string {
 // argument field names addEmptySchemaPlaceholder had to patch because they
 // were free-form dicts (see openDictPaths/openDictArgFields above) rather
 // than genuinely empty schemas.
-func cleanJSONSchema(jsonStr string, addPlaceholder bool) (string, []string) {
+func cleanJSONSchema(toolName, jsonStr string, addPlaceholder bool) (string, []string) {
 	// A node with additionalProperties set to a SCHEMA (not just `false`) is
 	// a free-form dict by design — Bash's "env", TaskCreate's "metadata" —
 	// and legitimately has no fixed "properties" of its own. Phase 3 below
@@ -209,18 +209,27 @@ func cleanJSONSchema(jsonStr string, addPlaceholder bool) (string, []string) {
 		}
 	}
 
-	// Phase 1: Convert and add hints
+	// Phase 1: Convert references and inline structures
 	jsonStr = convertRefsToHints(jsonStr)
 	jsonStr = convertConstToEnum(jsonStr)
-	jsonStr = convertEnumValuesToStrings(jsonStr)
-	jsonStr = addEnumHints(jsonStr)
-	jsonStr = addAdditionalPropertiesHints(jsonStr)
-	jsonStr = moveConstraintsToDescription(jsonStr)
 
 	// Phase 2: Flatten complex structures
 	jsonStr = mergeAllOf(jsonStr)
 	jsonStr = flattenAnyOfOneOf(jsonStr)
 	jsonStr = flattenTypeArrays(jsonStr)
+
+	// Record numeric and boolean enums AFTER references are inlined and allOf/anyOf
+	// structures are merged, but BEFORE convertEnumValuesToStrings coerces them
+	// to string enums for Gemini OpenAPI 3.0. This ensures enums defined via $ref
+	// or allOf composition are correctly preserved for coercion upon response.
+	if toolName != "" {
+		recordNumericEnumFields(toolName, jsonStr)
+	}
+
+	jsonStr = convertEnumValuesToStrings(jsonStr)
+	jsonStr = addEnumHints(jsonStr)
+	jsonStr = addAdditionalPropertiesHints(jsonStr)
+	jsonStr = moveConstraintsToDescription(jsonStr)
 
 	// Phase 3: Cleanup
 	jsonStr = removeUnsupportedKeywords(jsonStr)
@@ -350,6 +359,9 @@ func convertRefsToHints(jsonStr string) string {
 			// "object"} stub, which silently turned e.g. a string enum
 			// parameter into an object the model then fills in wrong.
 			if def := resolveLocalRef(jsonStr, refVal); def != "" {
+				if existingDesc := gjson.Get(jsonStr, joinPath(parentPath, "description")).String(); existingDesc != "" {
+					def, _ = sjson.Set(def, "description", existingDesc)
+				}
 				jsonStr = setRawAt(jsonStr, parentPath, def)
 				continue
 			}
@@ -380,33 +392,29 @@ func resolveLocalRef(jsonStr, refVal string) string {
 	const defsPrefix = "#/$defs/"
 	const definitionsPrefix = "#/definitions/"
 	const componentsSchemasPrefix = "#/components/schemas/"
-	var name string
+
+	var prefix, rootField string
 	switch {
 	case strings.HasPrefix(refVal, defsPrefix):
-		name = refVal[len(defsPrefix):]
-		// A def name containing a literal "." (Pydantic nests these as
-		// "Outer.Inner") would otherwise be read by gjson as a multi-level
-		// path ($defs.Outer.Inner) instead of the single key "$defs" ->
-		// "Outer.Inner" it actually is, silently failing to resolve and
-		// degrading the referenced schema to an empty {"type":"object"}.
-		if def := gjson.Get(jsonStr, "$defs."+escapeGJSONPathKey(name)); def.Exists() {
-			return def.Raw
-		}
+		prefix, rootField = defsPrefix, "$defs"
 	case strings.HasPrefix(refVal, definitionsPrefix):
-		name = refVal[len(definitionsPrefix):]
-		if def := gjson.Get(jsonStr, "definitions."+escapeGJSONPathKey(name)); def.Exists() {
-			return def.Raw
-		}
+		prefix, rootField = definitionsPrefix, "definitions"
 	case strings.HasPrefix(refVal, componentsSchemasPrefix):
-		// OpenAPI 3.0-style ref, used by MCP servers that generate their
-		// tool schemas from an OpenAPI spec instead of native JSON Schema
-		// $defs — previously unhandled entirely, degrading the referenced
-		// parameter to an empty {"type":"object"} and losing the tool's
-		// real structure.
-		name = refVal[len(componentsSchemasPrefix):]
-		if def := gjson.Get(jsonStr, "components.schemas."+escapeGJSONPathKey(name)); def.Exists() {
-			return def.Raw
-		}
+		prefix, rootField = componentsSchemasPrefix, "components.schemas"
+	default:
+		return ""
+	}
+
+	subPath := refVal[len(prefix):]
+	segments := strings.Split(subPath, "/")
+	currPath := rootField
+	for _, seg := range segments {
+		seg = strings.ReplaceAll(seg, "~1", "/")
+		seg = strings.ReplaceAll(seg, "~0", "~")
+		currPath = currPath + "." + escapeGJSONPathKey(seg)
+	}
+	if def := gjson.Get(jsonStr, currPath); def.Exists() {
+		return def.Raw
 	}
 	return ""
 }
@@ -482,6 +490,9 @@ var unsupportedConstraints = []string{
 	"minimum", "maximum", // MCP tools with numeric validators commonly set these; Gemini's schema doesn't document support for them
 	"pattern", "minItems", "maxItems", "format",
 	"default", "examples", // Claude rejects these in VALIDATED mode
+	"prefixItems", "uniqueItems", "contains", "minContains", "maxContains",
+	"dependentRequired", "dependentSchemas", "contentEncoding", "contentMediaType",
+	"readOnly", "writeOnly", "deprecated",
 }
 
 func moveConstraintsToDescription(jsonStr string) string {
@@ -515,6 +526,9 @@ func mergeAllOf(jsonStr string) string {
 
 		for _, item := range allOf.Array() {
 			if props := item.Get("properties"); props.IsObject() {
+				if !gjson.Get(jsonStr, joinPath(parentPath, "type")).Exists() {
+					jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "type"), "object")
+				}
 				props.ForEach(func(key, value gjson.Result) bool {
 					destPath := joinPath(parentPath, "properties."+escapeGJSONPathKey(key.String()))
 					jsonStr, _ = sjson.SetRaw(jsonStr, destPath, value.Raw)
@@ -531,14 +545,7 @@ func mergeAllOf(jsonStr string) string {
 				}
 				jsonStr, _ = sjson.Set(jsonStr, reqPath, current)
 			}
-			// A scalar allOf member (type-level composition, e.g. Pydantic
-			// emitting {"allOf":[{"type":"string","enum":["a","b"]}],
-			// "description":"..."}) has no "properties"/"required" at all —
-			// only the two cases above were handled, so the whole allOf key
-			// got deleted below with its type/enum/format never merged
-			// anywhere, leaving the parameter with no "type" at all and
-			// Google rejecting it outright.
-			for _, kw := range []string{"type", "enum", "format", "description"} {
+			for _, kw := range []string{"type", "enum", "format", "description", "items", "nullable"} {
 				if v := item.Get(kw); v.Exists() && !gjson.Get(jsonStr, joinPath(parentPath, kw)).Exists() {
 					jsonStr, _ = sjson.SetRaw(jsonStr, joinPath(parentPath, kw), v.Raw)
 				}
@@ -571,7 +578,11 @@ func flattenAnyOfOneOf(jsonStr string) string {
 			allEnums := make([]string, 0)
 			allStringEnums := true
 			for _, itm := range items {
-				if itm.Get("type").String() == "string" && itm.Get("enum").IsArray() {
+				t := itm.Get("type").String()
+				if t == "null" {
+					continue
+				}
+				if t == "string" && itm.Get("enum").IsArray() {
 					for _, ev := range itm.Get("enum").Array() {
 						allEnums = append(allEnums, ev.String())
 					}
