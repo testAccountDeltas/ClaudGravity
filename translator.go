@@ -684,6 +684,16 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				idx = 1
 			}
 			out, _ = sjson.SetRaw(out, fmt.Sprintf("tools.%d.googleSearch", idx), "{}")
+			if len(decls) > 0 {
+				// Google now rejects a request mixing a built-in tool
+				// (googleSearch) with custom functionDeclarations unless
+				// this is explicitly set: 400 INVALID_ARGUMENT "Please
+				// enable tool_config.include_server_side_tool_invocations
+				// to use Built-in tools with Function calling." Hit on
+				// virtually every real request, since Claude Code declares
+				// its native web_search tool alongside everything else.
+				out, _ = sjson.Set(out, "toolConfig.includeServerSideToolInvocations", true)
+			}
 		}
 
 		// tool_choice was previously dropped entirely, so a client forcing
