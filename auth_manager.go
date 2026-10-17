@@ -1059,6 +1059,8 @@ func ExchangeAuthCode(code string) (*AccountRecord, error) {
 	globalAccountManager.mu.Unlock()
 
 	_ = globalAccountManager.FetchQuota(email)
+	// Probe for the real GCP project_id immediately rather than waiting 1 hour for first refresh
+	go globalAccountManager.triggerProjectIDProbe(email, accToken)
 
 	return record, nil
 }

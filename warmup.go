@@ -181,7 +181,7 @@ func isSessionTokenWallError(status int, errText string) bool {
 // one, since the warmup ping itself only exercises a Gemini model.
 func needsGeminiWeeklyWarmup(acc *AccountRecord) bool {
 	for _, grp := range acc.Quotas {
-		if !strings.Contains(grp.DisplayName, "Gemini") {
+		if !strings.Contains(strings.ToLower(grp.DisplayName), "gemini") {
 			continue
 		}
 		for _, b := range grp.Buckets {

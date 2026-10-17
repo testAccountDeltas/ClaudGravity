@@ -141,7 +141,7 @@ func commonAPIMiddleware(next http.Handler) http.Handler {
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE, PUT")
 		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, x-claude-code-request-class, x-claude-code-agent-type, x-claude-code-agent-id, x-claude-code-prompt-id, x-session-id, x-claude-code-session-id")
-		h.Set("Access-Control-Expose-Headers", "anthropic-version, request-id, retry-after, anthropic-ratelimit-requests-limit, anthropic-ratelimit-requests-remaining, anthropic-ratelimit-requests-reset, anthropic-ratelimit-tokens-limit, anthropic-ratelimit-tokens-remaining, anthropic-ratelimit-tokens-reset, anthropic-ratelimit-unified-5h-status, anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, anthropic-ratelimit-unified-7d-status, anthropic-ratelimit-unified-7d-utilization, anthropic-ratelimit-unified-7d-reset, anthropic-ratelimit-unified-status, anthropic-ratelimit-unified-representative-claim, anthropic-ratelimit-unified-reset")
+		h.Set("Access-Control-Expose-Headers", "anthropic-version, request-id, retry-after, anthropic-organization-id, anthropic-workspace-id, anthropic-ratelimit-requests-limit, anthropic-ratelimit-requests-remaining, anthropic-ratelimit-requests-reset, anthropic-ratelimit-tokens-limit, anthropic-ratelimit-tokens-remaining, anthropic-ratelimit-tokens-reset, anthropic-ratelimit-unified-5h-status, anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, anthropic-ratelimit-unified-7d-status, anthropic-ratelimit-unified-7d-utilization, anthropic-ratelimit-unified-7d-reset, anthropic-ratelimit-unified-status, anthropic-ratelimit-unified-representative-claim, anthropic-ratelimit-unified-reset")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -387,6 +387,8 @@ func main() {
 	// (dashboard HTML), breaking profile validation, metrics, and remote settings.
 	handleProfileJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", "0bad747f-0000-4000-a000-000000000000")
+		w.Header().Set("anthropic-workspace-id", "wrkspc_0000000000000000000000000")
 		_, _ = w.Write([]byte(`{"account":{"uuid":"0bad747f-0000-4000-a000-000000000000","email_address":"user@claudgravity.local"},"organization":{"uuid":"0bad747f-0000-4000-a000-000000000000","name":"ClaudGravity Workspace"}}`))
 	}
 	handleValidateJSON := func(w http.ResponseWriter, r *http.Request) {
@@ -472,11 +474,7 @@ func main() {
 	// the real api.anthropic.com and hung for passthroughClient's full 30s
 	// timeout on any network that can't reach it (isolated/firewalled
 	// environments) — pure background telemetry, safe to just swallow.
-	interceptedMux.HandleFunc("/api/event_logging/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
+	interceptedMux.Handle("/api/event_logging/", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
 	// Same gap as /v1/messages and /v1/usage above: these five internal
 	// control endpoints were only ever registered on the plain dashboard
 	// mux, so an HTTPS_PROXY-only client fell through to PassthroughToReal
@@ -488,14 +486,21 @@ func main() {
 	interceptedMux.Handle("/api/claude_code/organizations/metrics_enabled", commonAPIMiddleware(http.HandlerFunc(handleMetricsJSON)))
 	interceptedMux.Handle("/api/claude_code/settings", commonAPIMiddleware(http.HandlerFunc(handleSettingsJSON)))
 	interceptedMux.Handle("/managed/settings", commonAPIMiddleware(http.HandlerFunc(handleSettingsJSON)))
+	interceptedMux.Handle("/v1/embeddings", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleEmbeddings(cfgMgr, w, r)
+	})))
 	interceptedMux.HandleFunc("/", PassthroughToReal)
 
 	proxySecret := cfgMgr.ProxySecret()
 
 	// Combined HTTP + HTTPS CONNECT Proxy root handler
 	rootHandler := recoverMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodConnect && mitmCA != nil {
-			HandleConnectTunnel(w, r, mitmCA, interceptedMux, proxySecret)
+		if r.Method == http.MethodConnect {
+			if mitmCA != nil {
+				HandleConnectTunnel(w, r, mitmCA, interceptedMux, proxySecret)
+			} else {
+				http.Error(w, "CONNECT proxy not available: MITM CA initialization failed", http.StatusBadGateway)
+			}
 			return
 		}
 		apiMux.ServeHTTP(w, r)
@@ -503,8 +508,10 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", serverCfg.Port)
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: rootHandler,
+		Addr:              addr,
+		Handler:           rootHandler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	LogGateway("[SuperRelay Gateway] Listening on http://localhost:%d (CONNECT proxy + plain API)", serverCfg.Port)
@@ -525,9 +532,11 @@ func main() {
 			LogGateway("[SuperRelay Gateway] Warning: could not mint gateway TLS cert: %v", err)
 		} else {
 			tlsSrv = &http.Server{
-				Addr:      fmt.Sprintf(":%d", tlsPort),
-				Handler:   recoverMiddleware(apiMux),
-				TLSConfig: &tls.Config{Certificates: []tls.Certificate{gwCert}},
+				Addr:              fmt.Sprintf(":%d", tlsPort),
+				Handler:           recoverMiddleware(apiMux),
+				TLSConfig:         &tls.Config{Certificates: []tls.Certificate{gwCert}},
+				ReadHeaderTimeout: 10 * time.Second,
+				IdleTimeout:       120 * time.Second,
 			}
 			go func() {
 				LogGateway("[SuperRelay Gateway] Listening on https://localhost:%d (TLS API, use as ANTHROPIC_BASE_URL)", tlsPort)
@@ -917,6 +926,9 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			}
 
 			if success || !isAntigravity {
+				break
+			}
+			if r.Context().Err() != nil {
 				break
 			}
 			errText := fmt.Sprint(lastErr)
@@ -1597,6 +1609,14 @@ func executeNonStreaming(
 	cwdKey := sessionID
 	if instanceID != "" {
 		cwdKey = sessionID + ":" + instanceID
+	}
+
+	if inTok > 0 {
+		if cacheTok > 0 {
+			setSessionCacheFraction(sessionID, float64(cacheTok)/float64(inTok))
+		} else if cacheCreationTok > 0 {
+			setSessionCacheFraction(sessionID, 0.85)
+		}
 	}
 
 	usageMap := map[string]interface{}{

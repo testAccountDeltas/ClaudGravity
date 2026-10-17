@@ -551,7 +551,7 @@ var unsupportedConstraints = []string{
 	"pattern", "minItems", "maxItems", "minProperties", "maxProperties", "format",
 	"default", "example", "examples", // Claude rejects these in VALIDATED mode
 	"prefixItems", "uniqueItems", "contains", "minContains", "maxContains",
-	"dependentRequired", "dependentSchemas", "contentEncoding", "contentMediaType",
+	"dependencies", "dependentRequired", "dependentSchemas", "contentEncoding", "contentMediaType",
 	"readOnly", "writeOnly", "deprecated",
 	"unevaluatedProperties", "unevaluatedItems", "$comment",
 	"if", "then", "else", "not",
@@ -593,7 +593,28 @@ func mergeAllOf(jsonStr string) string {
 				}
 				props.ForEach(func(key, value gjson.Result) bool {
 					destPath := joinPath(parentPath, "properties."+escapeGJSONPathKey(key.String()))
-					jsonStr, _ = sjson.SetRaw(jsonStr, destPath, value.Raw)
+					if !gjson.Get(jsonStr, destPath).Exists() {
+						jsonStr, _ = sjson.SetRaw(jsonStr, destPath, value.Raw)
+						return true
+					}
+					// Deep merge collision: preserve existing type if incoming lacks one, merge description hints
+					existingType := gjson.Get(jsonStr, destPath+".type").String()
+					incomingType := value.Get("type").String()
+					if existingType == "" && incomingType != "" {
+						jsonStr, _ = sjson.Set(jsonStr, destPath+".type", incomingType)
+					}
+					existingDesc := gjson.Get(jsonStr, destPath+".description").String()
+					incomingDesc := value.Get("description").String()
+					if incomingDesc != "" && incomingDesc != existingDesc {
+						jsonStr = appendHint(jsonStr, destPath, incomingDesc)
+					}
+					value.ForEach(func(attrKey, attrVal gjson.Result) bool {
+						k := attrKey.String()
+						if k != "description" && k != "type" && !gjson.Get(jsonStr, destPath+"."+k).Exists() {
+							jsonStr, _ = sjson.SetRaw(jsonStr, destPath+"."+k, attrVal.Raw)
+						}
+						return true
+					})
 					return true
 				})
 			}
@@ -987,10 +1008,9 @@ func addEmptySchemaPlaceholder(jsonStr string, openDictPaths map[string]bool) (s
 			// Add to required array
 			jsonStr, _ = sjson.Set(jsonStr, reqPath, []string{"reason"})
 
-			if openDictPaths[parentPath] {
-				if field, ok := strings.CutPrefix(parentPath, "properties."); ok && !strings.Contains(field, ".") {
-					nestedOpenDictFields = append(nestedOpenDictFields, unescapeGJSONPathKey(field))
-				}
+			if field, ok := strings.CutPrefix(parentPath, "properties."); ok {
+				argPath := strings.ReplaceAll(field, ".properties.", ".")
+				nestedOpenDictFields = append(nestedOpenDictFields, unescapeGJSONPathKey(argPath))
 			}
 		}
 		// Previously also force-added a bogus "_": {"type":"boolean"}
@@ -1049,7 +1069,14 @@ func walkForFields(value gjson.Result, path string, fields map[string]struct{}, 
 }
 
 func sortByDepth(paths []string) {
-	sort.Slice(paths, func(i, j int) bool { return len(paths[i]) > len(paths[j]) })
+	sort.Slice(paths, func(i, j int) bool {
+		depthI := strings.Count(paths[i], ".")
+		depthJ := strings.Count(paths[j], ".")
+		if depthI != depthJ {
+			return depthI > depthJ
+		}
+		return len(paths[i]) > len(paths[j])
+	})
 }
 
 func trimSuffix(path, suffix string) string {
@@ -1252,7 +1279,18 @@ func addMissingArrayItems(jsonStr string) string {
 			continue
 		}
 		itemsPath := joinPath(parentPath, "items")
-		if gjson.Get(jsonStr, itemsPath).Exists() {
+		itemsRes := gjson.Get(jsonStr, itemsPath)
+		if itemsRes.Exists() {
+			if itemsRes.IsArray() {
+				// Draft 7 tuple syntax: "items": [{"type": "string"}, {"type": "number"}]
+				// OpenAPI 3.0 requires "items" to be a single Schema object!
+				firstItem := "{}"
+				if len(itemsRes.Array()) > 0 {
+					firstItem = itemsRes.Array()[0].Raw
+				}
+				jsonStr = setRawAt(jsonStr, itemsPath, firstItem)
+				jsonStr = appendHint(jsonStr, parentPath, "Tuple items: "+itemsRes.Raw)
+			}
 			continue
 		}
 		jsonStr = setRawAt(jsonStr, itemsPath, "{}")

@@ -230,8 +230,17 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			requestedMaxOutputHint = 64000
 		}
 	}
+
+	// 1. Initial AST Sanitization (Middle Truncation 64KB, role repair, system extraction)
+	_, wasShrunk := SanitizeMessagesAndGraph(reqMap)
+
+	// Context Window Safety Truncation: runs AFTER initial sanitization so token budget
+	// is measured against middle-truncated outputs and deduplicated reads, preventing
+	// premature or unnecessary message dropping.
 	if dropped, truncated := TruncateConversationToFit(reqMap, modelName, requestedMaxOutputHint); truncated {
 		LogGateway("[ContextWindow] dropped %d oldest message(s) to fit %s's context window [%s]", dropped, modelName, agentKey)
+		// Re-sanitize to repair role alternation and orphaned tool calls created by dropping intermediate turns
+		SanitizeMessagesAndGraph(reqMap)
 	}
 
 	// 2. Loop-Guard Nudges (Read-Loop & Oscillation)
@@ -279,8 +288,10 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		LogGateway(".. %d consecutive Edit failures [%s] -> injecting edit-failure-loop nudge", editFailStreak, loopKey)
 	}
 
-	// 3. Full AST Sanitization (Middle Truncation 64KB, Non-empty sentinels, role repair, tool pairing)
-	_, wasShrunk := SanitizeMessagesAndGraph(reqMap)
+	// 3. Final graph validation after any loop-guard nudges
+	if _, didShrink := SanitizeMessagesAndGraph(reqMap); didShrink {
+		wasShrunk = true
+	}
 
 	// Re-serialize sanitized request
 	sanitizedBytes, err := json.Marshal(reqMap)

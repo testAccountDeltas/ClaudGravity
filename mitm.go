@@ -51,6 +51,7 @@ type MitmCA struct {
 	caPEM     []byte
 	caPEMPath string
 	certCache sync.Map
+	certMu    sync.Mutex
 }
 
 func InitMitmCA(caDir string) (*MitmCA, error) {
@@ -134,6 +135,13 @@ func (m *MitmCA) GetCAPath() string {
 }
 
 func (m *MitmCA) GetCertificate(domain string) (tls.Certificate, error) {
+	domain = strings.ToLower(domain)
+	if val, ok := m.certCache.Load(domain); ok {
+		return val.(tls.Certificate), nil
+	}
+
+	m.certMu.Lock()
+	defer m.certMu.Unlock()
 	if val, ok := m.certCache.Load(domain); ok {
 		return val.(tls.Certificate), nil
 	}
@@ -147,14 +155,21 @@ func (m *MitmCA) GetCertificate(domain string) (tls.Certificate, error) {
 	// DNSNames, when the client dials a bare IP (e.g. a remote server's
 	// public address), so a string match alone would still fail there.
 	dnsNames := []string{"localhost"}
-	ips := []net.IP{net.ParseIP("127.0.0.1")}
+	ips := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
 	if ip := net.ParseIP(domain); ip != nil {
 		ips = append(ips, ip)
 	} else {
 		dnsNames = append(dnsNames, domain)
 	}
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		serialNumber = big.NewInt(time.Now().UnixNano())
+	}
+
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   domain,
 			Organization: []string{"SuperRelay Internal Proxy"},
@@ -183,24 +198,34 @@ func (m *MitmCA) GetCertificate(domain string) (tls.Certificate, error) {
 
 // proxyAuthOK accepts the secret either as "Bearer <secret>" (manual
 // testing, curl --proxy-header) or as HTTP Basic auth with the secret as
-// the username (what every HTTP client sends when HTTPS_PROXY is set to
-// http://<secret>:x@host:port — the standard way to embed proxy
+// the username (or password) (what HTTP clients send when HTTPS_PROXY is set to
+// http://<secret>:x@host:port or http://:<secret>@host:port — the standard way to embed proxy
 // credentials in the proxy URL).
 func proxyAuthOK(r *http.Request, secret string) bool {
 	header := r.Header.Get("Proxy-Authorization")
-	if bearer, ok := strings.CutPrefix(header, "Bearer "); ok {
+	lower := strings.ToLower(header)
+	if strings.HasPrefix(lower, "bearer ") {
+		bearer := strings.TrimSpace(header[7:])
 		return subtle.ConstantTimeCompare([]byte(bearer), []byte(secret)) == 1
 	}
-	if encoded, ok := strings.CutPrefix(header, "Basic "); ok {
+	if strings.HasPrefix(lower, "basic ") {
+		encoded := strings.TrimSpace(header[6:])
 		decoded, err := base64.StdEncoding.DecodeString(encoded)
 		if err != nil {
 			return false
 		}
 		user := decoded
+		pass := []byte{}
 		if idx := bytes.IndexByte(decoded, ':'); idx >= 0 {
 			user = decoded[:idx]
+			pass = decoded[idx+1:]
 		}
-		return subtle.ConstantTimeCompare(user, []byte(secret)) == 1
+		if subtle.ConstantTimeCompare(user, []byte(secret)) == 1 {
+			return true
+		}
+		if len(pass) > 0 && subtle.ConstantTimeCompare(pass, []byte(secret)) == 1 {
+			return true
+		}
 	}
 	return false
 }
@@ -222,6 +247,11 @@ func isAnthropicHost(host string) bool {
 	return false
 }
 
+var cgnatSubnet = &net.IPNet{
+	IP:   net.IPv4(100, 64, 0, 0),
+	Mask: net.CIDRMask(10, 32),
+}
+
 // checkConnectTarget reports whether host resolves to a public, safe address.
 // It returns every verified safe IP (IPv4 addresses first — a dual-stack
 // DNS answer commonly lists AAAA before A, and a host with no outbound IPv6
@@ -241,7 +271,7 @@ func checkConnectTarget(host string) ([]net.IP, error) {
 		return nil, fmt.Errorf("no addresses found for %s", host)
 	}
 	for _, ip := range ips {
-		if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() || (ip.To4() != nil && cgnatSubnet.Contains(ip.To4())) {
 			return nil, fmt.Errorf("blocked target address: %s", ip)
 		}
 	}
@@ -309,10 +339,7 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 		clientConn = &bufferedConn{Conn: rawConn, r: io.MultiReader(rw.Reader, rawConn)}
 	}
 
-	// 1. Send 200 Connection Established to client
-	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	// 2. Intercept Anthropic and Claude API endpoints locally. isAnthropicHost
+	// 1. Intercept Anthropic and Claude API endpoints locally. isAnthropicHost
 	// does an exact-or-subdomain match, not a bare substring one — a raw
 	// strings.Contains would also match an unrelated host that merely
 	// contains "anthropic.com"/"claude.ai" as a substring (e.g.
@@ -322,18 +349,21 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 	if isAnthropicHost(host) {
 		tlsCert, err := ca.GetCertificate(host)
 		if err != nil {
+			_, _ = clientConn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n"))
 			clientConn.Close()
 			return
 		}
+		_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{tlsCert},
+			NextProtos:   []string{"http/1.1"},
 		}
 		tlsConn := tls.Server(clientConn, tlsConfig)
 		go serveInterceptedTLS(tlsConn, targetHandler)
 		return
 	}
 
-	// 3. Transparent TCP tunnel for all other external hosts. Dial a
+	// 2. Transparent TCP tunnel for all other external hosts. Dial a
 	// pre-verified IP (never re-resolving the hostname) to prevent TOCTOU
 	// DNS rebinding SSRF attacks, falling through the rest of the verified
 	// list if the first (IPv4-preferred) address is unreachable from this
@@ -351,9 +381,14 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 		}
 	}
 	if err != nil {
+		LogGateway("[SuperRelay Gateway] Failed to dial tunnel target %s:%s: %v", host, port, err)
+		_, _ = clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		clientConn.Close()
 		return
 	}
+
+	// Connection successfully established to remote target
+	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	// Guard against either side going silent forever and leaking the
 	// goroutines/fds indefinitely (e.g. a client that opens a tunnel and
 	// never sends anything) — but net.Conn.SetDeadline is an ABSOLUTE
@@ -494,7 +529,11 @@ func serveInterceptedTLS(tlsConn *tls.Conn, handler http.Handler) {
 func PassthroughToReal(w http.ResponseWriter, r *http.Request) {
 	target := *r.URL
 	target.Scheme = "https"
-	target.Host = r.Host
+	if isAnthropicHost(r.Host) {
+		target.Host = r.Host
+	} else {
+		target.Host = "api.anthropic.com"
+	}
 
 	// r.Body is a one-shot io.ReadCloser; http.NewRequest only wires up
 	// GetBody automatically for *bytes.Reader/*bytes.Buffer/*strings.Reader,
@@ -569,7 +608,7 @@ func HandleBootstrapSpoof(w http.ResponseWriter, r *http.Request) {
 			"override_user_selection": false,
 		},
 		"oauth_account": map[string]interface{}{
-			"account_uuid":                 nil,
+			"account_uuid":                 "0bad747f-0000-4000-a000-000000000000",
 			"account_email":                "user@claudgravity.local",
 			"organization_uuid":            fakeOrgID,
 			"organization_name":            "ClaudGravity Workspace",

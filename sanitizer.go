@@ -27,6 +27,9 @@ func extractPlainText(content interface{}) string {
 		for _, b := range c {
 			if b["type"] == "text" {
 				if t, ok := b["text"].(string); ok {
+					if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") {
+						sb.WriteString("\n")
+					}
 					sb.WriteString(t)
 				}
 			}
@@ -39,6 +42,9 @@ func extractPlainText(content interface{}) string {
 			}
 			if b["type"] == "text" {
 				if t, ok := b["text"].(string); ok {
+					if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") {
+						sb.WriteString("\n")
+					}
 					sb.WriteString(t)
 				}
 			}
@@ -123,6 +129,9 @@ func dedupedRepeatedReads(newMsgs []map[string]interface{}) bool {
 					}
 					if limit := input["limit"]; limit != nil {
 						key = fmt.Sprintf("%s:lim=%v", key, limit)
+					}
+					if pages := input["pages"]; pages != nil {
+						key = fmt.Sprintf("%s:pages=%v", key, pages)
 					}
 					toolIDToPath[id] = key
 				}
@@ -453,12 +462,28 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 		mContent := m["content"].([]map[string]interface{})
 		var toolUseBlocks []map[string]interface{}
 		var synths []map[string]interface{}
+		nextIsUser := i+1 < len(newMsgs) && newMsgs[i+1]["role"] == "user"
+
+		nextTurnResultIDs := make(map[string]bool)
+		if nextIsUser {
+			for _, b := range newMsgs[i+1]["content"].([]map[string]interface{}) {
+				if b["type"] == "tool_result" {
+					if tid, ok := b["tool_use_id"].(string); ok && tid != "" {
+						nextTurnResultIDs[tid] = true
+					}
+				}
+			}
+		}
+
 		for _, b := range mContent {
 			if b["type"] != "tool_use" {
 				continue
 			}
 			toolUseBlocks = append(toolUseBlocks, b)
-			if id, ok := b["id"].(string); ok && id != "" && !toolResultsSeen[id] {
+			// Gemini requires every functionCall in turn N to be answered in turn N+1.
+			// If not answered in newMsgs[i+1], synthesize a recovery stub immediately
+			// so turn N+1 matches, even if the real result arrives delayed in turn N+3.
+			if id, ok := b["id"].(string); ok && id != "" && !nextTurnResultIDs[id] {
 				synths = append(synths, map[string]interface{}{
 					"type":        "tool_result",
 					"tool_use_id": id,
@@ -466,7 +491,6 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 				})
 			}
 		}
-		nextIsUser := i+1 < len(newMsgs) && newMsgs[i+1]["role"] == "user"
 		if len(toolUseBlocks) == 0 {
 			// This assistant turn made no tool_use at all, so it has
 			// nothing to answer — but the client may still have put a

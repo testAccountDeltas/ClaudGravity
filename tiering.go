@@ -23,10 +23,13 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 		strings.HasPrefix(model, "claude-fable") || strings.HasPrefix(model, "claude-mythos") {
 		// Canonical mapping matching Python relay-proxy: Opus maps to gemini-3.8-flash-tiered
 		model = "gemini-3.8-flash-tiered"
-	} else if strings.HasPrefix(model, "claude-sonnet") || strings.HasPrefix(model, "claude-3-5-sonnet") || strings.HasPrefix(model, "claude-3-7-sonnet") {
+	} else if strings.HasPrefix(model, "claude-sonnet") || strings.HasPrefix(model, "claude-3-5-sonnet") || strings.HasPrefix(model, "claude-3-7-sonnet") || strings.HasPrefix(model, "claude-3-sonnet") {
 		model = "gemini-3.8-flash-medium"
 	} else if strings.HasPrefix(model, "claude-haiku") || strings.HasPrefix(model, "claude-3-5-haiku") || strings.HasPrefix(model, "claude-3-haiku") {
 		model = "gemini-2.5-flash"
+	} else if !strings.HasPrefix(model, "gemini-") {
+		// Fallback for unmapped or legacy models (claude-2.1, claude-instant, etc.)
+		model = "gemini-3.8-flash-tiered"
 	}
 
 	effort := ""
