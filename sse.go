@@ -182,9 +182,17 @@ func (s *SSEStreamer) EnsureMessageStart() error {
 			"model":         s.model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
+			// Gemini's own usageMetadata (real cache split) only arrives in
+			// the stream's last chunk, so these two can't be predicted
+			// honestly this early — present as the documented shape with
+			// 0 rather than omitted, in case a strict SDK expects the
+			// fields to exist at message_start even before they're
+			// corrected via message_delta.
 			"usage": map[string]interface{}{
-				"input_tokens":  s.estInputTokens,
-				"output_tokens": 0,
+				"input_tokens":                s.estInputTokens,
+				"output_tokens":               0,
+				"cache_creation_input_tokens": 0,
+				"cache_read_input_tokens":     0,
 			},
 		},
 	}
@@ -310,6 +318,16 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSig
 	if repaired, ok := RepairEditToolCall(name, argsRaw, s.sessionID); ok {
 		argsRaw = repaired
 	}
+	switch strings.ToLower(name) {
+	case "grep":
+		if repaired, ok := RepairGrepToolCall(argsRaw); ok {
+			argsRaw = repaired
+		}
+	case "glob":
+		if repaired, ok := RepairGlobToolCall(argsRaw); ok {
+			argsRaw = repaired
+		}
+	}
 	if s.syntheticReasonTools[name] {
 		// This tool's Gemini-bound schema only has a "reason" property
 		// because its real schema had none at all (addEmptySchemaPlaceholder
@@ -386,15 +404,15 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 
 	// A mid-generation safety cutoff with nothing produced yet is the same
 	// silent-failure shape as the promptFeedback block above, just arriving
-	// as a candidate's finishReason instead of a top-level field — tell the
-	// client instead of completing a textless turn as a normal "end_turn".
-	// If some content DID stream before the cutoff, let it through as-is:
-	// the client has something to show, which beats discarding it.
-	if finishReason == "SAFETY" && !s.toolUseOccurred && s.textChars == 0 && s.thinkingChars == 0 {
-		errPayload := `{"type":"error","error":{"type":"api_error","message":"Google safety filters stopped generation (finishReason: SAFETY) before any content was produced"}}`
-		_ = s.SendRaw("error", errPayload)
-		return fmt.Errorf("generation stopped by Google safety filters")
-	}
+	// as a candidate's finishReason instead of a top-level field. Anthropic
+	// has a real stop_reason for exactly this ("refusal") — ending the turn
+	// cleanly with it is friendlier to a client than aborting the whole
+	// stream with event:error, since the client still gets a complete,
+	// well-formed message it can display ("the model declined to answer")
+	// instead of a hard stream failure. If some content DID stream before
+	// the cutoff, let it through as end_turn: the client has something to
+	// show, which beats discarding it.
+	isEmptyRefusal := finishReason == "SAFETY" && !s.toolUseOccurred && s.textChars == 0 && s.thinkingChars == 0
 
 	// MAX_TOKENS must win over tool_use: toolUseOccurred only means a
 	// functionCall part was seen, not that it arrived complete. If
@@ -403,7 +421,9 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	// reporting "tool_use" here hides that and the client sees a plain
 	// JSON syntax error instead of a clear "hit the length limit".
 	stopReason := "end_turn"
-	if finishReason == "MAX_TOKENS" {
+	if isEmptyRefusal {
+		stopReason = "refusal"
+	} else if finishReason == "MAX_TOKENS" {
 		stopReason = "max_tokens"
 	} else if s.toolUseOccurred {
 		stopReason = "tool_use"
@@ -508,7 +528,13 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 		if msg == "" {
 			msg = errNode.Raw
 		}
-		errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":%q}}`, "Upstream stream error: "+msg)
+		// Google's in-band error code mirrors HTTP status semantics (429,
+		// 503, etc.) even though the outer HTTP response was 200 OK — map
+		// it the same way as a real HTTP failure so the client's SDK knows
+		// whether this is retryable instead of seeing a generic api_error
+		// for everything.
+		errType := anthropicErrorTypeForStatus(int(errNode.Get("code").Int()))
+		errPayload := fmt.Sprintf(`{"type":"error","error":{"type":%q,"message":%q}}`, errType, "Upstream stream error: "+msg)
 		_ = s.SendRaw("error", errPayload)
 		return fmt.Errorf("upstream stream error: %s", msg)
 	}

@@ -438,6 +438,17 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							part, _ = sjson.Set(part, "text", thoughtTxt)
 							partsJSON = append(partsJSON, part)
 						}
+					case "redacted_thinking":
+						// Opaque, encrypted — Gemini has no equivalent and
+						// there's nothing real to translate (this only
+						// shows up at all if history was imported from a
+						// genuine Anthropic/Claude conversation, since this
+						// gateway's own responses never produce one). Keep
+						// the turn's structure intact with a placeholder
+						// instead of silently dropping it, which could
+						// otherwise leave an assistant turn with zero parts.
+						part := `{"thought":true,"thoughtSignature":"skip_thought_signature_validator","text":"[Prior reasoning redacted]"}`
+						partsJSON = append(partsJSON, part)
 					}
 					return true
 				})

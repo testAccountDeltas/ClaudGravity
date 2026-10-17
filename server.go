@@ -114,8 +114,38 @@ func recoverMiddleware(next http.Handler) http.Handler {
 // responses was using — a client SDK that checks Content-Type before
 // attempting to parse a 4xx/5xx body (as Anthropic's own TypeScript SDK
 // does) never even tries to read the structured error out of it.
+// anthropicErrorTypeForStatus maps an HTTP status to the error type real
+// Anthropic SDKs key their auto-retry logic on. The one call site that used
+// to hardcode "api_error" regardless of status (the final give-up after the
+// account-rotation loop exhausts retries) meant a 429 (quota) or 503/502/504
+// (upstream overloaded) got surfaced as a type SDKs don't know to retry —
+// they'd hard-fail instead of backing off and trying again.
+func anthropicErrorTypeForStatus(status int) string {
+	switch status {
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return "overloaded_error"
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	default:
+		return "api_error"
+	}
+}
+
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
 	w.Header().Set("Content-Type", "application/json")
+	if status == http.StatusTooManyRequests {
+		w.Header().Set("Retry-After", "5")
+	} else if status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout {
+		w.Header().Set("Retry-After", "3")
+	}
 	w.WriteHeader(status)
 	body, _ := json.Marshal(map[string]interface{}{
 		"type": "error",
@@ -637,7 +667,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	// If all attempts failed and nothing was sent yet
 	if lastErr != nil {
 		LogGateway("[#%d] !! All pre-stream failover attempts failed: %v", rid, lastErr)
-		writeAnthropicError(w, lastStatus, "api_error", fmt.Sprintf("Upstream failed after retries: %v", lastErr))
+		writeAnthropicError(w, lastStatus, anthropicErrorTypeForStatus(lastStatus), fmt.Sprintf("Upstream failed after retries: %v", lastErr))
 	}
 }
 
@@ -872,7 +902,7 @@ UpstreamReady:
 
 		// Headers already sent: report SSE error block
 		wMu.Lock()
-		errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":"Upstream HTTP %d: %s"}}`, upResp.StatusCode, string(respBytes))
+		errPayload := fmt.Sprintf(`{"type":"error","error":{"type":%q,"message":"Upstream HTTP %d: %s"}}`, anthropicErrorTypeForStatus(upResp.StatusCode), upResp.StatusCode, string(respBytes))
 		_, _ = w.Write([]byte(fmt.Sprintf("event: error\ndata: %s\n\n", errPayload)))
 		flusher.Flush()
 		wMu.Unlock()
@@ -1130,6 +1160,16 @@ func executeNonStreaming(
 					if repairedArgs, ok := RepairEditToolCall(fname, argsRaw, sessionID); ok {
 						argsRaw = repairedArgs
 					}
+					switch strings.ToLower(fname) {
+					case "grep":
+						if repaired, ok := RepairGrepToolCall(argsRaw); ok {
+							argsRaw = repaired
+						}
+					case "glob":
+						if repaired, ok := RepairGlobToolCall(argsRaw); ok {
+							argsRaw = repaired
+						}
+					}
 					if syntheticReasonTools[fname] {
 						// Same synthetic-placeholder cleanup as sse.go's
 						// HandleFunctionCall — see there for the full
@@ -1285,16 +1325,44 @@ var knownModels = []map[string]interface{}{
 	{"id": "claude-opus-4-6-thinking", "object": "model", "display_name": "Claude Opus 4.6 Thinking"},
 }
 
+// allModels merges the static Claude-alias/canonical-Gemini-name list with
+// whatever real Gemini sub-models globalModelCatalog actually fetched from
+// Google at startup (gemini-3.8-flash-high/-medium/-low/-tiered etc.) —
+// previously only the hardcoded list existed, so a client asking about one
+// of tiering.go's own real target models got a 404 for a model this gateway
+// was actively routing requests to.
+func allModels() []map[string]interface{} {
+	seen := make(map[string]bool, len(knownModels))
+	out := make([]map[string]interface{}, 0, len(knownModels))
+	for _, m := range knownModels {
+		out = append(out, m)
+		seen[m["id"].(string)] = true
+	}
+	for _, m := range globalModelCatalog.GetAll() {
+		if m.ID == "" || seen[m.ID] {
+			continue
+		}
+		seen[m.ID] = true
+		out = append(out, map[string]interface{}{
+			"id":           m.ID,
+			"object":       "model",
+			"display_name": m.DisplayName,
+		})
+	}
+	return out
+}
+
 func handleModels(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
+	models := allModels()
 	resp := map[string]interface{}{
 		"object": "list",
-		"data":   knownModels,
+		"data":   models,
 		// This gateway's whole catalog fits in one page — has_more is
 		// always false, but the fields themselves are still expected by
 		// the official SDKs' pagination handling.
 		"has_more": false,
-		"first_id": knownModels[0]["id"],
-		"last_id":  knownModels[len(knownModels)-1]["id"],
+		"first_id": models[0]["id"],
+		"last_id":  models[len(models)-1]["id"],
 	}
 	b, _ := json.Marshal(resp)
 	w.Header().Set("Content-Type", "application/json")
@@ -1303,7 +1371,7 @@ func handleModels(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request)
 
 func handleModelByID(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	for _, m := range knownModels {
+	for _, m := range allModels() {
 		if m["id"] == id {
 			b, _ := json.Marshal(m)
 			w.Header().Set("Content-Type", "application/json")
@@ -1571,6 +1639,25 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 
 	header.Set("anthropic-ratelimit-unified-overage-status", "rejected")
 	header.Set("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled")
+
+	// Claude Code only ever reads the anthropic-ratelimit-unified-* headers
+	// above, but any generic Anthropic SDK client (Python/TS) or external
+	// tool pointed at this gateway reads the standard per-window headers
+	// instead and sees none of them without this — it has no rate-limit
+	// visibility at all, just an unexplained 429 when it eventually hits
+	// one. Google CloudCode doesn't expose real absolute request/token
+	// quota numbers (only fractions-remaining), so these use the same
+	// round synthetic ceiling the unified headers' own fake org/workspace
+	// IDs already rely on — honest about utilization, not a real count.
+	if fiveHourBucket != nil {
+		const reqLimit, tokLimit = 1000, 1000000
+		header.Set("anthropic-ratelimit-requests-limit", fmt.Sprintf("%d", reqLimit))
+		header.Set("anthropic-ratelimit-requests-remaining", fmt.Sprintf("%d", int(float64(reqLimit)*(1-fiveHourFrac))))
+		header.Set("anthropic-ratelimit-requests-reset", fmt.Sprintf("%d", fiveHourReset))
+		header.Set("anthropic-ratelimit-tokens-limit", fmt.Sprintf("%d", tokLimit))
+		header.Set("anthropic-ratelimit-tokens-remaining", fmt.Sprintf("%d", int(float64(tokLimit)*(1-fiveHourFrac))))
+		header.Set("anthropic-ratelimit-tokens-reset", fmt.Sprintf("%d", fiveHourReset))
+	}
 
 	// A real account's every response (bootstrap, oauth/usage, /v1/messages)
 	// carries the SAME anthropic-organization-id/anthropic-workspace-id —

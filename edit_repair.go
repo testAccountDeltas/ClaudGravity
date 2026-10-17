@@ -541,3 +541,79 @@ func findFuzzyLineMatch(fileContent, oldStr string) (string, bool) {
 
 	return "", false
 }
+
+// RepairGrepToolCall and RepairGlobToolCall catch the specific ways Gemini
+// mangles these two tools' calls — confirmed independently in a sibling
+// project (opencode, same Gemini models): the model reliably drops or
+// misplaces the one required "pattern" field on a multi-field search tool,
+// while a single general shell command string never has this problem. Not
+// wired to any live behavior change by itself — strip_search_tools stays
+// true by default (see README.md) until there's been real traffic through
+// this repair pass to build confidence in it.
+
+// RepairGrepToolCall fixes: (1) the model passing a bare JSON string instead
+// of an object — wrapped as {"pattern": <string>}; (2) a missing/empty
+// "pattern" with the search term sitting in "path" instead (path containing
+// glob/regex metacharacters, or no path separator at all, is the tell).
+func RepairGrepToolCall(argsRaw string) (string, bool) {
+	parsed := gjson.Parse(argsRaw)
+	if !parsed.Exists() {
+		return argsRaw, false
+	}
+	if parsed.Type == gjson.String {
+		s := parsed.String()
+		if s == "" {
+			return argsRaw, false
+		}
+		fixed, _ := sjson.Set(`{}`, "pattern", s)
+		return fixed, true
+	}
+	if !parsed.IsObject() {
+		return argsRaw, false
+	}
+
+	pattern := parsed.Get("pattern").String()
+	path := parsed.Get("path").String()
+	if pattern != "" {
+		return argsRaw, false
+	}
+	if path != "" && (strings.ContainsAny(path, "*?[]()|^$+\\") || !strings.ContainsAny(path, "/\\")) {
+		fixed, _ := sjson.Set(argsRaw, "pattern", path)
+		fixed, _ = sjson.Delete(fixed, "path")
+		return fixed, true
+	}
+	return argsRaw, false
+}
+
+// RepairGlobToolCall fixes the same missing/misplaced "pattern" issue for
+// Glob — its search term is a filename glob (e.g. "**/*.go") rather than a
+// regex, so the "looks like a pattern" heuristic checks glob wildcards.
+func RepairGlobToolCall(argsRaw string) (string, bool) {
+	parsed := gjson.Parse(argsRaw)
+	if !parsed.Exists() {
+		return argsRaw, false
+	}
+	if parsed.Type == gjson.String {
+		s := parsed.String()
+		if s == "" {
+			return argsRaw, false
+		}
+		fixed, _ := sjson.Set(`{}`, "pattern", s)
+		return fixed, true
+	}
+	if !parsed.IsObject() {
+		return argsRaw, false
+	}
+
+	pattern := parsed.Get("pattern").String()
+	path := parsed.Get("path").String()
+	if pattern != "" {
+		return argsRaw, false
+	}
+	if path != "" && strings.ContainsAny(path, "*?[]") {
+		fixed, _ := sjson.Set(argsRaw, "pattern", path)
+		fixed, _ = sjson.Delete(fixed, "path")
+		return fixed, true
+	}
+	return argsRaw, false
+}
