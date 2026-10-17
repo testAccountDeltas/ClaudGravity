@@ -85,6 +85,7 @@ func init() {
 		defer ticker.Stop()
 		for range ticker.C {
 			sweepStaleToolSignatures()
+			sweepStaleSessionCacheFractions()
 		}
 	}()
 }
@@ -115,6 +116,54 @@ func getToolSignature(callID string) string {
 	toolSignatureMu.Lock()
 	defer toolSignatureMu.Unlock()
 	return toolSignatureMap[callID]
+}
+
+// sessionCacheFraction remembers, per session (keyed the same way cwdKey/
+// loopKey already are), the last REAL cache_read/input_tokens ratio this
+// conversation saw at the end of a turn. message_start has to guess its
+// usage numbers before Gemini has even started generating — Google's real
+// cache split only arrives in the stream's last chunk — so it always sent
+// cache_read_input_tokens:0 there. Official Anthropic SDKs latch
+// input_tokens/cache_read_input_tokens from message_start only and never
+// update them from message_delta's real values, so every client built on
+// one of those SDKs displayed a permanent 0% cache hit rate regardless of
+// the real (correct) numbers later turns' message_delta carried. Guessing
+// from the PREVIOUS turn's real ratio is the best available estimate for
+// a conversation that's actively warm — still corrected to the real
+// number in message_delta for anything that reads that instead.
+var (
+	sessionCacheFractionMu   sync.Mutex
+	sessionCacheFractionMap  = make(map[string]float64)
+	sessionCacheFractionSeen = make(map[string]time.Time)
+)
+
+func sweepStaleSessionCacheFractions() {
+	sessionCacheFractionMu.Lock()
+	defer sessionCacheFractionMu.Unlock()
+	cutoff := time.Now().Add(-toolSignatureStaleAfter)
+	for id, t := range sessionCacheFractionSeen {
+		if t.Before(cutoff) {
+			delete(sessionCacheFractionSeen, id)
+			delete(sessionCacheFractionMap, id)
+		}
+	}
+}
+
+func setSessionCacheFraction(sessionID string, frac float64) {
+	if sessionID == "" {
+		return
+	}
+	sessionCacheFractionMu.Lock()
+	defer sessionCacheFractionMu.Unlock()
+	sessionCacheFractionMap[sessionID] = frac
+	sessionCacheFractionSeen[sessionID] = time.Now()
+}
+
+func getSessionCacheFraction(sessionID string) (float64, bool) {
+	sessionCacheFractionMu.Lock()
+	defer sessionCacheFractionMu.Unlock()
+	f, ok := sessionCacheFractionMap[sessionID]
+	return f, ok
 }
 
 type SSEStreamer struct {
@@ -208,6 +257,25 @@ func (s *SSEStreamer) EnsureMessageStart() error {
 		return nil
 	}
 	s.hasStarted = true
+	// Gemini's own usageMetadata (real cache split) only arrives in the
+	// stream's LAST chunk, so the true split can't be known this early —
+	// but official Anthropic SDKs latch input_tokens/cache_read_input_tokens
+	// from message_start ONLY and never revise them from message_delta's
+	// real numbers later, so always sending 0 here left every one of those
+	// clients permanently displaying 0% cache hit regardless of the correct
+	// numbers message_delta carried at the end. Guess from this same
+	// session's last turn (an actively warm conversation's cache fraction
+	// doesn't usually swing much turn to turn) when one is on record;
+	// message_delta still corrects to the real number either way.
+	cachedEstimate := int64(0)
+	uncachedEstimate := int64(s.estInputTokens)
+	if frac, ok := getSessionCacheFraction(s.sessionID); ok && frac > 0 {
+		cachedEstimate = int64(float64(s.estInputTokens) * frac)
+		uncachedEstimate = int64(s.estInputTokens) - cachedEstimate
+		if uncachedEstimate < 0 {
+			uncachedEstimate = 0
+		}
+	}
 	startPayload := map[string]interface{}{
 		"type": "message_start",
 		"message": map[string]interface{}{
@@ -218,17 +286,11 @@ func (s *SSEStreamer) EnsureMessageStart() error {
 			"model":         s.model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			// Gemini's own usageMetadata (real cache split) only arrives in
-			// the stream's last chunk, so these two can't be predicted
-			// honestly this early — present as the documented shape with
-			// 0 rather than omitted, in case a strict SDK expects the
-			// fields to exist at message_start even before they're
-			// corrected via message_delta.
 			"usage": map[string]interface{}{
-				"input_tokens":                s.estInputTokens,
+				"input_tokens":                uncachedEstimate,
 				"output_tokens":               0,
 				"cache_creation_input_tokens": 0,
-				"cache_read_input_tokens":     0,
+				"cache_read_input_tokens":     cachedEstimate,
 			},
 		},
 	}
@@ -567,6 +629,11 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	uncachedInputTokens := s.inputTokens - s.cacheTokens
 	if uncachedInputTokens < 0 {
 		uncachedInputTokens = 0
+	}
+	// Record this turn's real cache fraction for the NEXT turn's
+	// message_start estimate (see EnsureMessageStart).
+	if s.inputTokens > 0 {
+		setSessionCacheFraction(s.sessionID, float64(s.cacheTokens)/float64(s.inputTokens))
 	}
 	// Gemini never reports a distinct "tokens newly written to cache"
 	// counter — only cachedContentTokenCount (tokens actually READ from an

@@ -626,10 +626,23 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			}
 
 			if len(followUpImages) > 0 {
-				// A functionResponse turn's images, as their own
-				// immediately-following plain "user" turn — unambiguously
-				// valid Gemini syntax, unlike nesting them under
-				// functionResponse.parts (see sealFunctionResponseTurn).
+				// The turn right before this one (the functionResponse
+				// turn these images came out of) is ALSO role "user" —
+				// Gemini's tools/results always live on the user side,
+				// the same way Claude's tool_result does. Appending this
+				// image turn as role "user" too put two consecutive
+				// "user" entries in contents[], which Gemini's strict
+				// user/model alternation rejects outright with 400
+				// "multiturn requests alternate between user and model
+				// roles" — turning every tool call that returns an image
+				// into a guaranteed crash instead of just a lost image.
+				// A one-line synthetic model turn in between restores
+				// alternation.
+				out, _ = sjson.Set(out, fmt.Sprintf("contents.%d.role", contentIdx), "model")
+				ackPart := `{"text":"Tool output received. Processing visual data."}`
+				out, _ = sjson.SetRaw(out, fmt.Sprintf("contents.%d.parts.-1", contentIdx), ackPart)
+				contentIdx++
+
 				out, _ = sjson.Set(out, fmt.Sprintf("contents.%d.role", contentIdx), "user")
 				notePart := `{"text":"Visual output from the previous tool call:"}`
 				out, _ = sjson.SetRaw(out, fmt.Sprintf("contents.%d.parts.-1", contentIdx), notePart)
