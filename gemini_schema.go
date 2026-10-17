@@ -88,6 +88,18 @@ func walkSchemaForNumericEnums(props gjson.Result, prefix string, fields map[str
 		if val.Get("properties").IsObject() {
 			walkSchemaForNumericEnums(val.Get("properties"), path, fields)
 		}
+		// An array of a numeric/boolean enum (e.g. "ports": {"type":"array",
+		// "items":{"type":"integer","enum":[80,443]}}) needs its own marker
+		// — each element lives at its own index, not at `path` itself — so
+		// coerceNumericEnumArgs knows to walk the array instead of reading
+		// `path` as a single scalar.
+		if t == "array" {
+			items := val.Get("items")
+			itemType := items.Get("type").String()
+			if items.Get("enum").IsArray() && (itemType == "integer" || itemType == "number" || itemType == "boolean") {
+				fields[path] = "array:" + itemType
+			}
+		}
 		return true
 	})
 }
@@ -100,6 +112,33 @@ func coerceNumericEnumArgs(toolName, argsRaw string) string {
 	fields := numericEnumFields[toolName]
 	numericEnumFieldsMu.Unlock()
 	for field, origType := range fields {
+		if itemType, ok := strings.CutPrefix(origType, "array:"); ok {
+			arr := gjson.Get(argsRaw, field)
+			if !arr.IsArray() {
+				continue
+			}
+			for i, el := range arr.Array() {
+				if el.Type != gjson.String {
+					continue
+				}
+				idxPath := fmt.Sprintf("%s.%d", field, i)
+				switch itemType {
+				case "integer":
+					if n, err := strconv.ParseInt(el.String(), 10, 64); err == nil {
+						argsRaw, _ = sjson.Set(argsRaw, idxPath, n)
+					}
+				case "number":
+					if f, err := strconv.ParseFloat(el.String(), 64); err == nil {
+						argsRaw, _ = sjson.Set(argsRaw, idxPath, f)
+					}
+				case "boolean":
+					if b, err := strconv.ParseBool(el.String()); err == nil {
+						argsRaw, _ = sjson.Set(argsRaw, idxPath, b)
+					}
+				}
+			}
+			continue
+		}
 		v := gjson.Get(argsRaw, field)
 		if v.Type != gjson.String {
 			continue

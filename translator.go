@@ -427,7 +427,14 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							if rest, ok := strings.CutPrefix(toolUseID, "toolu_"); ok {
 								segs := strings.Split(rest, "_")
 								end := len(segs)
-								for end > 0 && isAllHexDigits(segs[end-1]) {
+								// nextToolCallID always appends EXACTLY two trailing
+								// segments (a hex nanosecond timestamp, a hex sequence
+								// number) after the name -- an open-ended strip loop
+								// could also eat a real trailing segment of the tool's
+								// own name that happens to look hex ("tool_v2_1": "1" is
+								// valid hex, stripping it left "tool_v2" instead of the
+								// real name). Stop at exactly two.
+								for stripped := 0; end > 0 && stripped < 2 && isAllHexDigits(segs[end-1]); stripped++ {
 									end--
 								}
 								if end > 0 {
@@ -506,16 +513,19 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							part, _ = sjson.Set(part, "functionResponse.id", toolUseID)
 						}
 						part, _ = sjson.Set(part, "functionResponse.response."+responseField, resText)
-						// Images must nest inside functionResponse.parts, not
-						// sit as sibling parts of this turn — Gemini requires
-						// a turn carrying a functionResponse to contain ONLY
-						// functionResponse parts; a bare inlineData sibling
-						// here is the exact same violation as a bare text
-						// sibling would be.
-						if len(imageParts) > 0 {
-							part, _ = sjson.SetRaw(part, "functionResponse.parts", "["+strings.Join(imageParts, ",")+"]")
-						}
 						partsJSON = append(partsJSON, part)
+						// Append any images from THIS tool_result as sibling
+						// top-level parts (not nested under
+						// functionResponse.parts, which real Gemini
+						// FunctionResponse messages don't have — Google
+						// silently drops unknown fields, losing the image
+						// entirely). sealFunctionResponseTurn below sees
+						// these as "other" parts mixed into the turn and
+						// moves them into a separate following plain "user"
+						// turn, the same way it already handles a stray
+						// image/document Claude content block sitting
+						// alongside a tool_result at the message level.
+						partsJSON = append(partsJSON, imageParts...)
 
 					case "thinking":
 						thoughtTxt := p.Get("thinking").String()
@@ -674,8 +684,16 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				return true
 			}
 			desc := t.Get("description").String()
-			recordNumericEnumFields(name, t.Get("input_schema").Raw)
-			schemaRaw := CleanJSONSchemaForAntigravity(name, t.Get("input_schema").Raw)
+			// A field declared via "const" (e.g. a Pydantic Literal) has no
+			// "enum" key yet at this point — recordNumericEnumFields only
+			// looks for "enum", and CleanJSONSchemaForAntigravity below is
+			// what actually promotes const into enum, internally, after
+			// this already ran. Run that one promotion pass first so a
+			// numeric/boolean const is recorded for restoration same as a
+			// real enum.
+			rawSchema := t.Get("input_schema").Raw
+			recordNumericEnumFields(name, convertConstToEnum(rawSchema))
+			schemaRaw := CleanJSONSchemaForAntigravity(name, rawSchema)
 			if strings.TrimSpace(schemaRaw) == "" || schemaRaw == "null" {
 				// Google rejects an OBJECT-type schema with empty properties
 				// ("parameters.properties: should be non-empty for OBJECT

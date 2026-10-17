@@ -143,6 +143,7 @@ type SSEStreamer struct {
 	toolCallIDs          []string
 	hasFinished          bool
 	thoughtSignature     string          // most recent thoughtSignature seen for the open thinking block, flushed as signature_delta on close
+	thinkingFinished     bool            // true once a thinking block has been opened and closed — Anthropic allows at most one, so a later "thought" chunk (Gemini can interleave thought->text->thought) must not reopen a second one
 	estInputTokens       int             // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
 	preferRussian        bool            // conversation's own language, detected from the user's latest message — picks which language gateway-synthesized text (grounding footer) uses, since that text bypasses the model entirely
 	syntheticReasonTools map[string]bool // tool names whose Gemini-bound schema got our synthetic "reason" placeholder injected (translator.go); that key is stripped back out of the model's actual function-call args before handing them to Claude Code
@@ -246,6 +247,7 @@ func (s *SSEStreamer) closeCurrentBlock() error {
 	// path (translator.go) in the first place, since the real signature was
 	// never captured and forwarded. Flush whatever we saw.
 	if s.currentType == TypeThinking {
+		s.thinkingFinished = true
 		sig := s.thoughtSignature
 		if sig == "" {
 			// A thinking block with no signature at all isn't a smaller
@@ -285,6 +287,14 @@ func (s *SSEStreamer) closeCurrentBlock() error {
 func (s *SSEStreamer) HandleThinking(text string, thoughtSignature string) error {
 	if err := s.EnsureMessageStart(); err != nil {
 		return err
+	}
+	if s.thinkingFinished && s.currentType != TypeThinking {
+		// Gemini can interleave thought -> text -> thought within one
+		// candidate; Anthropic allows at most one "thinking" block and it
+		// must be first. A second one a strict SDK's schema validation
+		// rejects outright, so once the first has closed, fold any further
+		// "thought" chunks into plain text instead of reopening one.
+		return s.HandleText(text)
 	}
 	if s.currentType != TypeThinking {
 		if err := s.closeCurrentBlock(); err != nil {

@@ -342,7 +342,7 @@ func main() {
 		if r.Method == http.MethodPost {
 			handleMessages(cfgMgr, w, r)
 		} else {
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method Not Allowed")
 		}
 	})
 	mux.HandleFunc("/v1/messages/count_tokens", func(w http.ResponseWriter, r *http.Request) {
@@ -399,7 +399,7 @@ func main() {
 		if r.Method == http.MethodPost {
 			handleMessages(cfgMgr, w, r)
 		} else {
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method Not Allowed")
 		}
 	})))
 	interceptedMux.Handle("/v1/messages/count_tokens", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -418,6 +418,18 @@ func main() {
 	interceptedMux.Handle("/v1/usage", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleUsage(cfgMgr, w, r)
 	})))
+	// claude.exe fires telemetry at a hardcoded api.anthropic.com URL
+	// regardless of ANTHROPIC_BASE_URL, so it only ever reaches this
+	// CONNECT-tunnel path, never the direct :8900 one. With no local
+	// handler it fell through to PassthroughToReal, which tried to reach
+	// the real api.anthropic.com and hung for passthroughClient's full 30s
+	// timeout on any network that can't reach it (isolated/firewalled
+	// environments) — pure background telemetry, safe to just swallow.
+	interceptedMux.HandleFunc("/api/event_logging/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
 	interceptedMux.HandleFunc("/", PassthroughToReal)
 
 	proxySecret := cfgMgr.ProxySecret()
@@ -543,7 +555,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	if headerSessionID == "" {
 		headerSessionID = r.Header.Get("x-session-id")
 	}
-	convAnchor := DeriveConversationAnchor(bodyBytes, headerSessionID)
+	convAnchor := DeriveConversationAnchor(bodyBytes, headerSessionID, instanceID)
 
 	// 2.1 Fast-Path Intercept: Claude Code Native WebSearch Sub-Request
 	if searchQuery, isSearch := IsClaudeCodeDirectWebSearch(bodyBytes); isSearch {
@@ -768,6 +780,13 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		antigravitySessionKey := sessionID
 		if instanceID != "" {
 			antigravitySessionKey = sessionID + ":" + instanceID
+		} else if agentType == "auxiliary" {
+			// auxiliary (title/summary generation, gemini-3.8-flash-low)
+			// and the main thread both carry instanceID=="" — without this,
+			// they collapsed onto the exact same antigravitySessionKey
+			// (bare sessionID), sharing one Google session-cache bucket
+			// between two completely different models and contexts.
+			antigravitySessionKey = sessionID + ":aux"
 		}
 		// Start from this session's last-known-good bump instead of 0: once a
 		// long (>1M-token) conversation has hit the session token-wall once,
@@ -2139,7 +2158,9 @@ func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) 
 	}
 
 	if acc == nil {
-		http.Error(w, `{"error":"no accounts available"}`, http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"no accounts available"}`))
 		return
 	}
 
@@ -2204,13 +2225,13 @@ func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) 
 }
 func handleEmbeddings(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method Not Allowed")
 		return
 	}
 
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Bad Request")
 		return
 	}
 
@@ -2323,10 +2344,14 @@ func handleOAuthUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	if acc == nil {
-		http.Error(w, `{"error":"no accounts available"}`, http.StatusNotFound)
-		return
-	}
+	// A tenant on google_auth_type "api_key" has no OAuth pool at all, so
+	// acc is nil here — this used to 404, breaking the /usage command
+	// outright instead of showing a low, stable utilization the same way
+	// applyRateLimitHeaders' own synthetic values already do for this
+	// exact case. isSyntheticAccount skips the real quota lookups below
+	// and falls through to the same resp-building code with synthetic
+	// windows, instead of duplicating that whole structure by hand.
+	isSyntheticAccount := acc == nil
 
 	// Only block on a real network round-trip the FIRST time this account
 	// has no quota data at all (matching applyRateLimitHeaders' own
@@ -2336,24 +2361,42 @@ func handleOAuthUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Requ
 	// Serve the cached snapshot immediately and let the same
 	// 45s-staleness async refresh everyone else already uses catch it up
 	// in the background.
-	if len(acc.Quotas) == 0 {
-		_ = globalAccountManager.FetchQuota(acc.Email)
-		acc, _ = globalAccountManager.GetAccount(acc.Email)
+	var fiveHourBucket, weeklyBucket *QuotaBucket
+	var fiveHourWindow, weeklyWindow map[string]interface{}
+	if isSyntheticAccount {
+		now := time.Now()
+		synthWindow := func(reset time.Time) map[string]interface{} {
+			return map[string]interface{}{
+				"utilization":       5.0,
+				"resets_at":         reset.UTC().Format("2006-01-02T15:04:05.000Z"),
+				"limit_dollars":     nil,
+				"used_dollars":      nil,
+				"remaining_dollars": nil,
+				"locked_reason":     nil,
+			}
+		}
+		fiveHourWindow = synthWindow(now.Add(5 * time.Hour))
+		weeklyWindow = synthWindow(now.Add(7 * 24 * time.Hour))
 	} else {
-		globalAccountManager.TriggerAsyncQuotaRefresh(acc.Email, 45*time.Second)
-	}
+		if len(acc.Quotas) == 0 {
+			_ = globalAccountManager.FetchQuota(acc.Email)
+			acc, _ = globalAccountManager.GetAccount(acc.Email)
+		} else {
+			globalAccountManager.TriggerAsyncQuotaRefresh(acc.Email, 45*time.Second)
+		}
 
-	// Real wire shape, captured live via MITM against a genuine, logged-in
-	// api.anthropic.com session (claude-native-capture/resp_024.json) — this
-	// replaces an earlier guess based on a third-party project's simplified
-	// normalization. The real account had no purchased extra-usage credits
-	// either, so extra_usage/spend below mirror its exact disabled shape
-	// rather than fabricating dollar figures.
-	// For OAuth usage, default to the Gemini quota group (the workhorse group)
-	// so the client displays the real ~95%+ free capacity rather than 100% lockout.
-	fiveHourBucket, weeklyBucket := pickFiveHourAndWeekly(acc, "gemini-3.8-flash-tiered")
-	fiveHourWindow := bucketToUsageWindow(fiveHourBucket)
-	weeklyWindow := bucketToUsageWindow(weeklyBucket)
+		// Real wire shape, captured live via MITM against a genuine, logged-in
+		// api.anthropic.com session (claude-native-capture/resp_024.json) — this
+		// replaces an earlier guess based on a third-party project's simplified
+		// normalization. The real account had no purchased extra-usage credits
+		// either, so extra_usage/spend below mirror its exact disabled shape
+		// rather than fabricating dollar figures.
+		// For OAuth usage, default to the Gemini quota group (the workhorse group)
+		// so the client displays the real ~95%+ free capacity rather than 100% lockout.
+		fiveHourBucket, weeklyBucket = pickFiveHourAndWeekly(acc, "gemini-3.8-flash-tiered")
+		fiveHourWindow = bucketToUsageWindow(fiveHourBucket)
+		weeklyWindow = bucketToUsageWindow(weeklyBucket)
+	}
 
 	if fiveHourWindow == nil && weeklyWindow == nil {
 		b, _ := json.Marshal(map[string]interface{}{"limits": []interface{}{}})

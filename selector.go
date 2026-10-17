@@ -64,8 +64,19 @@ var globalSelector = &AccountSelector{
 // message; on the very next turn THAT notice becomes the new "first user
 // message", the hash changes, and the conversation gets silently rebound to
 // a different Google account with none of the prior turns' prefix cache.
-func DeriveConversationAnchor(bodyBytes []byte, headerSessionID string) string {
+// instanceID, when non-empty, is a subagent's own stable per-instance key
+// (see ParseAgentInfo) — headerSessionID alone is shared by the main thread
+// and EVERY subagent in the conversation, so without qualifying by it here,
+// Session Affinity pinned 5-10 parallel subagents to the exact same Google
+// account (they share no content worth caching together anyway), piling
+// all of their load onto one account's quota and triggering an immediate
+// 429 instead of spreading across the pool the way the other per-instance
+// keys (antigravitySessionKey, cwdKey, loopKey) already do.
+func DeriveConversationAnchor(bodyBytes []byte, headerSessionID string, instanceID string) string {
 	if headerSessionID != "" {
+		if instanceID != "" {
+			return "sid:" + headerSessionID + ":" + instanceID
+		}
 		return "sid:" + headerSessionID
 	}
 

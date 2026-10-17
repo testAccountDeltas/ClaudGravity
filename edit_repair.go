@@ -95,7 +95,7 @@ const (
 var (
 	sessionSnapLock sync.RWMutex
 	sessionSnapMap  = make(map[string]map[string]string) // sessionID -> filePath -> content
-	sessionSnapSeen = make(map[string]time.Time)          // sessionID -> last touch, for staleness sweeps
+	sessionSnapSeen = make(map[string]time.Time)         // sessionID -> last touch, for staleness sweeps
 )
 
 func init() {
@@ -206,6 +206,31 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 	toolIDToName := make(map[string]string)
 	toolIDToPath := make(map[string]string)
 
+	// A tool_use's own result (is_error:true on a failed old_string match)
+	// arrives in a LATER message than the tool_use itself, so it has to be
+	// collected in its own pass before the main loop below — which replays
+	// Edit's old_string/new_string against the tracked snapshot the moment
+	// it sees the tool_use, with no way yet to know whether that edit
+	// actually succeeded on the real file. Applying it unconditionally
+	// poisoned the snapshot with content that was never actually written,
+	// then handed back to later repair attempts as if it were real.
+	failedToolIDs := make(map[string]bool)
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(_, p gjson.Result) bool {
+			if p.Get("type").String() == "tool_result" && p.Get("is_error").Bool() {
+				if tid := p.Get("tool_use_id").String(); tid != "" {
+					failedToolIDs[tid] = true
+				}
+			}
+			return true
+		})
+		return true
+	})
+
 	messages.ForEach(func(_, msg gjson.Result) bool {
 		content := msg.Get("content")
 		if !content.IsArray() {
@@ -227,6 +252,9 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					return true
 				}
 				toolIDToPath[id] = path
+				if failedToolIDs[id] {
+					return true
+				}
 
 				switch name {
 				case "write":

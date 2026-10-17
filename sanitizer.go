@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"fmt"
@@ -457,6 +457,7 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 				}
 			}
 			ordered := make([]map[string]interface{}, 0, len(nextBlocks)+len(synths))
+			consumed := make(map[string]bool, len(realResults))
 			for _, b := range m["content"].([]map[string]interface{}) {
 				if b["type"] != "tool_use" {
 					continue
@@ -467,8 +468,19 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 				}
 				if real, ok := realResults[id]; ok {
 					ordered = append(ordered, real)
+					consumed[id] = true
 				} else if synth, ok := synthByID[id]; ok {
 					ordered = append(ordered, synth)
+				}
+			}
+			// A tool_result whose tool_use_id doesn't match any tool_use in
+			// m (answering a call from further back than the immediately
+			// preceding assistant turn) was silently dropped by only ever
+			// walking m's own tool_use list above — append anything real
+			// that was never matched instead of discarding it.
+			for tid, real := range realResults {
+				if !consumed[tid] {
+					ordered = append(ordered, real)
 				}
 			}
 			ordered = append(ordered, otherBlocks...)
@@ -541,5 +553,3 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 
 	return modified, truncatedAny
 }
-
-

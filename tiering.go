@@ -8,11 +8,11 @@ import (
 // 1. Prioritizes ultra-fast gemini-3.8-flash-tiered with prompt caching for claude-* models.
 // 2. Maps *-tiered models based on output_config.effort or auxiliary requests.
 // 3. Configures thinking budget:
-//    - low -> 2048 (gemini-3.8-flash-low)
-//    - medium -> 8192 (gemini-3.8-flash-medium, safe production default)
-//    - high -> 16384 (gemini-3.8-flash-high)
-//    - xhigh / max / ultracode -> -1 (gemini-3.8-flash-tiered with Native Google ModeAuto)
-//    - auxiliary -> 2048 (gemini-3.8-flash-low, eliminates 20s stalls on metadata)
+//   - low -> 2048 (gemini-3.8-flash-low)
+//   - medium -> 8192 (gemini-3.8-flash-medium, safe production default)
+//   - high -> 16384 (gemini-3.8-flash-high)
+//   - xhigh / max / ultracode -> -1 (gemini-3.8-flash-tiered with Native Google ModeAuto)
+//   - auxiliary -> 2048 (gemini-3.8-flash-low, eliminates 20s stalls on metadata)
 func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass string) (string, int) {
 	model, _ := claudeReqJSON["model"].(string)
 
@@ -40,6 +40,15 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 	budget := 8192 // default medium
 
 	if strings.HasPrefix(model, "gemini-3.8-flash") || model == "gemini-3.8-flash-tiered" {
+		// Opus/Fable/Mythos were already mapped to the top "tiered"
+		// (ModeAuto) class above specifically because they're the
+		// flagship tier — but Sonnet maps to "-medium" and enters this
+		// exact same switch too, so without remembering which one this
+		// was, the no-effort default case below silently downgraded every
+		// Opus-class request with no explicit output_config.effort
+		// (anything not setting CLAUDE_CODE_EFFORT_LEVEL) from "tiered"
+		// down to plain "-medium" with a capped 8192 budget.
+		wasTieredClass := model == "gemini-3.8-flash-tiered"
 		base := "gemini-3.8-flash"
 		if reqClass == "auxiliary" {
 			model = base + "-low"
@@ -59,9 +68,14 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 				model = "gemini-3.8-flash-tiered"
 				budget = -1 // Native Google ModeAuto
 			default:
-				// Default when no explicit effort is passed: balanced medium
-				model = base + "-medium"
-				budget = 8192
+				if wasTieredClass {
+					model = "gemini-3.8-flash-tiered"
+					budget = -1
+				} else {
+					// Default when no explicit effort is passed: balanced medium
+					model = base + "-medium"
+					budget = 8192
+				}
 			}
 		}
 	} else if strings.HasSuffix(model, "-tiered") {
