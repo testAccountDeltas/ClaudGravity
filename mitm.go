@@ -283,11 +283,20 @@ func idleCopy(dst net.Conn, src net.Conn, idleDeadline time.Duration) {
 	}
 }
 
+// mitmIdleDeadline bounds how long serveInterceptedTLS's connection can go
+// completely silent before it's torn down — refreshed on every read/write
+// instead of set once, so it only fires on genuine inactivity. A single
+// absolute SetDeadline here used to kill the connection 30 real wall-clock
+// seconds after the handshake no matter what, which is well inside a real
+// generation's TTFT (this gateway's own panic/TTFT watchdogs allow up to
+// 180s) — any client routed through this intercepted path (HTTPS_PROXY set,
+// no ANTHROPIC_BASE_URL) doing real work past 30s got its response torn off
+// mid-stream.
+const mitmIdleDeadline = 10 * time.Minute
+
 func serveInterceptedTLS(tlsConn *tls.Conn, handler http.Handler) {
 	defer tlsConn.Close()
-	// A hung/malicious client inside the tunnel must not leak this
-	// goroutine or connection forever.
-	_ = tlsConn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = tlsConn.SetDeadline(time.Now().Add(mitmIdleDeadline))
 
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -299,6 +308,7 @@ func serveInterceptedTLS(tlsConn *tls.Conn, handler http.Handler) {
 		LogGateway("[SuperRelay Gateway] MITM TLS handshake failed: %v", err)
 		return
 	}
+	_ = tlsConn.SetDeadline(time.Now().Add(mitmIdleDeadline))
 
 	reader := bufio.NewReader(tlsConn)
 	req, err := http.ReadRequest(reader)
@@ -309,7 +319,7 @@ func serveInterceptedTLS(tlsConn *tls.Conn, handler http.Handler) {
 
 	rw := newMitmResponseWriter(tlsConn)
 	handler.ServeHTTP(rw, req)
-	rw.Flush()
+	rw.Close()
 	// Always close after one request-response pair instead of looping for
 	// keep-alive reuse: these intercepted calls (oauth/usage, bootstrap) are
 	// low-frequency control calls, and a hand-rolled HTTP/1.1 writer sharing
@@ -427,6 +437,9 @@ type MitmResponseWriter struct {
 	buf         bytes.Buffer
 	statusCode  int
 	wroteHeader bool
+	headersSent bool
+	chunked     bool
+	sentOffset  int
 }
 
 func newMitmResponseWriter(conn net.Conn) *MitmResponseWriter {
@@ -452,8 +465,18 @@ func (w *MitmResponseWriter) WriteHeader(statusCode int) {
 	}
 }
 
-func (w *MitmResponseWriter) Flush() {
-	if w.header.Get("Content-Length") == "" {
+// sendHeaders writes the status line and headers exactly once. chunked is
+// true for a real mid-stream Flush (SSE), where the final body size isn't
+// known yet; false for Close's single-shot path, where the handler has
+// already returned and the whole body is sitting in w.buf, so a precise
+// Content-Length can still be set just like before this type supported
+// incremental streaming at all.
+func (w *MitmResponseWriter) sendHeaders(chunked bool) {
+	w.headersSent = true
+	w.chunked = chunked
+	if chunked {
+		w.header.Set("Transfer-Encoding", "chunked")
+	} else if w.header.Get("Content-Length") == "" {
 		w.header.Set("Content-Length", strconv.Itoa(w.buf.Len()))
 	}
 	w.header.Set("Connection", "close")
@@ -466,8 +489,59 @@ func (w *MitmResponseWriter) Flush() {
 		}
 	}
 	sb.WriteString("\r\n")
+	_ = w.conn.SetWriteDeadline(time.Now().Add(mitmIdleDeadline))
 	_, _ = w.conn.Write([]byte(sb.String()))
-	if w.buf.Len() > 0 {
-		_, _ = w.conn.Write(w.buf.Bytes())
+}
+
+// writeNewBytes pushes only what's been written to w.buf since the last
+// call — not the whole buffer — as either a raw slice (fixed
+// Content-Length framing) or one chunked-encoding frame. Previously Flush()
+// replayed the status line, every header, and the ENTIRE buffer
+// accumulated so far on every single call, so any stream with more than
+// one chunk (every real SSE response) sent the client a response with its
+// headers and earlier chunks duplicated over and over.
+func (w *MitmResponseWriter) writeNewBytes() {
+	all := w.buf.Bytes()
+	if w.sentOffset >= len(all) {
+		return
+	}
+	chunk := all[w.sentOffset:]
+	w.sentOffset = len(all)
+	_ = w.conn.SetWriteDeadline(time.Now().Add(mitmIdleDeadline))
+	if w.chunked {
+		_, _ = w.conn.Write([]byte(fmt.Sprintf("%x\r\n", len(chunk))))
+		_, _ = w.conn.Write(chunk)
+		_, _ = w.conn.Write([]byte("\r\n"))
+	} else {
+		_, _ = w.conn.Write(chunk)
+	}
+}
+
+// Flush is called mid-handler by anything holding this writer as an
+// http.Flusher (SSEStreamer.SendRaw, in particular) — exactly the case
+// sendHeaders(true)/writeNewBytes above exist to make safe.
+func (w *MitmResponseWriter) Flush() {
+	if !w.headersSent {
+		w.sendHeaders(true)
+	}
+	w.writeNewBytes()
+}
+
+// Close finalizes the response after the handler has returned. If Flush
+// was never called mid-handler (every single-shot JSON handler — oauth/
+// usage, bootstrap, models, non-streaming /v1/messages), this is the ONLY
+// flush point and the full body is already buffered, so it's sent once
+// with an exact Content-Length — unchanged from the old behavior. If Flush
+// WAS already called (a real SSE stream), headers and earlier chunks are
+// already on the wire in chunked framing; this just sends the trailing
+// bytes and the terminating zero-length chunk.
+func (w *MitmResponseWriter) Close() {
+	if !w.headersSent {
+		w.sendHeaders(false)
+	}
+	w.writeNewBytes()
+	if w.chunked {
+		_ = w.conn.SetWriteDeadline(time.Now().Add(mitmIdleDeadline))
+		_, _ = w.conn.Write([]byte("0\r\n\r\n"))
 	}
 }

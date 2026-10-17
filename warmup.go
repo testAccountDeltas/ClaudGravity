@@ -92,30 +92,32 @@ func WrapAntigravityPayload(modelName string, payload []byte, projectID string, 
 }
 
 func generateStableSessionID(payload []byte, generation int, fallbackKey string) string {
-	hashKey := ""
-	contents := gjson.GetBytes(payload, "request.contents")
-	if !contents.Exists() {
-		contents = gjson.GetBytes(payload, "contents")
-	}
-	if contents.IsArray() {
-		for _, content := range contents.Array() {
-			if content.Get("role").String() == "user" {
-				if text := content.Get("parts.0.text").String(); text != "" {
-					hashKey = text
-					break
+	// fallbackKey (DeriveSessionID's result — the real x-claude-code-session-id/
+	// x-session-id header when the client sends one) is stable for the
+	// conversation's whole lifetime and takes priority over hashing the first
+	// user turn's text. The text used to be hashed first instead: once
+	// TruncateConversationToFit replaces dropped old messages with its own
+	// synthetic "[Gateway notice: ...]" message, THAT became the new "first
+	// user turn" on the next call and changed the hash, silently handing
+	// Antigravity a brand new sessionId mid-conversation and resetting its
+	// server-side prefix cache — the same failure class DeriveConversationAnchor
+	// in selector.go had for account affinity, just one layer deeper.
+	hashKey := fallbackKey
+	if hashKey == "" {
+		contents := gjson.GetBytes(payload, "request.contents")
+		if !contents.Exists() {
+			contents = gjson.GetBytes(payload, "contents")
+		}
+		if contents.IsArray() {
+			for _, content := range contents.Array() {
+				if content.Get("role").String() == "user" {
+					if text := content.Get("parts.0.text").String(); text != "" {
+						hashKey = text
+						break
+					}
 				}
 			}
 		}
-	}
-	// First user turn opening on an image/tool-call (parts.0 isn't text)
-	// previously fell straight through to a pure random id here — a brand
-	// new, uncorrelated sessionId on every single call, permanently
-	// defeating Google's server-side prefix cache for that whole
-	// conversation. Fall back to the gateway's own already-resolved
-	// session key (real x-claude-code-session-id header in the common
-	// case) before resorting to randomness.
-	if hashKey == "" {
-		hashKey = fallbackKey
 	}
 	if hashKey != "" {
 		h := sha256.New()

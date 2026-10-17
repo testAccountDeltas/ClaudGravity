@@ -298,12 +298,19 @@ func main() {
 	// two hardcoded-bypass endpoints are answered locally; everything else
 	// falls through to a real passthrough to the actual host.
 	interceptedMux := http.NewServeMux()
-	interceptedMux.HandleFunc("/api/oauth/usage", func(w http.ResponseWriter, r *http.Request) {
+	// Every route this gateway answers itself here (as opposed to the
+	// catch-all PassthroughToReal below, which forwards verbatim to the
+	// REAL api.anthropic.com and must keep its own upstream headers intact)
+	// gets commonAPIMiddleware too — previously only the plain-HTTP/TLS
+	// listeners had CORS/anthropic-version/request-id, so a client set up
+	// with only HTTPS_PROXY (routed through this MITM'd path instead) got
+	// none of them on otherwise-identical responses.
+	interceptedMux.Handle("/api/oauth/usage", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleOAuthUsage(cfgMgr, w, r)
-	})
-	interceptedMux.HandleFunc("/api/claude_cli/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	interceptedMux.Handle("/api/claude_cli/bootstrap", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		HandleBootstrapSpoof(w, r)
-	})
+	})))
 	// A client set up with only HTTPS_PROXY (no ANTHROPIC_BASE_URL override)
 	// sends its real traffic as a CONNECT tunnel to api.anthropic.com, MITM'd
 	// by mitmCA above — previously only the two routes above were answered
@@ -311,22 +318,22 @@ func main() {
 	// forwards straight to the real Anthropic server where this gateway's
 	// own key is meaningless and gets a 401. Answer the same routes here
 	// that the plain-HTTP/TLS listeners already serve.
-	interceptedMux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+	interceptedMux.Handle("/v1/messages", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			handleMessages(cfgMgr, w, r)
 		} else {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		}
-	})
-	interceptedMux.HandleFunc("/v1/messages/count_tokens", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	interceptedMux.Handle("/v1/messages/count_tokens", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleCountTokens(cfgMgr, w, r)
-	})
-	interceptedMux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	interceptedMux.Handle("/v1/models", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleModels(cfgMgr, w, r)
-	})
-	interceptedMux.HandleFunc("/v1/models/{id}", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	interceptedMux.Handle("/v1/models/{id}", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleModelByID(cfgMgr, w, r)
-	})
+	})))
 	interceptedMux.HandleFunc("/", PassthroughToReal)
 
 	proxySecret := cfgMgr.ProxySecret()
@@ -1373,6 +1380,14 @@ func executeNonStreaming(
 }
 
 func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
+	clientKey := r.Header.Get("x-api-key")
+	if clientKey == "" {
+		clientKey = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	}
+	if _, ok := cfgMgr.GetTenant(clientKey); !ok {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+		return
+	}
 	bodyBytes, _ := io.ReadAll(r.Body)
 	estTokens := estimateApproxClaudeTokens(bodyBytes)
 	resp := map[string]interface{}{

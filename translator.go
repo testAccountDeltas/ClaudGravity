@@ -3,11 +3,24 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// currentLocalTimeMinuteSecondRe zeroes the minutes/seconds of an ISO 8601
+// timestamp (the "current local time: 2026-10-17T11:56:07+03:00" line
+// Claude Code puts in its "# Environment" block), quantizing it to the hour.
+// Keeping the line verbatim kept the model honestly date/time-aware but
+// changed the system prompt's bytes every single second, invalidating
+// Google's byte-prefix cache on every turn; quantizing to the hour keeps the
+// model's sense of "now" accurate enough for any real use (git log date
+// filtering, "is it business hours") while the system prompt — and the
+// cache built on it — stays byte-stable for 3600 seconds at a time instead
+// of 1.
+var currentLocalTimeMinuteSecondRe = regexp.MustCompile(`(T\d{2}):\d{2}:\d{2}`)
 
 // DropSearchTools is stripped from the declared tools when
 // tenant.StripSearchTools is true (default: true — see README.md's
@@ -759,7 +772,7 @@ func ScrubBillingHeader(txt string) string {
 					// 2023/2024, misdating git log filters, and generally
 					// reasoning about "now" incorrectly.
 					strings.Contains(lower, "current local time") {
-					cleanLines = append(cleanLines, line)
+					cleanLines = append(cleanLines, currentLocalTimeMinuteSecondRe.ReplaceAllString(line, "${1}:00:00"))
 				}
 				continue
 			}
