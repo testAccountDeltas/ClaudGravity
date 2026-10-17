@@ -263,6 +263,21 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 			role = "user"
 		}
 
+		// SanitizeMessagesAndGraph runs more than once per request (translator.go
+		// calls it before AND after TruncateConversationToFit, and again after
+		// loop-guard nudges) — its own first pass normalizes content below from
+		// raw-JSON []interface{} to []map[string]interface{}. Re-wrap that back
+		// into []interface{} so the type switch below (which only recognizes
+		// string/[]interface{}) still matches it on a second/third pass, instead
+		// of falling to default and replacing the whole message with "...".
+		if normed, ok := m["content"].([]map[string]interface{}); ok {
+			reraw := make([]interface{}, len(normed))
+			for i, item := range normed {
+				reraw[i] = item
+			}
+			m["content"] = reraw
+		}
+
 		var normBlocks []map[string]interface{}
 
 		switch content := m["content"].(type) {
