@@ -3,10 +3,13 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -29,6 +32,16 @@ const (
 	// useless advice at best and confusing at worst.
 	NudgeReadLoop    = "Notice from the gateway: you have made many Read calls recently without writing/editing anything or giving a substantial answer — this looks like an unproductive read-loop. Stop reading slices. Use Bash (grep/rg) to jump straight to the relevant symbol/section, or read larger ranges, or proceed with what you have."
 	NudgeOscillation = "Notice from the gateway: your output is flagged for looping content (the exact same tool call or A/B oscillation repeated). If intentional, add the tag [ignoring loop detection]; otherwise stop and try a different approach."
+
+	// readToolGuidance is injected into every request's system prompt
+	// (translator.go), silently and unconditionally — not a reactive
+	// nudge after the fact, but an upfront instruction aimed at stopping
+	// the common small-file case from ever needing one. Live traffic
+	// showed the model defaulting to reading an entire file in a fixed
+	// ~120-line page size regardless of the file's actual size, needing
+	// 9 separate Read calls to get through a 1080-line file it could have
+	// read in one.
+	readToolGuidance = "Gateway notice (Read tool usage): if a file is small (roughly under 50KB, or a couple thousand lines), call Read once for the whole file instead of paging through it across multiple calls with offset/limit. Reserve offset/limit for genuinely large files. When you need to find something specific rather than read everything, prefer a targeted search (grep/rg via Bash) over sequential reads."
 
 	// NudgeEditFailureLoop fires when Edit has failed (old_string mismatch)
 	// several times in a row for the same agent — the read-loop guard above
@@ -70,6 +83,47 @@ const (
 // by. If hasModifyingTools is false (e.g. Plan Mode, or an investigation agent
 // without edit permissions), we use the relaxed exploreReadWindow limits so
 // legitimate file inspection does not trigger false-positive read-loop warnings.
+// readEquivalentBashPattern matches a Bash command doing the same "dump
+// raw file content" work the Read tool does — sed -n, head, tail, or cat
+// — as opposed to a genuinely targeted search (grep/rg/awk), which is
+// exactly what NudgeReadLoop itself tells the model to switch to and must
+// never count against this same guard, or the nudge's own advice would
+// trip it again immediately.
+var readEquivalentBashPattern = regexp.MustCompile(`(?i)\b(sed\s+-n|head\s+-[nc]|tail\s+-[nc]|cat)\b`)
+
+func isReadEquivalentBashCommand(command string) bool {
+	lc := strings.ToLower(command)
+	if strings.Contains(lc, "grep") || strings.Contains(lc, "awk") ||
+		strings.Contains(lc, "rg ") || strings.HasPrefix(lc, "rg") {
+		return false
+	}
+	return readEquivalentBashPattern.MatchString(command)
+}
+
+// readLoopEquivalentToolName extracts the tool name from a "name:argsRaw"
+// signature (sse.go's/the non-streaming path's toolCallSignatures) and
+// reports whether this call counts as a Read for read-loop purposes —
+// either literally the Read tool, or a Bash command paginating through a
+// file the same way under a different name. Verified necessary live: an
+// agent nudged off Read switched straight to `sed -n 'N,Mp' file` /
+// `head`/`tail` chains in Bash and was then completely invisible to a
+// counter that only ever matched the literal string "Read".
+func readLoopEquivalentToolName(signature string) (name string, isReadEquivalent bool) {
+	idx := strings.IndexByte(signature, ':')
+	if idx < 0 {
+		return signature, signature == "Read"
+	}
+	name = signature[:idx]
+	if name == "Read" {
+		return name, true
+	}
+	if name == "Bash" {
+		command := gjson.Get(signature[idx+1:], "command").String()
+		return name, isReadEquivalentBashCommand(command)
+	}
+	return name, false
+}
+
 func readLoopLimits(agentKey string, hasModifyingTools bool) (windowSize, threshold int) {
 	// ParseAgentInfo's fallback path (request-class "subagent" but no
 	// x-claude-code-agent-type header) returns the bare string "subagent"

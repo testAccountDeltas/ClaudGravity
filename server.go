@@ -1417,10 +1417,11 @@ UpstreamReady:
 
 	readCount := 0
 	madeProgress := false
-	for _, t := range streamer.toolNames {
-		if t == "Read" {
+	for _, sig := range streamer.toolCallSignatures {
+		name, isReadEquiv := readLoopEquivalentToolName(sig)
+		if isReadEquiv {
 			readCount++
-		} else if isModifyingToolName(t) {
+		} else if isModifyingToolName(name) {
 			madeProgress = true
 		}
 	}
@@ -1904,10 +1905,11 @@ func executeNonStreaming(
 	// matter how many consecutive unproductive Read turns it made.
 	readCount := 0
 	madeProgress := false
-	for _, t := range toolsCalled {
-		if t == "Read" {
+	for _, sig := range toolCallSignatures {
+		name, isReadEquiv := readLoopEquivalentToolName(sig)
+		if isReadEquiv {
 			readCount++
-		} else if isModifyingToolName(t) {
+		} else if isModifyingToolName(name) {
 			madeProgress = true
 		}
 	}

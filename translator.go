@@ -320,6 +320,19 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			systemPrompt = ScrubBillingHeader(sys.String())
 		}
 	}
+	// Silent, always-on Read-tool usage guidance: live traffic showed the
+	// model defaulting to a fixed ~120-line page size and marching through
+	// an entire file sequentially — 9 Read calls to get through a
+	// 1080-line file, one call per page, zero attempts to read it in
+	// fewer/larger calls or search for the relevant part first. Once the
+	// read-loop nudge (loopguard.go) fired, the model switched straight to
+	// `Bash(sed -n '...')`/`head`/`tail` and did the exact same thing
+	// under a different tool name. This doesn't replace the loop-guard
+	// (still needed for genuinely large files / scattered searches) — it
+	// aims to stop the common small-file case from ever reaching the
+	// guard at all, by telling the model up front that it doesn't need to
+	// paginate a small file.
+	systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + readToolGuidance)
 	if systemPrompt != "" {
 		// Per Google's REST spec, system_instruction is just {"parts": [...]}
 		// — role is only meaningful on conversation turns in "contents",
