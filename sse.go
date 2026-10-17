@@ -21,8 +21,43 @@ import (
 // requirement that every tool_use id in a message be unique.
 var toolCallSeq atomic.Uint64
 
+// nextToolCallID builds a tool_use id of the form
+// "toolu_<name>_<nanots>_<seq>" (see translator.go's recovery parse of this
+// exact format). Anthropic's real tool_use.id pattern is
+// ^[a-zA-Z0-9_-]{1,64}$ — a long MCP tool name ("mcp__server__some-
+// descriptive-tool-name") plus a decimal nanosecond timestamp routinely
+// exceeded 64 characters, which a strict client SDK rejects outright.
+// Hex-encoding the numeric parts (shorter than decimal, still digits for
+// the trailing-segment recovery check — see isAllHexDigits) buys back some
+// room; the name itself is truncated as a last resort only if it still
+// doesn't fit, which only degrades that same best-effort recovery path for
+// an already-rare case, never the live tool call itself (name/args are
+// carried separately in the SSE/JSON payload, not reconstructed from the
+// id).
 func nextToolCallID(name string) string {
-	return fmt.Sprintf("toolu_%s_%d_%d", name, time.Now().UnixNano(), toolCallSeq.Add(1))
+	safeName := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			return r
+		}
+		return '_'
+	}, name)
+	nanoHex := fmt.Sprintf("%x", time.Now().UnixNano())
+	seqHex := fmt.Sprintf("%x", toolCallSeq.Add(1))
+
+	const prefix = "toolu_"
+	fixedLen := len(prefix) + len(nanoHex) + len(seqHex) + 2 // 2 separators
+	maxNameLen := 64 - fixedLen
+	if maxNameLen < 1 {
+		maxNameLen = 1
+	}
+	if len(safeName) > maxNameLen {
+		safeName = safeName[:maxNameLen]
+	}
+	id := fmt.Sprintf("%s%s_%s_%s", prefix, safeName, nanoHex, seqHex)
+	if len(id) > 64 {
+		id = id[:64]
+	}
+	return id
 }
 
 const (
@@ -409,6 +444,29 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSig
 	return s.closeCurrentBlock()
 }
 
+// FinishWithError is the fallback for when the upstream read loop
+// (StreamGeminiToClaude) dies mid-stream on something other than a clean
+// EOF (network drop, a Read error) — previously that error just propagated
+// up to be logged, with no event:error/message_stop ever sent on a
+// connection that had already committed message_start and possibly several
+// content blocks. The client has no way to know the response is over and
+// hangs waiting for a message_stop that never arrives (until its own idle
+// timeout, if any). Best-effort: if the connection is well and truly dead
+// these writes fail too and are ignored, same as they would be anywhere
+// else in this file.
+func (s *SSEStreamer) FinishWithError(err error) {
+	s.mu.Lock()
+	finished := s.hasFinished
+	s.hasFinished = true
+	s.mu.Unlock()
+	if finished {
+		return
+	}
+	errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":%q}}`, "Stream connection broken: "+err.Error())
+	_ = s.SendRaw("error", errPayload)
+	_ = s.SendRaw("message_stop", `{"type":"message_stop"}`)
+}
+
 func (s *SSEStreamer) FinishStream(finishReason string) error {
 	s.mu.Lock()
 	if s.hasFinished {
@@ -448,6 +506,17 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	stopReason := "end_turn"
 	if isEmptyRefusal {
 		stopReason = "refusal"
+		// Anthropic's Message.content has minItems:1 — a refusal with
+		// NOTHING ever streamed (no text_delta/thinking_delta/tool_use)
+		// would otherwise leave the client reconstructing a genuinely
+		// empty content array from zero content_block_start/stop events,
+		// which a strict SDK's schema validation rejects outright.
+		if err := s.HandleText("I'm not able to help with that request."); err != nil {
+			return err
+		}
+		if err := s.closeCurrentBlock(); err != nil {
+			return err
+		}
 	} else if finishReason == "MAX_TOKENS" {
 		stopReason = "max_tokens"
 	} else if s.toolUseOccurred {

@@ -616,7 +616,17 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		}
 		RecordSessionCWD(cwdKey, cwd)
 	}
-	RecordSessionFileSnapshots(sessionID, bodyBytes)
+	// Same per-instance key RepairEditToolCall's getSessionSnapshot lookup
+	// already uses (via the cwdKey passed into it at its two call sites) —
+	// this was still writing under the bare sessionID, so for any subagent
+	// (cwdKey != sessionID) the snapshot read could never find what this
+	// just wrote, silently disabling the Edit-repair fallback for every
+	// subagent.
+	fileSnapKey := sessionID
+	if instanceID != "" {
+		fileSnapKey = sessionID + ":" + instanceID
+	}
+	RecordSessionFileSnapshots(fileSnapKey, bodyBytes)
 
 	hasSafeguards := gjson.GetBytes(bodyBytes, "safeguards").Exists()
 	flusher, hasFlusher := w.(http.Flusher)
@@ -1189,9 +1199,24 @@ UpstreamReady:
 	if instanceID != "" {
 		cwdKey = sessionID + ":" + instanceID
 	}
-	streamer := NewSSEStreamer(w, flusher, modelName, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools)
+	// Anthropic's SDKs/telemetry expect the response's "model" field to
+	// echo back exactly what the client asked for — modelName by this
+	// point is the internal Gemini routing alias (e.g.
+	// "gemini-3.8-flash-tiered"), not the original "claude-opus-5-5" the
+	// client requested, which previously leaked straight through.
+	respModel := gjson.GetBytes(claudeBodyBytes, "model").String()
+	if respModel == "" {
+		respModel = modelName
+	}
+	streamer := NewSSEStreamer(w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools)
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
+	if err != nil {
+		wMu.Lock()
+		streamer.FinishWithError(err)
+		flusher.Flush()
+		wMu.Unlock()
+	}
 	totalDur := time.Since(t0)
 
 	readCount := 0
@@ -1379,11 +1404,18 @@ func executeNonStreaming(
 		stopReason = "max_tokens"
 	}
 
+	// Same reasoning as the streaming path's respModel (executeStreamingWithWatchdog):
+	// echo back the model the client actually requested, not the internal
+	// Gemini routing alias modelName holds by this point.
+	respModel := gjson.GetBytes(claudeBodyBytes, "model").String()
+	if respModel == "" {
+		respModel = modelName
+	}
 	claudeResp := map[string]interface{}{
-		"id":          fmt.Sprintf("msg_%d", time.Now().UnixNano()),
-		"type":        "message",
-		"role":        "assistant",
-		"model":       modelName,
+		"id":            fmt.Sprintf("msg_%d", time.Now().UnixNano()),
+		"type":          "message",
+		"role":          "assistant",
+		"model":         respModel,
 		"content":       []map[string]interface{}{},
 		"usage":         usageMap,
 		"stop_reason":   stopReason,

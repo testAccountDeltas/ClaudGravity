@@ -204,7 +204,7 @@ func ParseAgentInfo(r *http.Request) (agentKey, agentType, subagentName, instanc
 	agentID := r.Header.Get("x-claude-code-agent-id")
 
 	if reqClass == "auxiliary" {
-		return "auxiliary", "auxiliary", "", promptID
+		return "auxiliary", "auxiliary", "", ""
 	}
 	if rawAgentType != "" {
 		if agentID != "" {
@@ -218,7 +218,20 @@ func ParseAgentInfo(r *http.Request) (agentKey, agentType, subagentName, instanc
 		}
 		return "subagent", "subagent", "subagent", promptID
 	}
-	return "main", "main", "", promptID
+	// The main/orchestrator thread's own requests used to fall back to
+	// Prompt-Id here too (same as a Task-tool-invocation subagent with no
+	// Agent-Id of its own) — but Prompt-Id is stable only for the span of
+	// one Task-tool invocation / user turn, not the whole conversation, so
+	// a non-empty instanceID here changed every single turn. Every caller
+	// that qualifies a cache key by instanceID when non-empty
+	// (antigravitySessionKey/sessionBumpMap/cwdKey in server.go, loopKey
+	// here and in translator.go) was therefore getting a brand new key for
+	// the main thread on every turn, defeating Google's server-side prefix
+	// cache continuously for the single most common case in this gateway.
+	// Main never carries a real Agent-Id (per claude-cli's own
+	// agentType==="main" check, confirmed above), so it has no legitimate
+	// per-instance key to qualify by at all — must stay empty.
+	return "main", "main", "", ""
 }
 
 func DeriveSessionID(r *http.Request, bodyBytes []byte, geminiBody []byte) string {

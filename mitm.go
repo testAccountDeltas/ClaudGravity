@@ -367,13 +367,34 @@ func serveInterceptedTLS(tlsConn *tls.Conn, handler http.Handler) {
 	// the direct :8900 TLS API) never propagated cancellation to the
 	// upstream Google call at all — r.Context() downstream was real but
 	// never actually tied to this connection closing.
+	// Drain the whole body into memory BEFORE starting the disconnect
+	// watcher below. req.Body is a lazy reader pulling from the same
+	// `reader` (bufio.Reader) wrapping tlsConn — whatever body bytes
+	// weren't already sitting in its buffer from the header read still
+	// have to come from a real tlsConn.Read() the first time something
+	// consumes req.Body. The watcher goroutine's own tlsConn.Read() raced
+	// directly against that on the raw connection, bypassing `reader`
+	// entirely, so it could steal a body byte meant for the request parser
+	// — silently corrupting any POST body that didn't fit in bufio's
+	// initial read (JSON parse failures in handleMessages, confirmed as
+	// the actual failure mode for bodies over a few KB).
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		LogGateway("[SuperRelay Gateway] MITM read body failed: %v", err)
+		return
+	}
+	_ = req.Body.Close()
+	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		// This connection is one request-response pair with no pipelining
-		// (see the comment below), so any read activity here — new bytes or
-		// an error/EOF — means the client is done with this tunnel; either
-		// way, stop the upstream call.
+		// Only safe to read tlsConn directly now that the body is fully
+		// drained above — nothing else will touch `reader`/tlsConn for
+		// input again on this one-shot connection (see the comment below).
+		// Any read activity here — new bytes or an error/EOF — means the
+		// client is done with this tunnel either way, so stop the upstream
+		// call.
 		buf := make([]byte, 1)
 		if _, err := tlsConn.Read(buf); err != nil {
 			cancel()

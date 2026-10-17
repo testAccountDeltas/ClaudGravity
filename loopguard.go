@@ -30,6 +30,13 @@ const (
 	NudgeReadLoop = "Notice from the gateway: you have made many Read calls recently without writing/editing anything or giving a substantial answer — this looks like an unproductive read-loop. Stop reading slices. Use Bash (grep/rg) to jump straight to the relevant symbol/section, or read larger ranges, or proceed with what you have."
 	NudgeOscillation    = "Notice from the gateway: your output is flagged for looping content (the exact same tool call or A/B oscillation repeated). If intentional, add the tag [ignoring loop detection]; otherwise stop and try a different approach."
 
+	// NudgeEditFailureLoop fires when Edit has failed (old_string mismatch)
+	// several times in a row for the same agent — the read-loop guard above
+	// has no visibility into this at all, since whether an Edit succeeded
+	// only becomes known on the client's NEXT request (its tool_result's
+	// is_error), not in this gateway's response to the call that failed.
+	NudgeEditFailureLoop = "Notice from the gateway: your Edit tool calls have failed repeatedly because old_string did not match the file. Do not keep retrying minor variations of the same old_string. Read the file to see its exact current contents, then either fix old_string to match exactly or use Write to replace the whole section/file."
+
 	// NudgeReadLoopEscalated fires when the soft nudge above already fired
 	// once for this agent and it slid right back into another full
 	// read-loop window without ever writing/editing anything in between —
@@ -78,6 +85,7 @@ type LoopGuardManager struct {
 	toolCallHist map[string][]string  // agentKey -> list of turn call hashes
 	lastSeen     map[string]time.Time // agentKey -> last activity, for staleness sweeps
 	nudgeCount   map[string]int       // agentKey -> how many read-loop nudges fired since the last genuine Write/Edit; escalates wording instead of staying a one-time whisper
+	editFailures map[string]int       // agentKey -> consecutive Edit tool_result is_error:true count
 }
 
 var globalLoopGuard = &LoopGuardManager{
@@ -85,6 +93,26 @@ var globalLoopGuard = &LoopGuardManager{
 	toolCallHist: make(map[string][]string),
 	lastSeen:     make(map[string]time.Time),
 	nudgeCount:   make(map[string]int),
+	editFailures: make(map[string]int),
+}
+
+// RecordEditResult tracks consecutive Edit tool_result failures per agent —
+// the response-side madeProgress signal in server.go counts ANY Edit call
+// as progress regardless of outcome (it can't know the outcome yet; the
+// client reports is_error on the client's own NEXT request, in that
+// request's tool_result, not in this gateway's response to the call that
+// failed), so a model stuck retrying the exact same failing old_string
+// indefinitely never tripped the read-loop guard. Returns the new
+// consecutive-failure count (0 if this call was a success/reset it).
+func (lg *LoopGuardManager) RecordEditResult(agentKey string, isError bool) int {
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
+	if isError {
+		lg.editFailures[agentKey]++
+		return lg.editFailures[agentKey]
+	}
+	lg.editFailures[agentKey] = 0
+	return 0
 }
 
 func init() {
@@ -107,6 +135,7 @@ func (lg *LoopGuardManager) sweepStale() {
 			delete(lg.readWindows, k)
 			delete(lg.toolCallHist, k)
 			delete(lg.nudgeCount, k)
+			delete(lg.editFailures, k)
 		}
 	}
 }

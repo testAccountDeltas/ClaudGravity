@@ -364,10 +364,28 @@ func hasRemainingQuota(acc *AccountRecord) bool {
 	if len(acc.Quotas) == 0 {
 		return true // assume ok if unprobed
 	}
+	now := time.Now()
 	for _, grp := range acc.Quotas {
 		if strings.Contains(strings.ToLower(grp.DisplayName), "gemini") {
 			for _, b := range grp.Buckets {
 				if b.RemainingFraction <= 0.05 {
+					// This bucket's own fraction is a snapshot from the
+					// last FetchQuota — nothing re-fetches it on a timer
+					// (RefreshAllQuotas only runs off a manual dashboard
+					// button), so without checking the bucket's own
+					// ResetTime here, an account stayed excluded from the
+					// pool forever after its window reset, until someone
+					// happened to click refresh. CooldownUntil above is the
+					// same ResetTime baked in at the time of that last
+					// fetch, so it goes stale in exactly the same way.
+					if b.ResetTime != "" {
+						if t, err := time.Parse(time.RFC3339Nano, b.ResetTime); err == nil && now.After(t) {
+							continue
+						}
+						if t, err := time.Parse(time.RFC3339, b.ResetTime); err == nil && now.After(t) {
+							continue
+						}
+					}
 					return false
 				}
 			}
@@ -383,8 +401,18 @@ func getEffectiveQuotaFraction(acc *AccountRecord) float64 {
 	if len(acc.Quotas) == 0 {
 		return 0.5
 	}
+	// Same "claude"-group exclusion as FetchQuota's CooldownUntil calc and
+	// pickFiveHourAndWeekly below — a free-tier account's 3P (Claude/GPT)
+	// bucket can legitimately sit at 0% for days while Gemini itself is
+	// still wide open. Without filtering to the Gemini group here, that
+	// unrelated 3P bucket dragged minFrac to ~0 for nearly every real
+	// account, making this ranking signal meaningless (every account looks
+	// equally "almost exhausted" regardless of its actual Gemini quota).
 	minFrac := 1.0
 	for _, grp := range acc.Quotas {
+		if strings.Contains(strings.ToLower(grp.DisplayName), "claude") {
+			continue
+		}
 		for _, b := range grp.Buckets {
 			if b.RemainingFraction < minFrac {
 				minFrac = b.RemainingFraction

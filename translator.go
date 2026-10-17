@@ -57,12 +57,72 @@ var DropSearchTools = map[string]bool{
 	"Glob": true,
 }
 
-func isAllDigits(s string) bool {
+// lastTurnHadFailedEdit reports whether the most recent assistant/user turn
+// pair in this request carries an Edit (or str_replace_editor/update/
+// notebookedit) tool_use answered by a tool_result with is_error:true —
+// the earliest point this gateway can see that outcome at all, since the
+// client only reports it on its NEXT request.
+func lastTurnHadFailedEdit(reqMap map[string]interface{}) bool {
+	msgsRaw, ok := reqMap["messages"].([]interface{})
+	if !ok || len(msgsRaw) < 2 {
+		return false
+	}
+	last, ok := msgsRaw[len(msgsRaw)-1].(map[string]interface{})
+	if !ok || last["role"] != "user" {
+		return false
+	}
+	prev, ok := msgsRaw[len(msgsRaw)-2].(map[string]interface{})
+	if !ok || prev["role"] != "assistant" {
+		return false
+	}
+
+	editToolIDs := make(map[string]bool)
+	if blocks, ok := prev["content"].([]interface{}); ok {
+		for _, bi := range blocks {
+			b, ok := bi.(map[string]interface{})
+			if !ok || b["type"] != "tool_use" {
+				continue
+			}
+			name, _ := b["name"].(string)
+			switch strings.ToLower(name) {
+			case "edit", "str_replace_editor", "update", "notebookedit":
+				if id, ok := b["id"].(string); ok && id != "" {
+					editToolIDs[id] = true
+				}
+			}
+		}
+	}
+	if len(editToolIDs) == 0 {
+		return false
+	}
+
+	if blocks, ok := last["content"].([]interface{}); ok {
+		for _, bi := range blocks {
+			b, ok := bi.(map[string]interface{})
+			if !ok || b["type"] != "tool_result" {
+				continue
+			}
+			tid, _ := b["tool_use_id"].(string)
+			isErr, _ := b["is_error"].(bool)
+			if isErr && editToolIDs[tid] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isAllHexDigits backs the toolu_<name>_<nanots>_<seq> id-recovery parse in
+// ConvertClaudeRequestToGemini below — nextToolCallID (sse.go) hex-encodes
+// its timestamp/sequence segments to stay within Anthropic's 64-char
+// tool_use.id limit, so the trailing-numeric-segment check here has to
+// accept hex digits too, not just decimal ones.
+func isAllHexDigits(s string) bool {
 	if s == "" {
 		return false
 	}
 	for _, c := range s {
-		if c < '0' || c > '9' {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
@@ -195,6 +255,10 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	if globalLoopGuard.CheckAndResetOscillation(loopKey) {
 		InjectUserNudge(reqMap, NudgeOscillation)
 		LogGateway(".. tool-call oscillation [%s] -> injecting loop-nudge", loopKey)
+	}
+	if editFailStreak := globalLoopGuard.RecordEditResult(loopKey, lastTurnHadFailedEdit(reqMap)); editFailStreak >= 3 {
+		InjectUserNudge(reqMap, NudgeEditFailureLoop)
+		LogGateway(".. %d consecutive Edit failures [%s] -> injecting edit-failure-loop nudge", editFailStreak, loopKey)
 	}
 
 	// 3. Full AST Sanitization (Middle Truncation 64KB, Non-empty sentinels, role repair, tool pairing)
@@ -360,7 +424,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							if rest, ok := strings.CutPrefix(toolUseID, "toolu_"); ok {
 								segs := strings.Split(rest, "_")
 								end := len(segs)
-								for end > 0 && isAllDigits(segs[end-1]) {
+								for end > 0 && isAllHexDigits(segs[end-1]) {
 									end--
 								}
 								if end > 0 {

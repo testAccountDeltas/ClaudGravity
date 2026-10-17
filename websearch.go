@@ -199,10 +199,33 @@ func searchWithGoogleGrounding(ctx context.Context, query string, googleToken st
 	}
 	summaryText := strings.TrimSpace(sb.String())
 
+	// groundingSupports links specific sentences of summaryText back to the
+	// specific chunk(s) that back them (segment.text + groundingChunkIndices) —
+	// without this, every result's snippet was the same first-300-chars of
+	// the WHOLE summary regardless of which source it actually came from.
+	chunkSnippets := make(map[int]string)
+	if supports := cand.Get("groundingMetadata.groundingSupports"); supports.IsArray() {
+		for _, sup := range supports.Array() {
+			segText := strings.TrimSpace(sup.Get("segment.text").String())
+			if segText == "" {
+				continue
+			}
+			sup.Get("groundingChunkIndices").ForEach(func(_, idx gjson.Result) bool {
+				i := int(idx.Int())
+				if existing, ok := chunkSnippets[i]; ok {
+					chunkSnippets[i] = existing + " " + segText
+				} else {
+					chunkSnippets[i] = segText
+				}
+				return true
+			})
+		}
+	}
+
 	var results []WebSearchResultItem
 	if chunks := cand.Get("groundingMetadata.groundingChunks"); chunks.IsArray() {
 		seen := make(map[string]bool)
-		for _, c := range chunks.Array() {
+		for i, c := range chunks.Array() {
 			uri := c.Get("web.uri").String()
 			title := c.Get("web.title").String()
 			if uri != "" && !seen[uri] {
@@ -210,7 +233,10 @@ func searchWithGoogleGrounding(ctx context.Context, query string, googleToken st
 				if title == "" {
 					title = uri
 				}
-				snippet := summaryText
+				snippet, ok := chunkSnippets[i]
+				if !ok || snippet == "" {
+					snippet = summaryText
+				}
 				if len([]rune(snippet)) > 300 {
 					snippet = string([]rune(snippet)[:300]) + "..."
 				}
