@@ -263,32 +263,41 @@ func (am *AccountManager) triggerProjectIDProbe(email, accessToken string) {
 		} else {
 			LogGateway("[AccountManager] %s: project_id probe confirmed %q", email, acc.ProjectID)
 		}
-		am.persistAccountLocked(acc)
+		filePath, projectID, probed := acc.FilePath, acc.ProjectID, acc.ProjectIDProbed
 		am.mu.Unlock()
+		// Disk I/O moved outside am.mu: this used to run the ReadFile +
+		// WriteFile round-trip to the account's auth JSON while still
+		// holding the SAME global lock every other account operation
+		// (routing, quota refresh, token refresh) needs — a slow disk
+		// here stalled every concurrent subagent's request routing for as
+		// long as the write took.
+		persistAccountFields(filePath, projectID, probed)
 	}()
 }
 
-// persistAccountLocked writes project_id/project_id_probed back to the
-// account's own auth JSON file. Caller must hold am.mu. Only those two fields
-// are touched — every other key in the file (tokens, timestamps, whatever a
-// future version adds) passes through untouched.
-func (am *AccountManager) persistAccountLocked(acc *AccountRecord) {
-	if acc.FilePath == "" {
+// persistAccountFields writes project_id/project_id_probed back to the
+// account's own auth JSON file. Only those two fields are touched — every
+// other key in the file (tokens, timestamps, whatever a future version
+// adds) passes through untouched. Takes a snapshot of the fields rather
+// than the live *AccountRecord so callers can do this disk I/O without
+// holding am.mu.
+func persistAccountFields(filePath, projectID string, probed bool) {
+	if filePath == "" {
 		return
 	}
-	data, err := os.ReadFile(acc.FilePath)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return
 	}
-	updated, err := sjson.SetBytes(data, "project_id", acc.ProjectID)
+	updated, err := sjson.SetBytes(data, "project_id", projectID)
 	if err != nil {
 		return
 	}
-	updated, err = sjson.SetBytes(updated, "project_id_probed", acc.ProjectIDProbed)
+	updated, err = sjson.SetBytes(updated, "project_id_probed", probed)
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(acc.FilePath, updated, 0644)
+	_ = os.WriteFile(filePath, updated, 0644)
 }
 
 // discoverAntigravityProjectID retrieves the account's real GCP project id via
@@ -412,9 +421,18 @@ func (am *AccountManager) FetchQuota(email string) error {
 		return fmt.Errorf("account not found")
 	}
 
-	// Ensure fresh token
+	// acc.AccessToken/ExpiresAt/ProjectID are written elsewhere under
+	// am.mu.Lock() (e.g. RefreshAccessToken itself) — reading them here
+	// without holding am.mu.RLock() first raced with those writers
+	// whenever a subagent request triggered a token refresh concurrently
+	// with this quota poll.
+	am.mu.RLock()
 	accToken := acc.AccessToken
-	if accToken == "" || time.Now().After(acc.ExpiresAt) {
+	expiresAt := acc.ExpiresAt
+	projectID := acc.ProjectID
+	am.mu.RUnlock()
+
+	if accToken == "" || time.Now().After(expiresAt) {
 		tok, err := am.RefreshAccessToken(email)
 		if err != nil {
 			am.mu.Lock()
@@ -426,7 +444,7 @@ func (am *AccountManager) FetchQuota(email string) error {
 	}
 
 	payload := map[string]string{
-		"project": acc.ProjectID,
+		"project": projectID,
 	}
 	bodyJSON, _ := json.Marshal(payload)
 

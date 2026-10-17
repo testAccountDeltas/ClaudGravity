@@ -38,7 +38,30 @@ const (
 	// ephemeral agentKeys a long-running gateway process accumulates.
 	loopGuardStaleAfter = 2 * time.Hour
 	loopGuardSweepEvery = 30 * time.Minute
+
+	// exploreReadWindowSize/exploreReadWindowThreshold are the read-loop
+	// limits for a research subagent (Explore/Plan role) instead of the
+	// main-agent ReadWindowSize/ReadWindowThreshold above. These roles are
+	// deliberately built to read 20-40+ files in a row with no Write/Edit
+	// at all — that IS the job, not a loop — so the main agent's
+	// 10-reads-in-15-turns threshold was firing on legitimate
+	// investigation and forcing an incomplete answer back to the parent
+	// agent well before the subagent had actually finished exploring.
+	exploreReadWindowSize      = 50
+	exploreReadWindowThreshold = 40
 )
+
+// readLoopLimits picks the LoopGuard read-loop window size and trip
+// threshold for this turn's agent. agentKey is ParseAgentInfo's own output
+// ("sub:<agentType>" for any subagent), so this needs no extra plumbing —
+// the role is already encoded in the same string LoopGuard keys its state
+// by.
+func readLoopLimits(agentKey string) (windowSize, threshold int) {
+	if strings.HasPrefix(agentKey, "sub:Explore") || strings.HasPrefix(agentKey, "sub:Plan") {
+		return exploreReadWindowSize, exploreReadWindowThreshold
+	}
+	return ReadWindowSize, ReadWindowThreshold
+}
 
 type LoopGuardManager struct {
 	mu           sync.Mutex
@@ -88,7 +111,7 @@ func (lg *LoopGuardManager) touchLocked(agentKey string) {
 // sliding window. madeProgress (a Write/Edit happened, or the turn carried a
 // substantial amount of actual explanatory text/thinking — not just "let me
 // check X") wipes the window: that's real forward motion, not skimming.
-func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeProgress bool) {
+func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeProgress bool, windowSize int) {
 	if agentKey == "" || agentKey == "auxiliary" || strings.HasPrefix(agentKey, "auxiliary|") {
 		return
 	}
@@ -103,8 +126,8 @@ func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeP
 	}
 
 	w := append(lg.readWindows[agentKey], readCount)
-	if len(w) > ReadWindowSize {
-		w = w[len(w)-ReadWindowSize:]
+	if len(w) > windowSize {
+		w = w[len(w)-windowSize:]
 	}
 	lg.readWindows[agentKey] = w
 }
@@ -117,7 +140,15 @@ func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeP
 // acknowledges the soft nudge, then immediately reads again), so the second
 // firing gets much more directive wording instead of repeating the same
 // whisper indefinitely.
-func (lg *LoopGuardManager) CheckAndResetReadStreak(agentKey string) int {
+// CheckAndResetReadStreak takes an explicit threshold instead of always
+// using the package-level ReadWindowThreshold: a research subagent
+// (Explore/Plan) is deliberately built to read 20-40+ files in a row with
+// no Write/Edit at all — that's its entire job, not a loop — so the same
+// 10-read threshold tuned for the main agent was cutting these subagents
+// off mid-investigation and forcing them to return an incomplete answer.
+// See readThresholdForAgent in translator.go, which picks the threshold
+// passed in here based on the agent's role.
+func (lg *LoopGuardManager) CheckAndResetReadStreak(agentKey string, threshold int) int {
 	if agentKey == "" || agentKey == "auxiliary" || strings.HasPrefix(agentKey, "auxiliary|") {
 		return 0
 	}
@@ -128,7 +159,7 @@ func (lg *LoopGuardManager) CheckAndResetReadStreak(agentKey string) int {
 	for _, c := range lg.readWindows[agentKey] {
 		total += c
 	}
-	if total >= ReadWindowThreshold {
+	if total >= threshold {
 		delete(lg.readWindows, agentKey)
 		lg.nudgeCount[agentKey]++
 		return lg.nudgeCount[agentKey]

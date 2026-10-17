@@ -177,12 +177,22 @@ func anthropicErrorTypeForStatus(status int) string {
 
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
 	w.Header().Set("Content-Type", "application/json")
+	// The real Anthropic API answers an overloaded backend with HTTP 529,
+	// not 502/503/504 — some SDK retry/backoff logic keys off the literal
+	// wire status code, not just the JSON "type" field, so passing
+	// Google's own upstream gateway status through verbatim here left that
+	// 529-specific path unreachable. The body's "type" still says
+	// "overloaded_error" either way; only the status line changes.
+	wireStatus := status
+	if errType == "overloaded_error" {
+		wireStatus = 529
+	}
 	if status == http.StatusTooManyRequests {
 		w.Header().Set("Retry-After", "5")
-	} else if status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout {
+	} else if errType == "overloaded_error" {
 		w.Header().Set("Retry-After", "3")
 	}
-	w.WriteHeader(status)
+	w.WriteHeader(wireStatus)
 	body, _ := json.Marshal(map[string]interface{}{
 		"type": "error",
 		"error": map[string]string{
@@ -676,7 +686,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				rid, attempt+1, maxAttempts, bump, tenant.Name, accLabel, modelName, budget, isStreaming, len(geminiBody), agentKey)
 
 			if isStreaming {
-				success, lastStatus, lastErr = executeStreamingWithWatchdog(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes, syntheticReasonTools)
+				success, lastStatus, lastErr = executeStreamingWithWatchdog(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes, syntheticReasonTools)
 			} else {
 				success, lastStatus, lastErr = executeNonStreaming(rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes, syntheticReasonTools)
 			}
@@ -725,6 +735,16 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			excludedAccounts[activeAcc.Email] = true
 			if lastStatus == 429 || strings.Contains(fmt.Sprint(lastErr), "RESOURCE_EXHAUSTED") {
 				globalAccountManager.MarkAccountCooldown(activeAcc.Email, 15*time.Minute)
+			} else if lastStatus == http.StatusForbidden {
+				// 403 means Google itself has rejected this account (banned,
+				// suspended, region-gated) — not a transient rate limit.
+				// excludedAccounts above only keeps it out of THIS request's
+				// retry loop; without also unsticking it, every future
+				// request for the same conversation keeps getting routed
+				// right back to it by Session Affinity until a human
+				// notices and disables it by hand.
+				globalAccountManager.MarkAccountCooldown(activeAcc.Email, 60*time.Minute)
+				globalSelector.UnstickAccount(activeAcc.Email)
 			}
 		}
 
@@ -744,6 +764,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 }
 
 func executeStreamingWithWatchdog(
+	baseCtx context.Context,
 	rid uint64,
 	t0 time.Time,
 	activeAcc *AccountRecord,
@@ -786,7 +807,14 @@ func executeStreamingWithWatchdog(
 		maxStreamDuration = 30 * time.Minute
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// Deriving from baseCtx (the original http.Request's context) instead of
+	// context.Background() means a client that disconnects (Ctrl+C, closed
+	// terminal, dropped connection) now actually cancels the in-flight
+	// upstream Google request immediately — net/http cancels a request's
+	// Context on client disconnect — instead of letting the generation run
+	// to completion anyway and silently burning the account's quota for a
+	// response nobody will ever read.
+	ctx, cancel := context.WithCancel(baseCtx)
 
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
@@ -1046,7 +1074,8 @@ UpstreamReady:
 		madeProgress = streamer.textChars > 200
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
-	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress)
+	readWindowSize, _ := readLoopLimits(agentKey)
+	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress, readWindowSize)
 
 	hasIgnoreTag := strings.Contains(streamer.lastText, OscIgnoreTag)
 	globalLoopGuard.RecordToolCalls(loopKey, streamer.toolCallSignatures, hasIgnoreTag)
@@ -1824,9 +1853,18 @@ func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Fetch fresh quota directly
-	_ = globalAccountManager.FetchQuota(acc.Email)
-	acc, _ = globalAccountManager.GetAccount(acc.Email)
+	// Only block on a real network round-trip the first time this account
+	// has no quota data at all (same first-fetch rule applyRateLimitHeaders
+	// uses) — this used to re-fetch synchronously on every single poll of
+	// this endpoint, hanging the response for however long Google's quota
+	// call took. Serve the cached snapshot and let the usual
+	// 45s-staleness async refresh catch it up in the background.
+	if len(acc.Quotas) == 0 {
+		_ = globalAccountManager.FetchQuota(acc.Email)
+		acc, _ = globalAccountManager.GetAccount(acc.Email)
+	} else {
+		globalAccountManager.TriggerAsyncQuotaRefresh(acc.Email, 45*time.Second)
+	}
 
 	type BucketOut struct {
 		Window           string  `json:"window"`
@@ -2000,9 +2038,20 @@ func handleOAuthUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Fetch fresh quota directly
-	_ = globalAccountManager.FetchQuota(acc.Email)
-	acc, _ = globalAccountManager.GetAccount(acc.Email)
+	// Only block on a real network round-trip the FIRST time this account
+	// has no quota data at all (matching applyRateLimitHeaders' own
+	// first-fetch rule) — every call after that used to re-fetch
+	// synchronously on every single /usage poll, so the command hung for
+	// however long Google's quota endpoint took (seconds, under any load).
+	// Serve the cached snapshot immediately and let the same
+	// 45s-staleness async refresh everyone else already uses catch it up
+	// in the background.
+	if len(acc.Quotas) == 0 {
+		_ = globalAccountManager.FetchQuota(acc.Email)
+		acc, _ = globalAccountManager.GetAccount(acc.Email)
+	} else {
+		globalAccountManager.TriggerAsyncQuotaRefresh(acc.Email, 45*time.Second)
+	}
 
 	// Real wire shape, captured live via MITM against a genuine, logged-in
 	// api.anthropic.com session (claude-native-capture/resp_024.json) — this

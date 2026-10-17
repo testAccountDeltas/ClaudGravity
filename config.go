@@ -120,6 +120,20 @@ func randomSecret() string {
 	return hex.EncodeToString(b)
 }
 
+// atomicWriteFile writes via a temp file + os.Rename instead of a direct
+// os.WriteFile, so a process killed mid-write (crash, OOM-kill, power loss)
+// can never leave config.json half-written — os.WriteFile truncates the
+// real file in place before writing the new bytes, so a process that dies
+// between the truncate and the final byte leaves it empty/corrupt, and this
+// file holds every tenant's API key and the dashboard password.
+func atomicWriteFile(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 func (cm *ConfigManager) Save() error {
 	cm.mu.RLock()
 	data, err := json.MarshalIndent(cm.cfg, "", "  ")
@@ -127,7 +141,7 @@ func (cm *ConfigManager) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cm.path, data, 0644)
+	return atomicWriteFile(cm.path, data)
 }
 
 func (cm *ConfigManager) GetTenant(apiKey string) (TenantConfig, bool) {
@@ -180,7 +194,7 @@ func (cm *ConfigManager) CreateAPIKey(name string, stickyAccount string, strateg
 
 	data, err := json.MarshalIndent(cm.cfg, "", "  ")
 	if err == nil {
-		_ = os.WriteFile(cm.path, data, 0644)
+		_ = atomicWriteFile(cm.path, data)
 	}
 
 	return key, nil
@@ -193,7 +207,7 @@ func (cm *ConfigManager) DeleteAPIKey(apiKey string) error {
 	delete(cm.cfg.Tenants, apiKey)
 	data, err := json.MarshalIndent(cm.cfg, "", "  ")
 	if err == nil {
-		_ = os.WriteFile(cm.path, data, 0644)
+		_ = atomicWriteFile(cm.path, data)
 	}
 	return nil
 }

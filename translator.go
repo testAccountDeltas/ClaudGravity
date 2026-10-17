@@ -176,13 +176,14 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 
 	// 2. Loop-Guard Nudges (Read-Loop & Oscillation)
-	if level := globalLoopGuard.CheckAndResetReadStreak(loopKey); level > 0 {
+	_, readThreshold := readLoopLimits(agentKey)
+	if level := globalLoopGuard.CheckAndResetReadStreak(loopKey, readThreshold); level > 0 {
 		nudgeText := NudgeReadLoop
 		if level >= 2 {
 			nudgeText = NudgeReadLoopEscalated
 		}
 		InjectUserNudge(reqMap, nudgeText)
-		LogGateway(".. read-loop window >= %d Read calls [%s] level=%d -> injecting stop-nudge", ReadWindowThreshold, loopKey, level)
+		LogGateway(".. read-loop window >= %d Read calls [%s] level=%d -> injecting stop-nudge", readThreshold, loopKey, level)
 	}
 	if globalLoopGuard.CheckAndResetOscillation(loopKey) {
 		InjectUserNudge(reqMap, NudgeOscillation)
@@ -650,6 +651,12 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		var seqs []string
 		for _, s := range stopSeqs.Array() {
 			seqs = append(seqs, s.String())
+		}
+		// Google hard-caps generationConfig.stopSequences at 5 entries —
+		// anything past that fails the whole request with a 400
+		// INVALID_ARGUMENT instead of just ignoring the extras.
+		if len(seqs) > 5 {
+			seqs = seqs[:5]
 		}
 		if len(seqs) > 0 {
 			seqsJSON, _ := json.Marshal(seqs)

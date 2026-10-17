@@ -336,6 +336,18 @@ func mergeAllOf(jsonStr string) string {
 				}
 				jsonStr, _ = sjson.Set(jsonStr, reqPath, current)
 			}
+			// A scalar allOf member (type-level composition, e.g. Pydantic
+			// emitting {"allOf":[{"type":"string","enum":["a","b"]}],
+			// "description":"..."}) has no "properties"/"required" at all —
+			// only the two cases above were handled, so the whole allOf key
+			// got deleted below with its type/enum/format never merged
+			// anywhere, leaving the parameter with no "type" at all and
+			// Google rejecting it outright.
+			for _, kw := range []string{"type", "enum", "format"} {
+				if v := item.Get(kw); v.Exists() && !gjson.Get(jsonStr, joinPath(parentPath, kw)).Exists() {
+					jsonStr, _ = sjson.SetRaw(jsonStr, joinPath(parentPath, kw), v.Raw)
+				}
+			}
 		}
 		jsonStr, _ = sjson.Delete(jsonStr, p)
 	}
