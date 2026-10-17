@@ -177,7 +177,15 @@ func TruncateMiddle(text string) (string, bool) {
 	if n <= ToolOutputCharLimit {
 		return text, false
 	}
-	half := ToolOutputCharLimit / 2
+	// Reserve room for the marker itself (its two counts can each run to
+	// ~20 digits for a pathological input) so head+marker+tail never
+	// exceeds ToolOutputCharLimit — otherwise the result re-triggers the
+	// n <= ToolOutputCharLimit check above on the next pass (this function
+	// runs once per SanitizeMessagesAndGraph call, and that now runs more
+	// than once per request) and keeps re-truncating/re-stamping a new
+	// marker over the previous one every time.
+	const truncateMarkerBudget = 128
+	half := (ToolOutputCharLimit - truncateMarkerBudget) / 2
 
 	// Align head cut to valid UTF-8 boundary
 	headIdx := half
@@ -193,6 +201,26 @@ func TruncateMiddle(text string) (string, bool) {
 
 	marker := fmt.Sprintf("\n<truncated %d of %d chars from the middle of the output>\n", tailIdx-headIdx, n)
 	return text[:headIdx] + marker + text[tailIdx:], true
+}
+
+// blocksToInterfaceSlice converts a concrete []map[string]interface{} content
+// block list into a plain []interface{} — the type every OTHER consumer of
+// claudeReqJSON["messages"][i]["content"] (context_window.go's
+// conservativeTokenEstimate, translator.go's lastTurnHadFailedEdit,
+// loopguard.go's InjectUserNudge) type-switches on, because that's the type
+// encoding/json itself produces when the original request is decoded. Any
+// "content" field this file sets directly from a concrete
+// []map[string]interface{} must go through this first, or those downstream
+// type assertions silently fail (wrong token estimate, blind edit-failure
+// detector, duplicate "user" turns — see commit history for the incident
+// this caused when SanitizeMessagesAndGraph started running more than once
+// per request).
+func blocksToInterfaceSlice(blocks []map[string]interface{}) []interface{} {
+	out := make([]interface{}, len(blocks))
+	for i, b := range blocks {
+		out[i] = b
+	}
+	return out
 }
 
 // SanitizeMessagesAndGraph performs AST-level pre-flight sanitization on conversation messages:
@@ -668,6 +696,23 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 	if modified {
 		var genericList []interface{}
 		for _, m := range newMsgs {
+			// Every step above (normalization, merging, synthesis) works
+			// against the concrete []map[string]interface{} content type
+			// internally — e.g. Step 3's merge-consecutive-roles type
+			// assertion right above requires exactly that, with no ", ok"
+			// to fall back on. Converting any earlier would panic there.
+			// Only now, on the way OUT to claudeReqJSON (which every other
+			// consumer — context_window.go's conservativeTokenEstimate,
+			// translator.go's lastTurnHadFailedEdit, loopguard.go's
+			// InjectUserNudge — type-switches expecting the same
+			// []interface{} encoding/json itself would have produced) do
+			// we convert. Skipping this step is what silently blinded all
+			// three of those on every request past the first
+			// SanitizeMessagesAndGraph call once it started running more
+			// than once per request.
+			if blocks, ok := m["content"].([]map[string]interface{}); ok {
+				m["content"] = blocksToInterfaceSlice(blocks)
+			}
 			genericList = append(genericList, m)
 		}
 		claudeReqJSON["messages"] = genericList

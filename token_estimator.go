@@ -176,7 +176,11 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 											decodedBytes := len(dataStr) * 3 / 4
 											est = decodedBytes / 2
 										}
-										if est < 1600 {
+										// The 1600-token floor approximates a minimum
+										// "page" cost for PDFs — applying it to a small
+										// text document (a short code snippet, a tiny
+										// CSV) overstates its real size for no reason.
+										if (mediaType == "application/pdf" || mediaType == "") && est < 1600 {
 											est = 1600
 										}
 										total += est

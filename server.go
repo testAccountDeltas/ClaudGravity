@@ -1574,8 +1574,44 @@ func executeNonStreaming(
 	}
 	if pf := geminiJSON.Get("promptFeedback"); pf.Exists() {
 		if br := pf.Get("blockReason").String(); br != "" && br != "BLOCK_REASON_UNSPECIFIED" {
-			writeAnthropicError(w, http.StatusOK, "invalid_request_error", "Request was blocked by upstream safety filters: "+br)
-			return false, http.StatusOK, fmt.Errorf("prompt blocked by safety filters: %s", br)
+			// The streaming path (sse.go) treats this as a normal completed
+			// turn with stop_reason "refusal" — a real message object, not
+			// an error. This path used to send writeAnthropicError's
+			// {"type":"error",...} body with HTTP 200, which the official
+			// Anthropic SDKs reject outright: a 200 status means "parse
+			// this as a message object," so the SDK's own response
+			// validation throws before the caller ever sees the refusal
+			// text. Build the same shape the streaming path produces
+			// instead, so a prompt blocked before any candidate exists
+			// behaves identically whether this request happened to stream
+			// or not.
+			blockRespModel := gjson.GetBytes(claudeBodyBytes, "model").String()
+			if blockRespModel == "" {
+				blockRespModel = modelName
+			}
+			blockResp := map[string]interface{}{
+				"id":      fmt.Sprintf("msg_%d", time.Now().UnixNano()),
+				"type":    "message",
+				"role":    "assistant",
+				"model":   blockRespModel,
+				"content": []map[string]interface{}{{"type": "text", "text": "I am unable to complete this request because it was flagged by upstream safety filters: " + br}},
+				"usage": map[string]interface{}{
+					"input_tokens":  0,
+					"output_tokens": 0,
+				},
+				"stop_reason":   "refusal",
+				"stop_sequence": nil,
+				"stop_details": map[string]interface{}{
+					"type":        "refusal",
+					"category":    "general_harms",
+					"explanation": "Content blocked by safety policy",
+				},
+			}
+			blockJSON, _ := json.Marshal(blockResp)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(blockJSON)
+			return true, http.StatusOK, nil
 		}
 	}
 	inTok := geminiJSON.Get("usageMetadata.promptTokenCount").Int()
