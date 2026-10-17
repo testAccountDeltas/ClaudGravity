@@ -52,3 +52,4 @@ undefined/
 # новый внутренний *.md файл не проскочит по умолчанию.
 *.md
 !README.md
+!AUDIT_CLAUDE_GEMINI_100PCT.md
