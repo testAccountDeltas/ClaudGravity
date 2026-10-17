@@ -53,13 +53,36 @@ func GetSessionCWD(sessionID string) string {
 	return sessionCWDMap[sessionID]
 }
 
+func isAbsPath(p string) bool {
+	if filepath.IsAbs(p) {
+		return true
+	}
+	if len(p) >= 3 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':' && (p[2] == '\\' || p[2] == '/') {
+		return true
+	}
+	if len(p) >= 2 && (p[0] == '\\' || p[0] == '/') && p[0] == p[1] {
+		return true
+	}
+	return false
+}
+
+func joinCWD(cwd, path string) string {
+	if isAbsPath(path) {
+		return path
+	}
+	if strings.Contains(cwd, "\\") {
+		return strings.TrimRight(cwd, "\\/") + "\\" + strings.TrimLeft(path, "\\/")
+	}
+	return filepath.Join(cwd, path)
+}
+
 // isWithinSessionCWD reports whether path is the session's recorded working
 // directory or a descendant of it. Returns false (refuse) if the session's
 // CWD is unknown, or the file resolution never caught up to produce an
 // absolute path — an unconstrained read is worse than a missed repair.
 func isWithinSessionCWD(path, sessionID string) bool {
 	cwd := GetSessionCWD(sessionID)
-	if cwd == "" || !filepath.IsAbs(path) {
+	if cwd == "" || !isAbsPath(path) {
 		return false
 	}
 	absCWD, err := filepath.Abs(cwd)
@@ -205,6 +228,7 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 
 	toolIDToName := make(map[string]string)
 	toolIDToPath := make(map[string]string)
+	toolIDIsPartial := make(map[string]bool)
 
 	// A tool_use's own result (is_error:true on a failed old_string match)
 	// arrives in a LATER message than the tool_use itself, so it has to be
@@ -252,6 +276,9 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					return true
 				}
 				toolIDToPath[id] = path
+				if name == "read" && (input.Get("offset").Exists() || input.Get("limit").Exists()) {
+					toolIDIsPartial[id] = true
+				}
 				if failedToolIDs[id] {
 					return true
 				}
@@ -263,9 +290,9 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					if c := input.Get("content"); c.Exists() {
 						contentStr := c.String()
 						setSessionSnapshot(sessionID, path, contentStr)
-						if !filepath.IsAbs(path) {
+						if !isAbsPath(path) {
 							if cwd := GetSessionCWD(sessionID); cwd != "" {
-								setSessionSnapshot(sessionID, filepath.Join(cwd, path), contentStr)
+								setSessionSnapshot(sessionID, joinCWD(cwd, path), contentStr)
 							}
 						}
 					}
@@ -284,9 +311,9 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 							}
 							updated := strings.Replace(cur, oldStr, newStr, n)
 							setSessionSnapshot(sessionID, path, updated)
-							if !filepath.IsAbs(path) {
+							if !isAbsPath(path) {
 								if cwd := GetSessionCWD(sessionID); cwd != "" {
-									setSessionSnapshot(sessionID, filepath.Join(cwd, path), updated)
+									setSessionSnapshot(sessionID, joinCWD(cwd, path), updated)
 								}
 							}
 						}
@@ -323,10 +350,14 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 				}
 				if resText != "" {
 					cleanContent := stripCatNPrefix(resText)
-					setSessionSnapshot(sessionID, path, cleanContent)
-					if !filepath.IsAbs(path) {
-						if cwd := GetSessionCWD(sessionID); cwd != "" {
-							setSessionSnapshot(sessionID, filepath.Join(cwd, path), cleanContent)
+					isPartial := toolIDIsPartial[toolUseID]
+					_, hasFullSnap := getSessionSnapshot(sessionID, path)
+					if !isPartial || !hasFullSnap {
+						setSessionSnapshot(sessionID, path, cleanContent)
+						if !isAbsPath(path) {
+							if cwd := GetSessionCWD(sessionID); cwd != "" {
+								setSessionSnapshot(sessionID, joinCWD(cwd, path), cleanContent)
+							}
 						}
 					}
 				}
@@ -454,13 +485,14 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 	}
 
 	// 3. Resolve path against filesystem and session CWD
+	cwdCandidate := ""
 	resolvedPath := targetPath
-	if !filepath.IsAbs(resolvedPath) {
+	if !isAbsPath(resolvedPath) {
 		cwd := GetSessionCWD(sessionID)
 		if cwd != "" {
-			candidate := filepath.Join(cwd, resolvedPath)
-			if _, err := os.Stat(candidate); err == nil {
-				resolvedPath = candidate
+			cwdCandidate = joinCWD(cwd, resolvedPath)
+			if _, err := os.Stat(cwdCandidate); err == nil {
+				resolvedPath = cwdCandidate
 			}
 		}
 	}
@@ -488,6 +520,9 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 		snap, ok := getSessionSnapshot(sessionID, targetPath)
 		if !ok {
 			snap, ok = getSessionSnapshot(sessionID, resolvedPath)
+		}
+		if !ok && cwdCandidate != "" {
+			snap, ok = getSessionSnapshot(sessionID, cwdCandidate)
 		}
 		if !ok {
 			return argsRaw, false
@@ -561,12 +596,21 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 	if ok && repairedExact != "" {
 		repaired, err := sjson.Set(argsRaw, oldStrKey, repairedExact)
 		if err == nil {
-			// Ensure new_string matches CRLF if file is CRLF
-			if hasCRLF && newStrKey != "" {
-				newCRLFCandidate := strings.ReplaceAll(strings.ReplaceAll(newStr, "\r\n", "\n"), "\n", "\r\n")
-				if newCRLFCandidate != newStr {
-					if withNew, err2 := sjson.Set(repaired, newStrKey, newCRLFCandidate); err2 == nil {
-						repaired = withNew
+			// Ensure new_string matches CRLF/LF line endings of file
+			if newStrKey != "" {
+				if hasCRLF {
+					newCRLFCandidate := strings.ReplaceAll(strings.ReplaceAll(newStr, "\r\n", "\n"), "\n", "\r\n")
+					if newCRLFCandidate != newStr {
+						if withNew, err2 := sjson.Set(repaired, newStrKey, newCRLFCandidate); err2 == nil {
+							repaired = withNew
+						}
+					}
+				} else {
+					newLFCandidate := strings.ReplaceAll(newStr, "\r\n", "\n")
+					if newLFCandidate != newStr {
+						if withNew, err2 := sjson.Set(repaired, newStrKey, newLFCandidate); err2 == nil {
+							repaired = withNew
+						}
 					}
 				}
 			}
@@ -582,6 +626,10 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 func findFuzzyLineMatch(fileContent, oldStr string) (string, bool) {
 	// Parse model lines
 	rawOldLines := strings.Split(strings.ReplaceAll(oldStr, "\r\n", "\n"), "\n")
+	hasTrailingNewline := strings.HasSuffix(oldStr, "\n") || strings.HasSuffix(oldStr, "\r")
+	if hasTrailingNewline && len(rawOldLines) > 1 && rawOldLines[len(rawOldLines)-1] == "" {
+		rawOldLines = rawOldLines[:len(rawOldLines)-1]
+	}
 	if len(rawOldLines) == 0 {
 		return "", false
 	}

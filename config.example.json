@@ -1,7 +1,7 @@
 {
   "server": {
     "port": 8898,
-    "panic_timeout_seconds": 30,
+    "panic_timeout_seconds": 60,
     "ttft_timeout_seconds": 180,
     "read_timeout_seconds": 600,
     "tls_port": 8900,

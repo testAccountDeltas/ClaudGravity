@@ -195,7 +195,15 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 					case "document":
 						src := part.Get("source")
 						if src.Get("type").String() == "base64" {
-							est := len(src.Get("data").String()) / 500
+							mediaType := strings.ToLower(src.Get("media_type").String())
+							dataStr := src.Get("data").String()
+							var est int
+							if mediaType == "application/pdf" || mediaType == "" {
+								est = len(dataStr) / 500
+							} else {
+								decodedBytes := len(dataStr) * 3 / 4
+								est = decodedBytes / 2
+							}
 							if est < 1600 {
 								est = 1600
 							}

@@ -482,12 +482,12 @@ func main() {
 	// mux, so an HTTPS_PROXY-only client fell through to PassthroughToReal
 	// here and got a real 401 from api.anthropic.com for every one of
 	// them (no genuine Anthropic session behind this gateway's key).
-	interceptedMux.HandleFunc("/api/claude_cli_profile", handleProfileJSON)
-	interceptedMux.HandleFunc("/api/oauth/profile", handleProfileJSON)
-	interceptedMux.HandleFunc("/api/oauth/validate", handleValidateJSON)
-	interceptedMux.HandleFunc("/api/claude_code/organizations/metrics_enabled", handleMetricsJSON)
-	interceptedMux.HandleFunc("/api/claude_code/settings", handleSettingsJSON)
-	interceptedMux.HandleFunc("/managed/settings", handleSettingsJSON)
+	interceptedMux.Handle("/api/claude_cli_profile", commonAPIMiddleware(http.HandlerFunc(handleProfileJSON)))
+	interceptedMux.Handle("/api/oauth/profile", commonAPIMiddleware(http.HandlerFunc(handleProfileJSON)))
+	interceptedMux.Handle("/api/oauth/validate", commonAPIMiddleware(http.HandlerFunc(handleValidateJSON)))
+	interceptedMux.Handle("/api/claude_code/organizations/metrics_enabled", commonAPIMiddleware(http.HandlerFunc(handleMetricsJSON)))
+	interceptedMux.Handle("/api/claude_code/settings", commonAPIMiddleware(http.HandlerFunc(handleSettingsJSON)))
+	interceptedMux.Handle("/managed/settings", commonAPIMiddleware(http.HandlerFunc(handleSettingsJSON)))
 	interceptedMux.HandleFunc("/", PassthroughToReal)
 
 	proxySecret := cfgMgr.ProxySecret()
@@ -1228,7 +1228,7 @@ func executeStreamingWithWatchdog(
 				if res.err != nil {
 					LogGateway("[#%d] !! Upstream failed after panic: %v", rid, res.err)
 					wMu.Lock()
-					errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":"Upstream failed after panic: %v"}}`, res.err)
+					errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":%q}}`, fmt.Sprintf("Upstream failed after panic: %v", res.err))
 					_, _ = w.Write([]byte(fmt.Sprintf("event: error\ndata: %s\n\n", errPayload)))
 					flusher.Flush()
 					wMu.Unlock()
@@ -1535,6 +1535,37 @@ func executeNonStreaming(
 	if respNode := geminiJSON.Get("response"); respNode.Exists() {
 		geminiJSON = respNode
 	}
+	if errNode := geminiJSON.Get("error"); errNode.Exists() {
+		msg := errNode.Get("message").String()
+		errCode := int(errNode.Get("code").Int())
+		if errCode == 0 {
+			errCode = http.StatusInternalServerError
+		}
+		errStatus := errNode.Get("status").String()
+		errType := "api_error"
+		switch errStatus {
+		case "RESOURCE_EXHAUSTED":
+			errType = "rate_limit_error"
+		case "INVALID_ARGUMENT", "FAILED_PRECONDITION", "OUT_OF_RANGE":
+			errType = "invalid_request_error"
+		case "UNAUTHENTICATED":
+			errType = "authentication_error"
+		case "PERMISSION_DENIED":
+			errType = "permission_error"
+		case "NOT_FOUND":
+			errType = "not_found_error"
+		default:
+			errType = anthropicErrorTypeForStatus(errCode)
+		}
+		writeAnthropicError(w, errCode, errType, "Upstream error: "+msg)
+		return false, errCode, fmt.Errorf("upstream error: %s", msg)
+	}
+	if pf := geminiJSON.Get("promptFeedback"); pf.Exists() {
+		if br := pf.Get("blockReason").String(); br != "" && br != "BLOCK_REASON_UNSPECIFIED" {
+			writeAnthropicError(w, http.StatusOK, "invalid_request_error", "Request was blocked by upstream safety filters: "+br)
+			return false, http.StatusOK, fmt.Errorf("prompt blocked by safety filters: %s", br)
+		}
+	}
 	inTok := geminiJSON.Get("usageMetadata.promptTokenCount").Int()
 	outTok := geminiJSON.Get("usageMetadata.candidatesTokenCount").Int()
 	cacheTok := geminiJSON.Get("usageMetadata.cachedContentTokenCount").Int()
@@ -1741,7 +1772,7 @@ func executeNonStreaming(
 					// Same MAX_TOKENS-wins-over-tool_use priority as sse.go's
 					// FinishStream: a functionCall part being present
 					// doesn't mean it arrived complete.
-					if claudeResp["stop_reason"] != "max_tokens" {
+					if claudeResp["stop_reason"] != "max_tokens" && claudeResp["stop_reason"] != "refusal" {
 						claudeResp["stop_reason"] = "tool_use"
 					}
 				}

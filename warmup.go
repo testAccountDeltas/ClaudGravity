@@ -109,7 +109,6 @@ func WrapAntigravityPayload(modelName string, payload []byte, projectID string, 
 	// Derive stable session ID for prefix cache
 	sessionID := generateStableSessionID(payload, generation, fallbackSessionKey)
 	template, _ = sjson.Set(template, "request.sessionId", sessionID)
-	template, _ = sjson.Delete(template, "request.safetySettings")
 
 	return []byte(template)
 }

@@ -352,12 +352,12 @@ func (s *SSEStreamer) HandleThinking(text string, thoughtSignature string) error
 	if err := s.EnsureMessageStart(); err != nil {
 		return err
 	}
-	if s.thinkingFinished && s.currentType != TypeThinking {
+	if (s.thinkingFinished || s.currentIndex >= 0) && s.currentType != TypeThinking {
 		// Gemini can interleave thought -> text -> thought within one
 		// candidate; Anthropic allows at most one "thinking" block and it
 		// must be first. A second one a strict SDK's schema validation
-		// rejects outright, so once the first has closed, fold any further
-		// "thought" chunks into plain text instead of reopening one.
+		// rejects outright, so once the first has closed (or any non-thinking block
+		// has opened), fold any further "thought" chunks into plain text instead of reopening one.
 		return s.HandleText(text)
 	}
 	if s.currentType != TypeThinking {
@@ -740,6 +740,9 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 		}
 		errPayload := fmt.Sprintf(`{"type":"error","error":{"type":%q,"message":%q}}`, errType, "Upstream stream error: "+msg)
 		_ = s.SendRaw("error", errPayload)
+		s.mu.Lock()
+		s.hasFinished = true
+		s.mu.Unlock()
 		return fmt.Errorf("upstream stream error: %s", msg)
 	}
 

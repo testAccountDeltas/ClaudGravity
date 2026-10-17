@@ -82,6 +82,18 @@ func walkSchemaForNumericEnums(props gjson.Result, prefix string, fields map[str
 			path = prefix + "." + key.String()
 		}
 		t := val.Get("type").String()
+		if t == "" && val.Get("enum").IsArray() {
+			first := val.Get("enum.0")
+			if first.Type == gjson.Number {
+				if strings.Contains(first.Raw, ".") {
+					t = "number"
+				} else {
+					t = "integer"
+				}
+			} else if first.Type == gjson.True || first.Type == gjson.False {
+				t = "boolean"
+			}
+		}
 		if val.Get("enum").IsArray() && (t == "integer" || t == "number" || t == "boolean") {
 			fields[path] = t
 		}
@@ -96,6 +108,18 @@ func walkSchemaForNumericEnums(props gjson.Result, prefix string, fields map[str
 		if t == "array" {
 			items := val.Get("items")
 			itemType := items.Get("type").String()
+			if itemType == "" && items.Get("enum").IsArray() {
+				first := items.Get("enum.0")
+				if first.Type == gjson.Number {
+					if strings.Contains(first.Raw, ".") {
+						itemType = "number"
+					} else {
+						itemType = "integer"
+					}
+				} else if first.Type == gjson.True || first.Type == gjson.False {
+					itemType = "boolean"
+				}
+			}
 			if items.Get("enum").IsArray() && (itemType == "integer" || itemType == "number" || itemType == "boolean") {
 				fields[path] = "array:" + itemType
 			}
@@ -335,7 +359,9 @@ func removePlaceholderFields(jsonStr string) string {
 
 // convertRefsToHints converts $ref to description hints (Lazy Hint strategy).
 func convertRefsToHints(jsonStr string) string {
-	visitedRefs := make(map[string]int)
+	expandedRefPaths := make(map[string]string) // prefixPath -> refVal
+	expansionCount := make(map[string]int)      // refVal -> total expansions
+
 	for pass := 0; pass < 5; pass++ {
 		paths := findPaths(jsonStr, "$ref")
 		if len(paths) == 0 {
@@ -344,7 +370,14 @@ func convertRefsToHints(jsonStr string) string {
 		sortByDepth(paths)
 
 		for _, p := range paths {
-			refVal := gjson.Get(jsonStr, p).String()
+			refNode := gjson.Get(jsonStr, p)
+			if !refNode.Exists() {
+				continue
+			}
+			refVal := refNode.String()
+			if refVal == "" {
+				continue
+			}
 			parentPath := trimSuffix(p, ".$ref")
 
 			defName := refVal
@@ -352,17 +385,42 @@ func convertRefsToHints(jsonStr string) string {
 				defName = refVal[idx+1:]
 			}
 
-			// Prevent recursive schema explosion and OOM: stop after expanding each ref once
-			if visitedRefs[refVal] >= 1 {
+			// True recursion check: is this $ref being evaluated inside an ancestor path
+			// that already expanded the exact same refVal?
+			isRecursive := false
+			for prefix, expandedRef := range expandedRefPaths {
+				if expandedRef == refVal {
+					if prefix == "" || parentPath == prefix || strings.HasPrefix(parentPath, prefix+".") {
+						isRecursive = true
+						break
+					}
+				}
+			}
+			// Hard safety cap against runaway non-tree schemas
+			if expansionCount[refVal] >= 10 {
+				isRecursive = true
+			}
+
+			if isRecursive {
 				replacement := fmt.Sprintf(`{"type":"object","description":"Recursive reference: See %s"}`, defName)
 				jsonStr = setRawAt(jsonStr, parentPath, replacement)
 				continue
 			}
 
 			if def := resolveLocalRef(jsonStr, refVal); def != "" {
-				visitedRefs[refVal]++
+				expandedRefPaths[parentPath] = refVal
+				expansionCount[refVal]++
 				if existingDesc := gjson.Get(jsonStr, joinPath(parentPath, "description")).String(); existingDesc != "" {
 					def, _ = sjson.Set(def, "description", existingDesc)
+				}
+				// If replacing at root, preserve $defs / definitions so subsequent passes can resolve nested refs
+				if parentPath == "" {
+					if !gjson.Get(def, "$defs").Exists() && gjson.Get(jsonStr, "$defs").Exists() {
+						def, _ = sjson.SetRaw(def, "$defs", gjson.Get(jsonStr, "$defs").Raw)
+					}
+					if !gjson.Get(def, "definitions").Exists() && gjson.Get(jsonStr, "definitions").Exists() {
+						def, _ = sjson.SetRaw(def, "definitions", gjson.Get(jsonStr, "definitions").Raw)
+					}
 				}
 				jsonStr = setRawAt(jsonStr, parentPath, def)
 				continue
@@ -423,7 +481,11 @@ func convertConstToEnum(jsonStr string) string {
 		if !val.Exists() {
 			continue
 		}
-		enumPath := trimSuffix(p, ".const") + ".enum"
+		parentPath := trimSuffix(p, ".const")
+		if isPropertyDefinition(parentPath) {
+			continue
+		}
+		enumPath := parentPath + ".enum"
 		if !gjson.Get(jsonStr, enumPath).Exists() {
 			jsonStr, _ = sjson.Set(jsonStr, enumPath, []interface{}{val.Value()})
 		}
@@ -573,6 +635,13 @@ func flattenAnyOfOneOf(jsonStr string) string {
 			items := arr.Array()
 			bestIdx, allTypes := selectBest(items)
 			selected := items[bestIdx].Raw
+			if !gjson.Get(selected, "type").Exists() {
+				if gjson.Get(selected, "properties").Exists() {
+					selected, _ = sjson.Set(selected, "type", "object")
+				} else if gjson.Get(selected, "items").Exists() {
+					selected, _ = sjson.Set(selected, "type", "array")
+				}
+			}
 
 			// If all branches are strings with enums, merge all enum options together!
 			allEnums := make([]string, 0)
@@ -840,7 +909,11 @@ func cleanupRequiredFields(jsonStr string) string {
 
 		req := gjson.Get(jsonStr, p)
 		props := gjson.Get(jsonStr, propsPath)
-		if !req.IsArray() || !props.IsObject() {
+		if !req.IsArray() {
+			continue
+		}
+		if !props.IsObject() {
+			jsonStr, _ = sjson.Delete(jsonStr, p)
 			continue
 		}
 

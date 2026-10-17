@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -261,15 +262,13 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		hasModifyingTools = false
 	}
 	_, readThreshold := readLoopLimits(agentKey, hasModifyingTools)
-	if hasModifyingTools {
-		if level := globalLoopGuard.CheckAndResetReadStreak(loopKey, readThreshold); level > 0 {
-			nudgeText := NudgeReadLoop
-			if level >= 2 {
-				nudgeText = NudgeReadLoopEscalated
-			}
-			InjectUserNudge(reqMap, nudgeText)
-			LogGateway(".. read-loop window >= %d Read calls [%s] level=%d -> injecting stop-nudge", readThreshold, loopKey, level)
+	if level := globalLoopGuard.CheckAndResetReadStreak(loopKey, readThreshold); level > 0 {
+		nudgeText := NudgeReadLoop
+		if level >= 2 {
+			nudgeText = NudgeReadLoopEscalated
 		}
+		InjectUserNudge(reqMap, nudgeText)
+		LogGateway(".. read-loop window >= %d Read calls [%s] level=%d -> injecting stop-nudge", readThreshold, loopKey, level)
 	}
 	if globalLoopGuard.CheckAndResetOscillation(loopKey) {
 		InjectUserNudge(reqMap, NudgeOscillation)
@@ -392,10 +391,21 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							mediaType := src.Get("media_type").String()
 							b64Data := src.Get("data").String()
 							if b64Data != "" {
-								part := `{"inlineData":{"mimeType":"","data":""}}`
-								part, _ = sjson.Set(part, "inlineData.mimeType", mediaType)
-								part, _ = sjson.Set(part, "inlineData.data", b64Data)
-								partsJSON = append(partsJSON, part)
+								if mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/") {
+									part := `{"inlineData":{"mimeType":"","data":""}}`
+									part, _ = sjson.Set(part, "inlineData.mimeType", mediaType)
+									part, _ = sjson.Set(part, "inlineData.data", b64Data)
+									partsJSON = append(partsJSON, part)
+								} else {
+									// Plain text, code, CSV, JSON base64 documents:
+									// Gemini inlineData only accepts binary media types.
+									// Decode base64 to UTF-8 text!
+									if decoded, err := base64.StdEncoding.DecodeString(b64Data); err == nil && len(decoded) > 0 {
+										part := `{"text":""}`
+										part, _ = sjson.Set(part, "text", string(decoded))
+										partsJSON = append(partsJSON, part)
+									}
+								}
 							}
 						case "text":
 							// A plain-text document source (source.data is
@@ -483,6 +493,12 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 								// Last resort: any declared tool at least
 								// matches Google's validation; "tool" never
 								// does.
+								for name := range declaredToolNames {
+									fnName = name
+									break
+								}
+							}
+							if fnName == "" {
 								fnName = root.Get("tools.0.name").String()
 							}
 							if fnName == "" {
@@ -509,10 +525,16 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 										mediaType := src.Get("media_type").String()
 										data := src.Get("data").String()
 										if mediaType != "" && data != "" {
-											imgPart := `{"inlineData":{"mimeType":"","data":""}}`
-											imgPart, _ = sjson.Set(imgPart, "inlineData.mimeType", mediaType)
-											imgPart, _ = sjson.Set(imgPart, "inlineData.data", data)
-											imageParts = append(imageParts, imgPart)
+											if mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/") {
+												imgPart := `{"inlineData":{"mimeType":"","data":""}}`
+												imgPart, _ = sjson.Set(imgPart, "inlineData.mimeType", mediaType)
+												imgPart, _ = sjson.Set(imgPart, "inlineData.data", data)
+												imageParts = append(imageParts, imgPart)
+											} else {
+												if decoded, err := base64.StdEncoding.DecodeString(data); err == nil {
+													sb.Write(decoded)
+												}
+											}
 										}
 									case "text":
 										if txt := src.Get("data").String(); txt != "" {

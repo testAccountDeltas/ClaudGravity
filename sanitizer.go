@@ -117,7 +117,14 @@ func dedupedRepeatedReads(newMsgs []map[string]interface{}) bool {
 					continue
 				}
 				if path := firstNonEmptyFromMap(input, "file_path", "path", "target_file"); path != "" {
-					toolIDToPath[id] = canonicalSnapshotKey(path)
+					key := canonicalSnapshotKey(path)
+					if offset := input["offset"]; offset != nil {
+						key = fmt.Sprintf("%s:off=%v", key, offset)
+					}
+					if limit := input["limit"]; limit != nil {
+						key = fmt.Sprintf("%s:lim=%v", key, limit)
+					}
+					toolIDToPath[id] = key
 				}
 			case "tool_result":
 				tid, _ := b["tool_use_id"].(string)
@@ -251,6 +258,10 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 
 		switch content := m["content"].(type) {
 		case string:
+			if strings.Contains(content, "\x00") {
+				content = strings.ReplaceAll(content, "\x00", "")
+				modified = true
+			}
 			cleaned := StripPollutedToolCallText(content)
 			if cleaned != content {
 				content = cleaned
@@ -274,6 +285,11 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 
 				if bType == "text" {
 					txt, _ := b["text"].(string)
+					if strings.Contains(txt, "\x00") {
+						txt = strings.ReplaceAll(txt, "\x00", "")
+						b["text"] = txt
+						modified = true
+					}
 					cleaned := StripPollutedToolCallText(txt)
 					if cleaned != txt {
 						txt = cleaned
@@ -289,6 +305,11 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 					// Eager truncate tool_result
 					switch c := b["content"].(type) {
 					case string:
+						if strings.Contains(c, "\x00") {
+							c = strings.ReplaceAll(c, "\x00", "")
+							b["content"] = c
+							modified = true
+						}
 						if truncated, did := TruncateMiddle(c); did {
 							b["content"] = truncated
 							modified = true
@@ -299,6 +320,11 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 							p, ok := pItem.(map[string]interface{})
 							if ok && p["type"] == "text" {
 								if pt, ok := p["text"].(string); ok {
+									if strings.Contains(pt, "\x00") {
+										pt = strings.ReplaceAll(pt, "\x00", "")
+										p["text"] = pt
+										modified = true
+									}
 									if truncated, did := TruncateMiddle(pt); did {
 										p["text"] = truncated
 										modified = true

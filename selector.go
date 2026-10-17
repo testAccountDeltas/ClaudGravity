@@ -334,7 +334,7 @@ func (as *AccountSelector) GetOrAssignStickyAccount(apiKey string, tenant Tenant
 		}
 	}
 
-	if bestAcc != nil {
+	if bestAcc != nil && maxQuota > 0 {
 		if apiKey != "" {
 			as.stickyMap[apiKey] = bestAcc.Email
 		}
