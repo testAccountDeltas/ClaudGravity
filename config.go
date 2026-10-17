@@ -22,6 +22,15 @@ type ServerConfig struct {
 	GoogleOAuthClientSecret  string `json:"google_oauth_client_secret,omitempty"`  // overrides auth_manager.go's AntigravityClientSecret default if set
 	MaxStreamDurationSeconds int    `json:"max_stream_duration_seconds,omitempty"` // absolute safety-net ceiling for one streaming request, regardless of ongoing activity; default 1800s (30min) if unset. The real per-request cutoff is idle silence > ttft_timeout_seconds, not this.
 	AntigravityUserAgent     string `json:"antigravity_user_agent,omitempty"`      // overrides auth_manager.go's AntigravityUserAgent default if set — bump this when Google ships a new real Antigravity client version
+	SpecCaptureEnabled       *bool  `json:"spec_capture_enabled,omitempty"`        // records a redacted (no generative text) structural skeleton of every request/response for cmd/speccheck — see speccapture.go. nil (field absent) defaults to true; a plain bool default couldn't tell "absent" from "false".
+	SpecCaptureDir           string `json:"spec_capture_dir,omitempty"`            // defaults to "request_captures" relative to the working directory
+	SpecCaptureRetentionDays int    `json:"spec_capture_retention_days,omitempty"` // defaults to 14; capture files are named by UTC date and pruned on each day rotation
+}
+
+// SpecCaptureIsEnabled resolves the nil-means-true default for
+// SpecCaptureEnabled described above.
+func (s ServerConfig) SpecCaptureIsEnabled() bool {
+	return s.SpecCaptureEnabled == nil || *s.SpecCaptureEnabled
 }
 
 type TenantConfig struct {
@@ -84,6 +93,12 @@ func LoadConfig(path string) (*ConfigManager, error) {
 	}
 	if cfg.Tenants == nil {
 		cfg.Tenants = make(map[string]TenantConfig)
+	}
+	if cfg.Server.SpecCaptureDir == "" {
+		cfg.Server.SpecCaptureDir = "request_captures"
+	}
+	if cfg.Server.SpecCaptureRetentionDays == 0 {
+		cfg.Server.SpecCaptureRetentionDays = 14
 	}
 
 	if cfg.Server.GoogleOAuthClientID != "" {

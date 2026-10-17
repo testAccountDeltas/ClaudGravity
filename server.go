@@ -313,6 +313,9 @@ func main() {
 		LogGateway("[SuperRelay Gateway] Warning: request log DB init failed: %v", err)
 	}
 
+	serverCfgAtStartup := cfgMgr.GetServerConfig()
+	InitSpecCapture(serverCfgAtStartup.SpecCaptureIsEnabled(), serverCfgAtStartup.SpecCaptureDir, serverCfgAtStartup.SpecCaptureRetentionDays)
+
 	// Initialize account manager from auths directory
 	if err := InitAccountManager("auths"); err != nil {
 		LogGateway("[SuperRelay Gateway] Notice: auths dir init: %v", err)
@@ -621,6 +624,10 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	globalSpecCapture.Begin(rid)
+	globalSpecCapture.RecordClaudeRequest(rid, r.Header, bodyBytes)
+	defer globalSpecCapture.Finish(rid)
+
 	// 2. Derive Conversation Anchor for Session Affinity (Prompt Caching)
 	headerSessionID := r.Header.Get("x-claude-code-session-id")
 	if headerSessionID == "" {
@@ -709,6 +716,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Translation error: %v", err))
 		return
 	}
+	globalSpecCapture.RecordGeminiRequest(rid, nil, geminiBody)
 
 	isStream := gjson.GetBytes(bodyBytes, "stream").Bool()
 	serverCfg := cfgMgr.GetServerConfig()
@@ -1395,7 +1403,7 @@ UpstreamReady:
 		respModel = modelName
 	}
 	hasPrior := hasAssistantTurns(claudeBodyBytes)
-	streamer := NewSSEStreamer(w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior)
+	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior)
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	if err != nil {
@@ -1537,6 +1545,7 @@ func executeNonStreaming(
 	if err != nil {
 		return false, http.StatusInternalServerError, fmt.Errorf("failed to read upstream body: %w", err)
 	}
+	globalSpecCapture.RecordGeminiResponse(rid, resp.Header, respBytes)
 
 	if resp.StatusCode != http.StatusOK {
 		LogGateway("[#%d] !! Upstream non-streaming HTTP %d: %s", rid, resp.StatusCode, string(respBytes))
@@ -1611,6 +1620,7 @@ func executeNonStreaming(
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(blockJSON)
+			globalSpecCapture.RecordClaudeResponse(rid, w.Header(), blockJSON)
 			return true, http.StatusOK, nil
 		}
 	}
@@ -1925,6 +1935,7 @@ func executeNonStreaming(
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(outJSON)
+	globalSpecCapture.RecordClaudeResponse(rid, w.Header(), outJSON)
 
 	durMs := time.Since(t0).Milliseconds()
 	var hitRate float64

@@ -41,6 +41,12 @@ superrelay_logs.db-wal
 gateway.db
 debug_upstream_request.json
 
+# Redacted (no generative text) structural capture of live request/response
+# traffic for cmd/speccheck — see speccapture.go. Headers/structure only,
+# but still real-traffic-derived, so it stays local like everything else
+# above, never committed.
+request_captures/
+
 # ===== Случайный мусор отладочных сессий =====
 probe.txt
 undefined/

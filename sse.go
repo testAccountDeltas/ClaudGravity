@@ -167,6 +167,7 @@ func getSessionCacheFraction(sessionID string) (float64, bool) {
 }
 
 type SSEStreamer struct {
+	rid                      uint64 // correlates with globalSpecCapture's per-request record
 	w                        http.ResponseWriter
 	flusher                  http.Flusher
 	mu                       sync.Mutex
@@ -212,8 +213,9 @@ const (
 	TypeToolUse  = 3
 )
 
-func NewSSEStreamer(w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool) *SSEStreamer {
+func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool) *SSEStreamer {
 	return &SSEStreamer{
+		rid:                  rid,
 		w:                    w,
 		flusher:              flusher,
 		messageID:            fmt.Sprintf("msg_%d", time.Now().UnixNano()),
@@ -233,6 +235,7 @@ func (s *SSEStreamer) SendRaw(event, data string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastEventTime = time.Now()
+	globalSpecCapture.AppendClaudeEvent(s.rid, event, data)
 	msg := fmt.Sprintf("event: %s\ndata: %s\n\n", event, data)
 	_, err := s.w.Write([]byte(msg))
 	if err == nil && s.flusher != nil {
@@ -692,6 +695,7 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 
 // ProcessGeminiChunk parses a single Gemini SSE JSON line and drives the state machine.
 func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
+	globalSpecCapture.AppendGeminiChunk(s.rid, chunkJSON)
 	root := gjson.ParseBytes(chunkJSON)
 	if respNode := root.Get("response"); respNode.Exists() {
 		root = respNode
