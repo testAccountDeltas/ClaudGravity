@@ -33,15 +33,37 @@ const (
 	NudgeReadLoop    = "Notice from the gateway: you have made many Read calls recently without writing/editing anything or giving a substantial answer — this looks like an unproductive read-loop. Stop reading slices. Use Bash (grep/rg) to jump straight to the relevant symbol/section, or read larger ranges, or proceed with what you have."
 	NudgeOscillation = "Notice from the gateway: your output is flagged for looping content (the exact same tool call or A/B oscillation repeated). If intentional, add the tag [ignoring loop detection]; otherwise stop and try a different approach."
 
-	// readToolGuidance is injected into every request's system prompt
-	// (translator.go), silently and unconditionally — not a reactive
-	// nudge after the fact, but an upfront instruction aimed at stopping
-	// the common small-file case from ever needing one. Live traffic
-	// showed the model defaulting to reading an entire file in a fixed
-	// ~120-line page size regardless of the file's actual size, needing
-	// 9 separate Read calls to get through a 1080-line file it could have
-	// read in one.
-	readToolGuidance = "Gateway notice (Read tool usage): if a file is small (roughly under 50KB, or a couple thousand lines), call Read once for the whole file instead of paging through it across multiple calls with offset/limit. Reserve offset/limit for genuinely large files. When you need to find something specific rather than read everything, prefer a targeted search (grep/rg via Bash) over sequential reads."
+	// readToolGuidance is appended to the Read tool's own declared
+	// "description" field (translator.go, where Claude's tool
+	// declarations get translated into Gemini functionDeclarations) —
+	// not the system prompt. Two earlier versions lived in the system
+	// prompt instead and both measurably helped (fixed ~120-line pages
+	// became variable 40-150-line pages, then a direct test got a
+	// correctly-reasoned no-offset/limit call) without fully stopping
+	// the pattern on real multi-file audits. Moved to the tool's own
+	// description because: (1) it sits right next to the schema the
+	// model is already attending to when deciding how to call this
+	// specific tool, instead of competing with everything else in the
+	// system prompt; (2) it's part of the tool DEFINITION, sent fresh
+	// with the same static text on every request, same caching
+	// properties as the system-prompt version had — never put a date,
+	// counter, or anything else that varies per-request in here, or it
+	// breaks Gemini's implicit prefix cache for no benefit.
+	//
+	// Three things wrong with the system-prompt version, fixed here:
+	// (1) a dense file (long Go struct/comment lines) can hit the Read
+	// tool's own OUTPUT TOKEN cap before 2000 LINES, forcing a real
+	// "file too large" retry — the old text had no guidance for that
+	// case, so the model fell back to its own habit of small ~100-line
+	// pages. Now explicit: retry with a LARGE chunk (500-800 lines),
+	// never a small one. (2) the old text's "the whole file ends up in
+	// context either way" framing only holds when the whole file is
+	// actually needed — now split out as its own bullet, since reading
+	// one specific function should go through Grep first, not a
+	// full-file read. (3) "follow this exactly" plus a paragraph of
+	// justification was wordier than this model needs — shorter, with
+	// concrete numbers, reads as more authoritative.
+	readToolGuidance = "Gateway notice (Read tool): Do not read files in small pages. Call Read without offset/limit by default: it returns up to 2000 lines in one call, which covers most files. Splitting into 100-150 line pages wastes calls and time and saves no context, because the whole file ends up in context anyway.\n\nUse offset/limit only when:\n- a previous Read said the file is longer or too large (then use big chunks, at least 500-800 lines, never 100-150), or\n- a Grep/Bash search already gave you the exact line range you need, and you only need that range.\n\nTo locate one function or symbol in a large file, Grep first, then Read just that range. Do not scan the file page by page."
 
 	// NudgeEditFailureLoop fires when Edit has failed (old_string mismatch)
 	// several times in a row for the same agent — the read-loop guard above

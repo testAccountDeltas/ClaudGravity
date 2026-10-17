@@ -320,19 +320,6 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			systemPrompt = ScrubBillingHeader(sys.String())
 		}
 	}
-	// Silent, always-on Read-tool usage guidance: live traffic showed the
-	// model defaulting to a fixed ~120-line page size and marching through
-	// an entire file sequentially — 9 Read calls to get through a
-	// 1080-line file, one call per page, zero attempts to read it in
-	// fewer/larger calls or search for the relevant part first. Once the
-	// read-loop nudge (loopguard.go) fired, the model switched straight to
-	// `Bash(sed -n '...')`/`head`/`tail` and did the exact same thing
-	// under a different tool name. This doesn't replace the loop-guard
-	// (still needed for genuinely large files / scattered searches) — it
-	// aims to stop the common small-file case from ever reaching the
-	// guard at all, by telling the model up front that it doesn't need to
-	// paginate a small file.
-	systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + readToolGuidance)
 	if systemPrompt != "" {
 		// Per Google's REST spec, system_instruction is just {"parts": [...]}
 		// — role is only meaningful on conversation turns in "contents",
@@ -797,6 +784,15 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				return true
 			}
 			desc := t.Get("description").String()
+			if name == "Read" {
+				// See loopguard.go's readToolGuidance doc comment for why
+				// this lives on the tool's own description rather than the
+				// system prompt: it's static (same text every request, so
+				// it doesn't disturb Gemini's prefix cache) and sits right
+				// next to the schema the model is already attending to
+				// when it decides how to call THIS tool.
+				desc = strings.TrimRight(desc, "\n") + "\n\n" + readToolGuidance
+			}
 			rawSchema := t.Get("input_schema").Raw
 			schemaRaw := CleanJSONSchemaForAntigravity(name, rawSchema)
 			if strings.TrimSpace(schemaRaw) == "" || schemaRaw == "null" {
