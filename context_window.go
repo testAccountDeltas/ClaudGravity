@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 )
 
 // contextSafetyMarginTokens reserves headroom beyond the reserved output
@@ -40,17 +39,8 @@ func conservativeTokenEstimate(v interface{}) int {
 				if !isMap {
 					continue
 				}
-				switch bMap["type"] {
-				case "image":
-					total += 1600
-					counted = true
-				case "document":
-					total += 2500
-					counted = true
-				default:
-					total += flatTokenEstimate(bMap)
-					counted = true
-				}
+				total += blockTokenEstimate(bMap)
+				counted = true
 			}
 			if counted {
 				return total
@@ -58,6 +48,36 @@ func conservativeTokenEstimate(v interface{}) int {
 		}
 	}
 	return flatTokenEstimate(v)
+}
+
+// blockTokenEstimate prices a single content block, recursing into
+// "tool_result" blocks whose own "content" is itself a sub-array of blocks
+// (Anthropic's tool_result can carry image/document results from the
+// tool, e.g. a browser screenshot or a Read of a PDF). Without this, a
+// screenshot sitting inside a tool_result fell through to the same
+// len(json)/2 flat estimate conservativeTokenEstimate exists to avoid for
+// a top-level image block — only one level shallower.
+func blockTokenEstimate(bMap map[string]interface{}) int {
+	switch bMap["type"] {
+	case "image":
+		return 1600
+	case "document":
+		return 2500
+	case "tool_result":
+		inner, isList := bMap["content"].([]interface{})
+		if !isList {
+			return flatTokenEstimate(bMap)
+		}
+		total := 0
+		for _, b := range inner {
+			if innerMap, isMap := b.(map[string]interface{}); isMap {
+				total += blockTokenEstimate(innerMap)
+			}
+		}
+		return total
+	default:
+		return flatTokenEstimate(bMap)
+	}
 }
 
 func flatTokenEstimate(v interface{}) int {
@@ -168,12 +188,17 @@ func TruncateConversationToFit(reqMap map[string]interface{}, modelName string, 
 	}
 
 	remaining := msgsList[i:]
+	// Static text, no dropped-count/model-name/max-tokens interpolation:
+	// this notice sits near the very start of the conversation, so once
+	// truncation first fires, EVERY byte after it is part of Google's
+	// server-side prefix-cache key for the rest of the conversation. The
+	// dropped count grows monotonically every time this fires again on a
+	// long conversation (5 -> 8 -> 12 ...), and a changed byte here
+	// invalidated that prefix cache for the entire remaining history on
+	// every single later turn instead of just the first truncation.
 	notice := map[string]interface{}{
-		"role": "user",
-		"content": fmt.Sprintf(
-			"[Gateway notice: %d earlier message(s) were dropped from this conversation to fit inside the %s model's %d-token context window. The conversation continues below.]",
-			dropped, modelName, maxTokens,
-		),
+		"role":    "user",
+		"content": "[Gateway notice: Earlier intermediate messages were dropped to fit inside this conversation's context window. The conversation continues below.]",
 	}
 	reqMap["messages"] = append([]interface{}{msgsList[0], notice}, remaining...)
 	return dropped, true

@@ -415,6 +415,20 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 		return argsRaw, false
 	}
 
+	// Locate new_string's key too (same naming pairs as old_string, minus
+	// "pattern" which has no replacement-text counterpart), so the line-
+	// ending fix below can normalize it along with old_string instead of
+	// leaving it as a mismatched style that then gets written into the file.
+	newStrKey := ""
+	newStr := ""
+	for _, k := range []string{"new_string", "new_str", "new_text"} {
+		if val := parsed.Get(k); val.Exists() {
+			newStrKey = k
+			newStr = val.String()
+			break
+		}
+	}
+
 	// 4. Try newline normalization (\r\n vs \n)
 	hasCRLF := strings.Contains(fileContent, "\r\n")
 	normalizedLF := strings.ReplaceAll(oldStr, "\r\n", "\n")
@@ -423,6 +437,18 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 		if strings.Contains(fileContent, crlfCandidate) {
 			repaired, err := sjson.Set(argsRaw, oldStrKey, crlfCandidate)
 			if err == nil {
+				// Without this, old_string now matches the file's real CRLF
+				// line endings but new_string (still LF, as the model wrote
+				// it) gets substituted in verbatim, leaving the edited span
+				// with LF endings inside an otherwise-CRLF file.
+				if newStrKey != "" {
+					newCRLFCandidate := strings.ReplaceAll(strings.ReplaceAll(newStr, "\r\n", "\n"), "\n", "\r\n")
+					if newCRLFCandidate != newStr {
+						if withNew, err2 := sjson.Set(repaired, newStrKey, newCRLFCandidate); err2 == nil {
+							repaired = withNew
+						}
+					}
+				}
 				LogGateway("[Auto-Repair Edit] Fixed CRLF newlines for %s (len: %d)", filepath.Base(resolvedPath), len(crlfCandidate))
 				return repaired, true
 			}
@@ -431,6 +457,14 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 		if strings.Contains(fileContent, normalizedLF) {
 			repaired, err := sjson.Set(argsRaw, oldStrKey, normalizedLF)
 			if err == nil {
+				if newStrKey != "" {
+					normalizedNewLF := strings.ReplaceAll(newStr, "\r\n", "\n")
+					if normalizedNewLF != newStr {
+						if withNew, err2 := sjson.Set(repaired, newStrKey, normalizedNewLF); err2 == nil {
+							repaired = withNew
+						}
+					}
+				}
 				LogGateway("[Auto-Repair Edit] Fixed LF newlines for %s (len: %d)", filepath.Base(resolvedPath), len(normalizedLF))
 				return repaired, true
 			}
@@ -525,6 +559,24 @@ func findFuzzyLineMatch(fileContent, oldStr string) (string, bool) {
 		endIdx := startIdx + mLen - 1
 
 		startOffset := fileLines[startIdx].offset
+		// normalizeLineForMatch strips leading whitespace for comparison,
+		// so a model-written old_string with no leading indentation (e.g.
+		// "x = 10;") matches a real file line that DOES have some
+		// ("    x = 10;") — but the returned span always started at the raw
+		// line's own offset (before that indentation), capturing it as part
+		// of old_string. Claude Code then replaces that span with the
+		// model's new_string, which is typically written in the same
+		// unindented style as its old_string, silently stripping the file's
+		// real indentation. If old_string's first line had no leading
+		// whitespace of its own, start the returned span after the file
+		// line's leading whitespace instead, leaving it as untouched
+		// surrounding text outside the replaced span.
+		firstOldLine := rawOldLines[0]
+		if firstOldLine == strings.TrimLeft(firstOldLine, " \t") {
+			firstLineClean := fileLines[startIdx].clean
+			leadingLen := len(firstLineClean) - len(strings.TrimLeft(firstLineClean, " \t"))
+			startOffset += leadingLen
+		}
 		lastLine := fileLines[endIdx]
 
 		// If the last line in model's old_string did not end with a newline,

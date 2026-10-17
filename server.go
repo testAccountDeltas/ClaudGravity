@@ -100,7 +100,13 @@ func recoverMiddleware(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				LogGateway("[SuperRelay Gateway] PANIC recovered on %s %s: %v", r.Method, r.URL.Path, rec)
-				writeAnthropicError(w, http.StatusInternalServerError, "internal_error", "internal gateway error")
+				// "internal_error" isn't one of Anthropic's documented error
+				// types (invalid_request_error/authentication_error/
+				// permission_error/not_found_error/rate_limit_error/
+				// api_error/overloaded_error/request_too_large) — an SDK
+				// that switches on the type string falls through to its
+				// generic/unknown-error handling instead of api_error's.
+				writeAnthropicError(w, http.StatusInternalServerError, "api_error", "internal gateway error")
 			}
 		}()
 		next.ServeHTTP(w, r)
@@ -396,6 +402,13 @@ func main() {
 	interceptedMux.Handle("/v1/models/{id}", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleModelByID(cfgMgr, w, r)
 	})))
+	// Same gap as /v1/messages above: an HTTPS_PROXY-only client's /v1/usage
+	// call previously fell through to PassthroughToReal and hit the real
+	// api.anthropic.com, which 401s with no genuine subscription behind this
+	// gateway's key.
+	interceptedMux.Handle("/v1/usage", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleUsage(cfgMgr, w, r)
+	})))
 	interceptedMux.HandleFunc("/", PassthroughToReal)
 
 	proxySecret := cfgMgr.ProxySecret()
@@ -591,7 +604,17 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	// from the rest of the JSON structure. ExtractSystemPromptText decodes
 	// properly via gjson's .String() first.
 	if cwd := ExtractCWDFromSystemPrompt(ExtractSystemPromptText(bodyBytes)); cwd != "" {
-		RecordSessionCWD(sessionID, cwd)
+		// Keyed per subagent instance, not just the terminal-wide sessionID:
+		// a subagent spawned in its own git worktree legitimately has a
+		// different cwd than the main thread or a sibling subagent, and
+		// without instanceID whichever request recorded last silently wins
+		// for everyone sharing this sessionID, corrupting Edit-repair path
+		// resolution for the other one.
+		cwdKey := sessionID
+		if instanceID != "" {
+			cwdKey = sessionID + ":" + instanceID
+		}
+		RecordSessionCWD(cwdKey, cwd)
 	}
 	RecordSessionFileSnapshots(sessionID, bodyBytes)
 
@@ -715,12 +738,27 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		const maxLocationGatePasses = 2 // full passes over antigravityHosts
 		hostIdx := 0
 		locationGatePasses := 0
+		// Per-agent-instance key for both the Antigravity sessionId AND the
+		// bump counter below — computed once here instead of inline inside
+		// the retry loop, since getSessionBump/setSessionBump need the same
+		// key WrapAntigravityPayload uses. Keying the bump by bare sessionID
+		// alone meant one subagent tripping the token wall and bumping to
+		// gen 1 silently bumped every OTHER subagent and the main thread
+		// sharing that same terminal session on their very next request,
+		// even though their own context never came close to the wall —
+		// each one got a brand new Google-side session hash (generation is
+		// mixed into generateStableSessionID's hash) and lost its warm
+		// prefix cache for no reason.
+		antigravitySessionKey := sessionID
+		if instanceID != "" {
+			antigravitySessionKey = sessionID + ":" + instanceID
+		}
 		// Start from this session's last-known-good bump instead of 0: once a
 		// long (>1M-token) conversation has hit the session token-wall once,
 		// every later turn would otherwise repeat the same failing bump=0
 		// attempt first, burning a wasted round-trip on every single turn for
 		// the rest of the conversation instead of just the first one.
-		bump := getSessionBump(sessionID)
+		bump := getSessionBump(antigravitySessionKey)
 		var success bool
 		for {
 			upstreamURL := directURL
@@ -735,18 +773,6 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 
 			var finalPayload []byte
 			if isAntigravity {
-				// Google's Antigravity session cache is shared and capped
-				// (~1,048,576 tokens) per sessionId. sessionID alone is the
-				// terminal-wide x-claude-code-session-id, identical across
-				// every parallel subagent spawned from the same orchestrator
-				// turn — without qualifying by instanceID, N concurrent
-				// subagents' contexts all land in the same server-side
-				// session bucket and collectively blow the wall even though
-				// each one individually fits comfortably.
-				antigravitySessionKey := sessionID
-				if instanceID != "" {
-					antigravitySessionKey = sessionID + ":" + instanceID
-				}
 				finalPayload = WrapAntigravityPayload(modelName, geminiBody, projectID, bump, antigravitySessionKey)
 			} else {
 				// The public Gemini Developer API documents "thought" as
@@ -792,7 +818,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 					break
 				}
 				bump++
-				setSessionBump(sessionID, bump)
+				setSessionBump(antigravitySessionKey, bump)
 				LogGateway("[#%d] !! Session token-wall (~1,048,576) hit on %s, bumping to a fresh session bucket and retrying same account", rid, accLabel)
 				continue
 			}
@@ -801,8 +827,26 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		}
 
 		if success {
-			if activeAcc != nil && convAnchor != "" {
-				globalSelector.RememberAffinity(convAnchor, activeAcc.Email)
+			// success==true here only means "the response was already
+			// committed to the client, so we can't fail over to another
+			// account for THIS request" — the panic watchdog can send an
+			// early 200 + SSE headers and the upstream call can still go on
+			// to fail (429/403) afterwards. lastStatus is the real verdict:
+			// pin affinity only on an actual 200, and apply the same
+			// cooldown/unstick bookkeeping a pre-headers failure gets below
+			// so the NEXT request isn't routed right back to a now-known-bad
+			// account just because this one couldn't retry.
+			if lastStatus == http.StatusOK {
+				if activeAcc != nil && convAnchor != "" {
+					globalSelector.RememberAffinity(convAnchor, activeAcc.Email)
+				}
+			} else if activeAcc != nil {
+				if lastStatus == 429 || strings.Contains(fmt.Sprint(lastErr), "RESOURCE_EXHAUSTED") {
+					globalAccountManager.MarkAccountCooldown(activeAcc.Email, 15*time.Minute)
+				} else if lastStatus == http.StatusForbidden {
+					globalAccountManager.MarkAccountCooldown(activeAcc.Email, 60*time.Minute)
+					globalSelector.UnstickAccount(activeAcc.Email)
+				}
 			}
 			return
 		}
@@ -1077,10 +1121,20 @@ UpstreamReady:
 			return false, upResp.StatusCode, fmt.Errorf("HTTP %d: %s", upResp.StatusCode, string(respBytes))
 		}
 
-		// Headers already sent: report SSE error block
+		// Headers already sent: report SSE error block. respBytes is
+		// Google's raw (often JSON) error body — interpolating it into a
+		// hand-built JSON string via %s let its own quotes/braces corrupt
+		// the outer JSON, so the client's SDK saw a parse error instead of
+		// a clean APIError.
 		wMu.Lock()
-		errPayload := fmt.Sprintf(`{"type":"error","error":{"type":%q,"message":"Upstream HTTP %d: %s"}}`, anthropicErrorTypeForStatus(upResp.StatusCode), upResp.StatusCode, string(respBytes))
-		_, _ = w.Write([]byte(fmt.Sprintf("event: error\ndata: %s\n\n", errPayload)))
+		errPayloadBytes, _ := json.Marshal(map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":    anthropicErrorTypeForStatus(upResp.StatusCode),
+				"message": fmt.Sprintf("Upstream HTTP %d: %s", upResp.StatusCode, string(respBytes)),
+			},
+		})
+		_, _ = w.Write([]byte(fmt.Sprintf("event: error\ndata: %s\n\n", errPayloadBytes)))
 		flusher.Flush()
 		wMu.Unlock()
 
@@ -1125,7 +1179,17 @@ UpstreamReady:
 	// be stuck believing it was 0 for the whole conversation.
 	estInputTokens := estimateApproxClaudeTokens(claudeBodyBytes)
 	preferRussian := detectRussianConversation(claudeBodyBytes)
-	streamer := NewSSEStreamer(w, flusher, modelName, sessionID, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools)
+	// Qualify by instanceID for the same reason RecordSessionCWD's own
+	// caller does (see handleMessages): a subagent spawned in its own git
+	// worktree has a genuinely different cwd than the main thread or a
+	// sibling subagent sharing the same terminal sessionID, and
+	// RepairEditToolCall's path resolution needs the right one, not
+	// whichever request happened to record last.
+	cwdKey := sessionID
+	if instanceID != "" {
+		cwdKey = sessionID + ":" + instanceID
+	}
+	streamer := NewSSEStreamer(w, flusher, modelName, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools)
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	totalDur := time.Since(t0)
@@ -1289,6 +1353,13 @@ func executeNonStreaming(
 		cacheCreationTok = uncachedInTok
 		uncachedInTok = 0
 	}
+	// Same per-instance CWD key as the streaming path (see
+	// executeStreamingWithWatchdog) — needed below for RepairEditToolCall.
+	cwdKey := sessionID
+	if instanceID != "" {
+		cwdKey = sessionID + ":" + instanceID
+	}
+
 	usageMap := map[string]interface{}{
 		"input_tokens":  uncachedInTok,
 		"output_tokens": outTok,
@@ -1321,6 +1392,9 @@ func executeNonStreaming(
 
 	var toolsCalled []string
 	var toolCallIDs []string
+	var toolCallSignatures []string
+	var textChars int
+	var lastText string
 	cand := geminiJSON.Get("candidates.0")
 	if cand.Exists() {
 		parts := cand.Get("content.parts")
@@ -1332,9 +1406,14 @@ func executeNonStreaming(
 							"type":     "thinking",
 							"thinking": t,
 						}
-						if sig := p.Get("thoughtSignature").String(); sig != "" {
-							block["signature"] = sig
+						// Same reasoning as sse.go's closeCurrentBlock: a
+						// missing "signature" fails Pydantic/Zod schema
+						// validation outright, not just a wrong one.
+						sig := p.Get("thoughtSignature").String()
+						if sig == "" {
+							sig = "skip_thought_signature_validator"
 						}
+						block["signature"] = sig
 						claudeResp["content"] = append(claudeResp["content"].([]map[string]interface{}), block)
 					}
 				} else if t := p.Get("text").String(); t != "" {
@@ -1342,6 +1421,8 @@ func executeNonStreaming(
 						"type": "text",
 						"text": t,
 					})
+					textChars += len(t)
+					lastText = t
 				} else if fc := p.Get("functionCall"); fc.Exists() {
 					fname := fc.Get("name").String()
 					argsRaw := fc.Get("args").Raw
@@ -1349,7 +1430,7 @@ func executeNonStreaming(
 						argsRaw = "{}"
 					}
 					argsRaw = coerceNumericEnumArgs(fname, argsRaw)
-					if repairedArgs, ok := RepairEditToolCall(fname, argsRaw, sessionID); ok {
+					if repairedArgs, ok := RepairEditToolCall(fname, argsRaw, cwdKey); ok {
 						argsRaw = repairedArgs
 					}
 					switch strings.ToLower(fname) {
@@ -1370,6 +1451,7 @@ func executeNonStreaming(
 							argsRaw = cleaned
 						}
 					}
+					argsRaw = stripNestedOpenDictReason(fname, argsRaw)
 					var argsObj interface{}
 					_ = json.Unmarshal([]byte(argsRaw), &argsObj)
 					if argsObj == nil {
@@ -1381,6 +1463,7 @@ func executeNonStreaming(
 						argsObj = map[string]interface{}{}
 					}
 					toolsCalled = append(toolsCalled, fname)
+					toolCallSignatures = append(toolCallSignatures, fmt.Sprintf("%s:%s", fname, argsRaw))
 					callID := nextToolCallID(fname)
 					toolCallIDs = append(toolCallIDs, callID)
 					setToolSignature(callID, p.Get("thoughtSignature").String())
@@ -1400,8 +1483,12 @@ func executeNonStreaming(
 			}
 		}
 
-		// Append Google Search Grounding sources if present
-		if gm := cand.Get("groundingMetadata"); gm.Exists() {
+		// Append Google Search Grounding sources if present. Anthropic
+		// requires tool_use to be the LAST content block whenever
+		// stop_reason is "tool_use" — appending this text block after one
+		// would violate that on the rare response carrying both a grounding
+		// citation list and a separate custom tool call.
+		if gm := cand.Get("groundingMetadata"); claudeResp["stop_reason"] != "tool_use" && gm.Exists() {
 			if chunks := gm.Get("groundingChunks"); chunks.IsArray() && len(chunks.Array()) > 0 {
 				var sb strings.Builder
 				if detectRussianConversation(claudeBodyBytes) {
@@ -1448,6 +1535,27 @@ func executeNonStreaming(
 			},
 		}
 	}
+
+	// LoopGuard previously only ran in the streaming path — a client calling
+	// non-streaming entirely evaded read-loop/oscillation detection no
+	// matter how many consecutive unproductive Read turns it made.
+	readCount := 0
+	madeProgress := false
+	for _, t := range toolsCalled {
+		if t == "Read" {
+			readCount++
+		} else if t == "Write" || t == "Edit" || t == "NotebookEdit" {
+			madeProgress = true
+		}
+	}
+	if readCount == 0 && !madeProgress {
+		madeProgress = textChars > 200
+	}
+	loopKey := agentKey + "|" + sessionID + "|" + instanceID
+	readWindowSize, _ := readLoopLimits(agentKey)
+	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress, readWindowSize)
+	hasIgnoreTag := strings.Contains(lastText, OscIgnoreTag)
+	globalLoopGuard.RecordToolCalls(loopKey, toolCallSignatures, hasIgnoreTag)
 
 	outJSON, _ := json.Marshal(claudeResp)
 	applyRateLimitHeaders(w.Header(), activeAcc, modelName)
@@ -1527,6 +1635,7 @@ var knownModels = []map[string]interface{}{
 	{"id": "claude-3-7-sonnet-latest", "type": "model", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z"},
 	{"id": "claude-3-opus-20240229", "type": "model", "display_name": "Claude 3 Opus", "created_at": "2024-02-29T00:00:00Z"},
 	{"id": "claude-opus-4-6-thinking", "type": "model", "display_name": "Claude Opus 4.6 Thinking", "created_at": "2026-01-01T00:00:00Z"},
+	{"id": "claude-sonnet-4-6", "type": "model", "display_name": "Claude Sonnet 4.6", "created_at": "2026-01-01T00:00:00Z"},
 	{"id": "claude-opus-5-5", "type": "model", "display_name": "Claude Opus 5.5", "created_at": "2026-01-01T00:00:00Z"},
 	{"id": "claude-sonnet-5-5", "type": "model", "display_name": "Claude Sonnet 5.5", "created_at": "2026-01-01T00:00:00Z"},
 	{"id": "claude-haiku-5-5", "type": "model", "display_name": "Claude Haiku 5.5", "created_at": "2026-01-01T00:00:00Z"},
@@ -1801,6 +1910,19 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 		header.Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", now.Add(5*time.Hour).Unix()))
 		header.Set("anthropic-ratelimit-unified-overage-status", "rejected")
 		header.Set("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled")
+		// Same standard per-window headers the acc != nil path below sends —
+		// a generic Anthropic SDK client (not Claude Code, which only reads
+		// the unified-* headers above) reads these instead and otherwise
+		// gets no rate-limit visibility at all on an api_key tenant.
+		const reqLimit, tokLimit = 1000, 1000000
+		header.Set("anthropic-ratelimit-requests-limit", fmt.Sprintf("%d", reqLimit))
+		header.Set("anthropic-ratelimit-requests-remaining", fmt.Sprintf("%d", int(float64(reqLimit)*0.95)))
+		header.Set("anthropic-ratelimit-requests-reset", now.Add(5*time.Hour).UTC().Format(time.RFC3339))
+		header.Set("anthropic-ratelimit-tokens-limit", fmt.Sprintf("%d", tokLimit))
+		header.Set("anthropic-ratelimit-tokens-remaining", fmt.Sprintf("%d", int(float64(tokLimit)*0.95)))
+		header.Set("anthropic-ratelimit-tokens-reset", now.Add(5*time.Hour).UTC().Format(time.RFC3339))
+		header.Set("anthropic-organization-id", fakeOrgID)
+		header.Set("anthropic-workspace-id", fakeWorkspaceID)
 		return
 	}
 

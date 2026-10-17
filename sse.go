@@ -210,13 +210,26 @@ func (s *SSEStreamer) closeCurrentBlock() error {
 	// "skip_thought_signature_validator" placeholder on the translate-back
 	// path (translator.go) in the first place, since the real signature was
 	// never captured and forwarded. Flush whatever we saw.
-	if s.currentType == TypeThinking && s.thoughtSignature != "" {
+	if s.currentType == TypeThinking {
+		sig := s.thoughtSignature
+		if sig == "" {
+			// A thinking block with no signature at all isn't a smaller
+			// problem than a wrong one — Anthropic's schema declares
+			// "signature" required on every thinking block, and an SDK's
+			// Pydantic/Zod model raises a validation error on a missing
+			// field, not just a mismatched one. Gemini not returning a
+			// thoughtSignature for this turn (happens on the public API and
+			// some model versions) used to skip signature_delta entirely;
+			// fall back to the same placeholder translator.go already uses
+			// when replaying history with no real signature to round-trip.
+			sig = "skip_thought_signature_validator"
+		}
 		sigPayload := map[string]interface{}{
 			"type":  "content_block_delta",
 			"index": s.currentIndex,
 			"delta": map[string]interface{}{
 				"type":      "signature_delta",
-				"signature": s.thoughtSignature,
+				"signature": sig,
 			},
 		}
 		b, _ := json.Marshal(sigPayload)
@@ -340,6 +353,7 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSig
 			argsRaw = cleaned
 		}
 	}
+	argsRaw = stripNestedOpenDictReason(name, argsRaw)
 	if err := s.EnsureMessageStart(); err != nil {
 		return err
 	}

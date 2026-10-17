@@ -23,7 +23,11 @@ const (
 	ReadWindowThreshold = 10
 	ToolCallHistMax     = 12
 	OscIgnoreTag        = "[ignoring loop detection]"
-	NudgeReadLoop       = "Notice from the gateway: you have made many Read calls recently without writing/editing anything or giving a substantial answer — this looks like an unproductive read-loop. Stop reading slices. Use Grep/Bash to jump straight to the relevant symbol/section, or read larger ranges, or proceed with what you have."
+	// Recommends Bash (grep/rg), not the native Grep tool — strip_search_tools
+	// defaults to true (see config.go), so Grep/Glob usually aren't even
+	// declared to the model; telling it to use a tool it doesn't have is
+	// useless advice at best and confusing at worst.
+	NudgeReadLoop = "Notice from the gateway: you have made many Read calls recently without writing/editing anything or giving a substantial answer — this looks like an unproductive read-loop. Stop reading slices. Use Bash (grep/rg) to jump straight to the relevant symbol/section, or read larger ranges, or proceed with what you have."
 	NudgeOscillation    = "Notice from the gateway: your output is flagged for looping content (the exact same tool call or A/B oscillation repeated). If intentional, add the tag [ignoring loop detection]; otherwise stop and try a different approach."
 
 	// NudgeReadLoopEscalated fires when the soft nudge above already fired
@@ -58,7 +62,11 @@ const (
 // the role is already encoded in the same string LoopGuard keys its state
 // by.
 func readLoopLimits(agentKey string) (windowSize, threshold int) {
-	if strings.HasPrefix(agentKey, "sub:") {
+	// ParseAgentInfo's fallback path (request-class "subagent" but no
+	// x-claude-code-agent-type header) returns the bare string "subagent"
+	// with no "sub:" prefix at all — missing that here silently dropped
+	// those subagents back to the tight main-agent threshold.
+	if strings.HasPrefix(agentKey, "sub:") || agentKey == "subagent" {
 		return exploreReadWindowSize, exploreReadWindowThreshold
 	}
 	return ReadWindowSize, ReadWindowThreshold

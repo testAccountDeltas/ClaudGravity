@@ -228,6 +228,12 @@ func DeriveSessionID(r *http.Request, bodyBytes []byte, geminiBody []byte) strin
 	if s := r.Header.Get("x-claude-code-session-id"); s != "" {
 		return s
 	}
+	if s := r.Header.Get("anthropic-session-id"); s != "" {
+		return s
+	}
+	if s := r.Header.Get("x-anthropic-session-id"); s != "" {
+		return s
+	}
 	if s := gjson.GetBytes(bodyBytes, "metadata.session_id").String(); s != "" {
 		return s
 	}

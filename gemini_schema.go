@@ -30,6 +30,33 @@ var (
 	numericEnumFields   = make(map[string]map[string]string) // toolName -> fieldName -> original JSON type
 )
 
+// openDictArgFields remembers, per declared tool name, which top-level
+// argument fields are free-form dicts (originally declared with
+// additionalProperties, e.g. Bash's "env" or TaskCreate's "metadata") that
+// addEmptySchemaPlaceholder had to inject a "reason" placeholder into — so
+// a function call's args can get that nested "env.reason" stripped too, not
+// just a top-level "reason" (see syntheticReasonTools in translator.go/
+// sse.go, which only ever covered the top level).
+var (
+	openDictArgFieldsMu sync.Mutex
+	openDictArgFields   = make(map[string][]string)
+)
+
+func stripNestedOpenDictReason(toolName, argsRaw string) string {
+	openDictArgFieldsMu.Lock()
+	fields := openDictArgFields[toolName]
+	openDictArgFieldsMu.Unlock()
+	for _, field := range fields {
+		path := field + ".reason"
+		if gjson.Get(argsRaw, path).Exists() {
+			if cleaned, err := sjson.Delete(argsRaw, path); err == nil {
+				argsRaw = cleaned
+			}
+		}
+	}
+	return argsRaw
+}
+
 // recordNumericEnumFields scans a tool's ORIGINAL (pre-clean) input_schema
 // for top-level properties with a non-string enum, so the type can be
 // restored on the way back in coerceNumericEnumArgs.
@@ -93,18 +120,49 @@ const placeholderReasonDescription = "Brief explanation of why you are calling t
 // CleanJSONSchemaForAntigravity transforms a JSON schema to be compatible with Antigravity API.
 // It handles unsupported keywords, type flattening, and schema simplification while preserving
 // semantic information as description hints.
-func CleanJSONSchemaForAntigravity(jsonStr string) string {
-	return cleanJSONSchema(jsonStr, true)
+func CleanJSONSchemaForAntigravity(toolName, jsonStr string) string {
+	cleaned, nestedOpenDictFields := cleanJSONSchema(jsonStr, true)
+	openDictArgFieldsMu.Lock()
+	if len(nestedOpenDictFields) > 0 {
+		openDictArgFields[toolName] = nestedOpenDictFields
+	} else {
+		delete(openDictArgFields, toolName)
+	}
+	openDictArgFieldsMu.Unlock()
+	return cleaned
 }
 
 // CleanJSONSchemaForGemini transforms a JSON schema to be compatible with Gemini tool calling.
 // It removes unsupported keywords and simplifies schemas, without adding empty-schema placeholders.
 func CleanJSONSchemaForGemini(jsonStr string) string {
-	return cleanJSONSchema(jsonStr, false)
+	cleaned, _ := cleanJSONSchema(jsonStr, false)
+	return cleaned
 }
 
 // cleanJSONSchema performs the core cleaning operations on the JSON schema.
-func cleanJSONSchema(jsonStr string, addPlaceholder bool) string {
+// Returns the cleaned schema and, when addPlaceholder is set, the top-level
+// argument field names addEmptySchemaPlaceholder had to patch because they
+// were free-form dicts (see openDictPaths/openDictArgFields above) rather
+// than genuinely empty schemas.
+func cleanJSONSchema(jsonStr string, addPlaceholder bool) (string, []string) {
+	// A node with additionalProperties set to a SCHEMA (not just `false`) is
+	// a free-form dict by design — Bash's "env", TaskCreate's "metadata" —
+	// and legitimately has no fixed "properties" of its own. Phase 3 below
+	// strips additionalProperties entirely as unsupported, which otherwise
+	// leaves nothing behind to distinguish that node from a genuinely empty
+	// schema, and Phase 4 would inject a required "reason" placeholder
+	// property into it. The model dutifully fills "reason" in, and a tool
+	// with a strict handler (additionalProperties: false on ITS end)
+	// rejects the call over that one extra field the client-side cleanup
+	// elsewhere only ever strips at the top level of the arguments, never
+	// inside a nested dict field like this one.
+	openDictPaths := make(map[string]bool)
+	for _, p := range findPaths(jsonStr, "additionalProperties") {
+		if gjson.Get(jsonStr, p).Type != gjson.False {
+			openDictPaths[trimSuffix(p, ".additionalProperties")] = true
+		}
+	}
+
 	// Phase 1: Convert and add hints
 	jsonStr = convertRefsToHints(jsonStr)
 	jsonStr = convertConstToEnum(jsonStr)
@@ -128,11 +186,12 @@ func cleanJSONSchema(jsonStr string, addPlaceholder bool) string {
 	jsonStr = cleanupRequiredFields(jsonStr)
 	jsonStr = addMissingArrayItems(jsonStr)
 	// Phase 4: Add placeholder for empty object schemas (Claude VALIDATED mode requirement)
+	var nestedOpenDictFields []string
 	if addPlaceholder {
-		jsonStr = addEmptySchemaPlaceholder(jsonStr)
+		jsonStr, nestedOpenDictFields = addEmptySchemaPlaceholder(jsonStr, openDictPaths)
 	}
 
-	return jsonStr
+	return jsonStr, nestedOpenDictFields
 }
 
 // removeKeywords removes all occurrences of specified keywords from the JSON schema.
@@ -476,6 +535,15 @@ func flattenAnyOfOneOf(jsonStr string) string {
 				hint := "Accepts: " + strings.Join(allTypes, " | ")
 				selected = appendHintRaw(selected, hint)
 			}
+			if contains(allTypes, "null") {
+				// Same reasoning as flattenTypeArrays: collapsing
+				// anyOf/oneOf down to its single best branch otherwise
+				// threw away the fact that "null" was one of the original
+				// options, leaving the model unable to pass an explicit
+				// null for a field Gemini's validator now sees as a plain
+				// (non-nullable) string/object/etc.
+				selected, _ = sjson.Set(selected, "nullable", true)
+			}
 
 			jsonStr = setRawAt(jsonStr, parentPath, selected)
 		}
@@ -547,6 +615,18 @@ func flattenTypeArrays(jsonStr string) string {
 		}
 
 		if hasNull {
+			// Antigravity's internal schema (unlike the public Gemini
+			// Developer API's stricter OpenAPI 3.0 subset) does have a real
+			// "nullable" field — CleanJSONSchemaForGemini strips it back
+			// out right after this for that other path, so setting it
+			// unconditionally here is inert there and only takes effect on
+			// the live Antigravity path. Previously only a "(nullable)"
+			// description hint was added and the field dropped from
+			// "required" below — workable as long as the model omits the
+			// field entirely, but Gemini's own validator rejects an
+			// explicit "field": null against a type it never declared as
+			// nullable.
+			jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "nullable"), true)
 			parts := splitGJSONPath(p)
 			if len(parts) >= 3 && parts[len(parts)-3] == "properties" {
 				fieldNameEscaped := parts[len(parts)-2]
@@ -693,13 +773,20 @@ func cleanupRequiredFields(jsonStr string) string {
 
 // addEmptySchemaPlaceholder adds a placeholder "reason" property to empty object schemas.
 // Claude VALIDATED mode requires at least one required property in tool schemas.
-func addEmptySchemaPlaceholder(jsonStr string) string {
+// nestedOpenDictFields collects the top-level argument field name (e.g.
+// "env") of every NESTED (non-root) object that got the placeholder because
+// it was actually a free-form dict (openDictPaths) rather than a genuinely
+// empty schema — so the caller can register them for recursive "reason"
+// cleanup on the way back from a function call, the same way the top-level
+// placeholder is already cleaned up via syntheticReasonTools.
+func addEmptySchemaPlaceholder(jsonStr string, openDictPaths map[string]bool) (string, []string) {
 	// Find all "type" fields
 	paths := findPaths(jsonStr, "type")
 
 	// Process from deepest to shallowest (to handle nested objects properly)
 	sortByDepth(paths)
 
+	var nestedOpenDictFields []string
 	for _, p := range paths {
 		typeVal := gjson.Get(jsonStr, p)
 		if typeVal.String() != "object" {
@@ -734,6 +821,12 @@ func addEmptySchemaPlaceholder(jsonStr string) string {
 
 			// Add to required array
 			jsonStr, _ = sjson.Set(jsonStr, reqPath, []string{"reason"})
+
+			if openDictPaths[parentPath] {
+				if field, ok := strings.CutPrefix(parentPath, "properties."); ok && !strings.Contains(field, ".") {
+					nestedOpenDictFields = append(nestedOpenDictFields, unescapeGJSONPathKey(field))
+				}
+			}
 		}
 		// Previously also force-added a bogus "_": {"type":"boolean"}
 		// required property to ANY nested object that had real properties
@@ -743,7 +836,7 @@ func addEmptySchemaPlaceholder(jsonStr string) string {
 		// then receives) with a field nothing downstream expects.
 	}
 
-	return jsonStr
+	return jsonStr, nestedOpenDictFields
 }
 
 // --- Helpers ---

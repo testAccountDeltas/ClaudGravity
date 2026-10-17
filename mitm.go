@@ -3,6 +3,7 @@
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/subtle"
@@ -203,6 +204,19 @@ func proxyAuthOK(r *http.Request, secret string) bool {
 	return false
 }
 
+// isAnthropicHost reports whether host is exactly one of the domains this
+// gateway intercepts, or a subdomain of one — not merely a string that
+// contains it anywhere.
+func isAnthropicHost(host string) bool {
+	host = strings.ToLower(host)
+	for _, domain := range []string{"anthropic.com", "claude.ai"} {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
 // HandleConnectTunnel implements native HTTP CONNECT proxying and TLS interception.
 // proxySecret, when non-empty, is required as a "Proxy-Authorization: Bearer
 // <secret>" header on every CONNECT request — without it, anyone who can
@@ -242,8 +256,14 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 	// 1. Send 200 Connection Established to client
 	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	// 2. Intercept Anthropic and Claude API endpoints locally
-	if strings.Contains(host, "anthropic.com") || strings.Contains(host, "claude.ai") {
+	// 2. Intercept Anthropic and Claude API endpoints locally. isAnthropicHost
+	// does an exact-or-subdomain match, not a bare substring one — a raw
+	// strings.Contains would also match an unrelated host that merely
+	// contains "anthropic.com"/"claude.ai" as a substring (e.g.
+	// "anthropic.com.attacker.net" or some third party's
+	// "notclaude.ai.example.org"), MITM'ing it with this gateway's own
+	// self-signed cert instead of leaving it to PassthroughToReal untouched.
+	if isAnthropicHost(host) {
 		tlsCert, err := ca.GetCertificate(host)
 		if err != nil {
 			clientConn.Close()
@@ -338,6 +358,28 @@ func serveInterceptedTLS(tlsConn *tls.Conn, handler http.Handler) {
 		LogGateway("[SuperRelay Gateway] MITM request parse failed: %v", err)
 		return
 	}
+
+	// http.ReadRequest builds req with context.Background() — real, since
+	// this path parses raw requests off a hijacked CONNECT tunnel instead of
+	// going through http.Server (which would wire req.Context() to cancel
+	// on client disconnect automatically). Without this, a client hitting
+	// Ctrl+C mid-generation while routed through HTTPS_PROXY (rather than
+	// the direct :8900 TLS API) never propagated cancellation to the
+	// upstream Google call at all — r.Context() downstream was real but
+	// never actually tied to this connection closing.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		// This connection is one request-response pair with no pipelining
+		// (see the comment below), so any read activity here — new bytes or
+		// an error/EOF — means the client is done with this tunnel; either
+		// way, stop the upstream call.
+		buf := make([]byte, 1)
+		if _, err := tlsConn.Read(buf); err != nil {
+			cancel()
+		}
+	}()
+	req = req.WithContext(ctx)
 
 	rw := newMitmResponseWriter(tlsConn)
 	handler.ServeHTTP(rw, req)

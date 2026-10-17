@@ -179,6 +179,41 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 
 	modified := false
 	truncatedAny := false
+
+	// Anthropic's real Messages API only allows "user"/"assistant" in
+	// messages[].role — "system" belongs in the separate top-level "system"
+	// field — but a client built against the OpenAI-style convention (some
+	// of the non-Claude-Code web/Electron clients this gateway also serves,
+	// per commonAPIMiddleware's CORS support) can still send messages[0]
+	// with role "system". Step 2 below used to see that as "first message
+	// isn't user" and prepend a synthetic "Continue." turn ahead of it,
+	// leaving the real system instruction sitting in the message body after
+	// "Continue." instead of actually reaching Gemini's systemInstruction —
+	// extract it into the real system field first.
+	if first, ok := msgsList[0].(map[string]interface{}); ok && first["role"] == "system" {
+		// Only merge when the top-level "system" field is absent or a plain
+		// string — it can also be an array of blocks carrying its own
+		// cache_control, and blindly overwriting that with a string here
+		// would silently discard it.
+		_, isArraySystem := claudeReqJSON["system"].([]interface{})
+		if !isArraySystem {
+			if sysText := strings.TrimSpace(extractPlainText(first["content"])); sysText != "" {
+				existing, _ := claudeReqJSON["system"].(string)
+				if existing != "" {
+					claudeReqJSON["system"] = existing + "\n\n" + sysText
+				} else {
+					claudeReqJSON["system"] = sysText
+				}
+			}
+			msgsList = msgsList[1:]
+			modified = true
+		}
+	}
+	if len(msgsList) == 0 {
+		claudeReqJSON["messages"] = []interface{}{}
+		return modified, truncatedAny
+	}
+
 	var newMsgs []map[string]interface{}
 
 	// Step 1: Eager Truncation and Text Block Normalization
@@ -364,28 +399,80 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 		if m["role"] != "assistant" {
 			continue
 		}
+		mContent := m["content"].([]map[string]interface{})
+		var toolUseBlocks []map[string]interface{}
 		var synths []map[string]interface{}
-		for _, b := range m["content"].([]map[string]interface{}) {
-			if b["type"] == "tool_use" {
-				if id, ok := b["id"].(string); ok && id != "" && !toolResultsSeen[id] {
-					synths = append(synths, map[string]interface{}{
-						"type":        "tool_result",
-						"tool_use_id": id,
-						"content":     "(recovered by proxy)",
-					})
-				}
+		for _, b := range mContent {
+			if b["type"] != "tool_use" {
+				continue
+			}
+			toolUseBlocks = append(toolUseBlocks, b)
+			if id, ok := b["id"].(string); ok && id != "" && !toolResultsSeen[id] {
+				synths = append(synths, map[string]interface{}{
+					"type":        "tool_result",
+					"tool_use_id": id,
+					"content":     "(recovered by proxy)",
+				})
 			}
 		}
-		if len(synths) == 0 {
+		if len(toolUseBlocks) == 0 {
+			continue
+		}
+		nextIsUser := i+1 < len(newMsgs) && newMsgs[i+1]["role"] == "user"
+		// Even with nothing to synthesize, the client is allowed to send
+		// genuine tool_result blocks in any order (parallel tool calls can
+		// finish out of order) — Gemini still requires functionResponse
+		// parts to mirror the original functionCall order, so this needs
+		// to run whenever m made any tool_use call, not just when recovery
+		// stubs are needed.
+		if len(synths) == 0 && !nextIsUser {
 			continue
 		}
 		modified = true
-		if i+1 < len(newMsgs) && newMsgs[i+1]["role"] == "user" {
+		if nextIsUser {
 			nextBlocks := newMsgs[i+1]["content"].([]map[string]interface{})
-			merged := make([]map[string]interface{}, 0, len(synths)+len(nextBlocks))
-			merged = append(merged, synths...)
-			merged = append(merged, nextBlocks...)
-			newMsgs[i+1]["content"] = merged
+			// Gemini requires functionResponse parts in the SAME order as
+			// the functionCall parts they answer — always prepending the
+			// synthetic recovery stubs ahead of the real tool_results (as
+			// this used to do unconditionally) only happened to be correct
+			// when the abandoned call was the FIRST one m made. If it was a
+			// middle or later call, the synthetic stub still landed first,
+			// putting the responses out of order relative to m's original
+			// tool_use sequence. Rebuild in that original order instead.
+			realResults := make(map[string]map[string]interface{}, len(nextBlocks))
+			var otherBlocks []map[string]interface{}
+			for _, b := range nextBlocks {
+				if b["type"] == "tool_result" {
+					if tid, ok := b["tool_use_id"].(string); ok && tid != "" {
+						realResults[tid] = b
+						continue
+					}
+				}
+				otherBlocks = append(otherBlocks, b)
+			}
+			synthByID := make(map[string]map[string]interface{}, len(synths))
+			for _, s := range synths {
+				if tid, ok := s["tool_use_id"].(string); ok {
+					synthByID[tid] = s
+				}
+			}
+			ordered := make([]map[string]interface{}, 0, len(nextBlocks)+len(synths))
+			for _, b := range m["content"].([]map[string]interface{}) {
+				if b["type"] != "tool_use" {
+					continue
+				}
+				id, _ := b["id"].(string)
+				if id == "" {
+					continue
+				}
+				if real, ok := realResults[id]; ok {
+					ordered = append(ordered, real)
+				} else if synth, ok := synthByID[id]; ok {
+					ordered = append(ordered, synth)
+				}
+			}
+			ordered = append(ordered, otherBlocks...)
+			newMsgs[i+1]["content"] = ordered
 			rebuilt = append(rebuilt, newMsgs[i+1])
 			skipNext = true
 		} else {

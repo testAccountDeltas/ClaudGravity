@@ -22,6 +22,13 @@ import (
 // of 1.
 var currentLocalTimeMinuteSecondRe = regexp.MustCompile(`(T\d{2}):\d{2}:\d{2}`)
 
+// claudeCodeSelfIDRe matches only the self-identification clause itself —
+// the real line continues straight on with real behavioral instructions
+// ("Given the user's message, you should use the tools available to
+// complete the task. Complete the task fully...") that a whole-line
+// replacement in ScrubBillingHeader used to discard along with it.
+var claudeCodeSelfIDRe = regexp.MustCompile(`(?i)you are claude code, anthropic's official cli for claude\.?`)
+
 // DropSearchTools is stripped from the declared tools when
 // tenant.StripSearchTools is true (default: true — see README.md's
 // "Почему strip_search_tools по умолчанию true" for the full reasoning).
@@ -441,6 +448,23 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 					case "thinking":
 						thoughtTxt := p.Get("thinking").String()
 						if thoughtTxt != "" {
+							if role != "assistant" {
+								// Anthropic's spec never puts a "thinking"
+								// block in a user message, but a client
+								// built against a looser convention (not
+								// Claude Code itself, but one of the other
+								// Anthropic-API-compatible web/Electron
+								// clients this gateway also serves) could
+								// still send one. Google rejects "thought"
+								// outright on a non-model turn ("thought is
+								// only supported for model turns") — render
+								// it as plain text instead of risking a 400
+								// on the whole request over one stray block.
+								part := `{"text":""}`
+								part, _ = sjson.Set(part, "text", thoughtTxt)
+								partsJSON = append(partsJSON, part)
+								return true
+							}
 							// Prefer the real signature the client echoed back
 							// (now that sse.go actually sends one via
 							// signature_delta) over the skip-validator bypass;
@@ -465,6 +489,11 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						// the turn's structure intact with a placeholder
 						// instead of silently dropping it, which could
 						// otherwise leave an assistant turn with zero parts.
+						if role != "assistant" {
+							part := `{"text":"[Prior reasoning redacted]"}`
+							partsJSON = append(partsJSON, part)
+							return true
+						}
 						part := `{"thought":true,"thoughtSignature":"skip_thought_signature_validator","text":"[Prior reasoning redacted]"}`
 						partsJSON = append(partsJSON, part)
 					}
@@ -537,7 +566,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			}
 			desc := t.Get("description").String()
 			recordNumericEnumFields(name, t.Get("input_schema").Raw)
-			schemaRaw := CleanJSONSchemaForAntigravity(t.Get("input_schema").Raw)
+			schemaRaw := CleanJSONSchemaForAntigravity(name, t.Get("input_schema").Raw)
 			if strings.TrimSpace(schemaRaw) == "" || schemaRaw == "null" {
 				// Google rejects an OBJECT-type schema with empty properties
 				// ("parameters.properties: should be non-empty for OBJECT
@@ -545,7 +574,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				// CleanJSONSchemaForAntigravity already uses for schemas
 				// that end up empty after cleaning, instead of a raw
 				// properties:{} that bypasses it entirely.
-				schemaRaw = addEmptySchemaPlaceholder(`{"type":"object","properties":{}}`)
+				schemaRaw, _ = addEmptySchemaPlaceholder(`{"type":"object","properties":{}}`, nil)
 			}
 			// Remember which tools got our synthetic "reason" placeholder
 			// injected (the only way Gemini will accept an argument-less
@@ -767,7 +796,14 @@ func ScrubBillingHeader(txt string) string {
 			continue
 		}
 		if skipSection {
-			if strings.HasPrefix(trimmed, "# ") {
+			// Any heading level ends the section, not just another
+			// top-level "# " one — a "## Guidelines"/"### Rules" subsection
+			// nested under "# Environment" (or following it before the next
+			// real top-level heading) matched neither "# " nor the
+			// Environment whitelist below, so it and everything after it
+			// kept getting silently dropped as if it were still environment
+			// noise, sometimes eating the rest of the system prompt.
+			if strings.HasPrefix(trimmed, "#") {
 				skipSection = false
 			} else {
 				if strings.Contains(lower, "platform:") ||
@@ -806,9 +842,11 @@ func ScrubBillingHeader(txt string) string {
 			continue
 		}
 
-		// Normalize self-identification
+		// Normalize self-identification — replace only the identifying
+		// clause, keeping whatever real behavioral instructions follow it
+		// on the same line.
 		if strings.Contains(lower, "you are claude code, anthropic's official cli") {
-			cleanLines = append(cleanLines, "You are a helpful coding assistant.")
+			cleanLines = append(cleanLines, claudeCodeSelfIDRe.ReplaceAllString(line, "You are a helpful coding assistant."))
 			continue
 		}
 
