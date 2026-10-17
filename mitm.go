@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"bufio"
@@ -490,13 +490,40 @@ func HandleBootstrapSpoof(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	resp := map[string]interface{}{
-		"org_model_default": "claude-opus-5-5",
+		"org_model_default": map[string]interface{}{
+			"name":                    "claude-opus-5-5",
+			"updated_at":              "2026-01-01T00:00:00Z",
+			"data_source":             "org",
+			"override_user_selection": false,
+		},
+		"oauth_account": map[string]interface{}{
+			"account_uuid":                 "0bad747f-0000-4000-a000-000000000000",
+			"account_email":                "user@claudgravity.local",
+			"organization_uuid":            fakeOrgID,
+			"organization_name":            "ClaudGravity Workspace",
+			"organization_type":            "enterprise",
+			"organization_rate_limit_tier": "tier_4",
+			"user_rate_limit_tier":         "tier_4",
+			"seat_tier":                    "enterprise",
+		},
 		"additional_model_options": []interface{}{},
 		"model_access": []map[string]interface{}{
 			{"api_name": "claude-opus-5-5", "entitled": true},
+			{"api_name": "claude-opus-5", "entitled": true},
+			{"api_name": "claude-opus-4-8", "entitled": true},
+			{"api_name": "claude-opus-4-7", "entitled": true},
+			{"api_name": "claude-opus-4-6", "entitled": true},
+			{"api_name": "claude-opus-4-5", "entitled": true},
+			{"api_name": "claude-opus-4-6-thinking", "entitled": true},
 			{"api_name": "claude-sonnet-5-5", "entitled": true},
+			{"api_name": "claude-sonnet-5", "entitled": true},
+			{"api_name": "claude-sonnet-4-6", "entitled": true},
+			{"api_name": "claude-sonnet-4-5", "entitled": true},
 			{"api_name": "claude-haiku-5-5", "entitled": true},
+			{"api_name": "claude-haiku-4-5", "entitled": true},
 			{"api_name": "claude-fable-5-1", "entitled": true},
+			{"api_name": "claude-mythos-5", "entitled": true},
+			{"api_name": "claude-mythos-5-1", "entitled": true},
 			{"api_name": "gemini-3.8-flash-tiered", "entitled": true},
 			// Older canonical Claude model ids/aliases: a client pinned to one
 			// of these via `/model <id>` or `--model` checks this list before
@@ -510,7 +537,7 @@ func HandleBootstrapSpoof(w http.ResponseWriter, r *http.Request) {
 			{"api_name": "claude-3-5-haiku-20241022", "entitled": true},
 			{"api_name": "claude-3-5-haiku-latest", "entitled": true},
 			{"api_name": "claude-3-opus-20240229", "entitled": true},
-			{"api_name": "claude-opus-4-6-thinking", "entitled": true},
+			{"api_name": "gpt-oss-120b-medium", "entitled": true},
 		},
 	}
 	_ = json.NewEncoder(w).Encode(resp)

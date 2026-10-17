@@ -1,4 +1,4 @@
-﻿// package main provides utility functions for the CLI Proxy API server.
+// package main provides utility functions for the CLI Proxy API server.
 package main
 
 import (
@@ -58,31 +58,38 @@ func stripNestedOpenDictReason(toolName, argsRaw string) string {
 }
 
 // recordNumericEnumFields scans a tool's ORIGINAL (pre-clean) input_schema
-// for top-level properties with a non-string enum, so the type can be
+// recursively for properties with a non-string enum, so the type can be
 // restored on the way back in coerceNumericEnumArgs.
 func recordNumericEnumFields(toolName, inputSchemaRaw string) {
-	props := gjson.Get(inputSchemaRaw, "properties")
-	if !props.IsObject() {
-		return
-	}
-	var fields map[string]string
-	props.ForEach(func(key, val gjson.Result) bool {
-		t := val.Get("type").String()
-		if val.Get("enum").IsArray() && (t == "integer" || t == "number" || t == "boolean") {
-			if fields == nil {
-				fields = make(map[string]string)
-			}
-			fields[key.String()] = t
-		}
-		return true
-	})
+	fields := make(map[string]string)
+	walkSchemaForNumericEnums(gjson.Get(inputSchemaRaw, "properties"), "", fields)
 	numericEnumFieldsMu.Lock()
 	defer numericEnumFieldsMu.Unlock()
-	if fields == nil {
+	if len(fields) == 0 {
 		delete(numericEnumFields, toolName)
 		return
 	}
 	numericEnumFields[toolName] = fields
+}
+
+func walkSchemaForNumericEnums(props gjson.Result, prefix string, fields map[string]string) {
+	if !props.IsObject() {
+		return
+	}
+	props.ForEach(func(key, val gjson.Result) bool {
+		path := key.String()
+		if prefix != "" {
+			path = prefix + "." + key.String()
+		}
+		t := val.Get("type").String()
+		if val.Get("enum").IsArray() && (t == "integer" || t == "number" || t == "boolean") {
+			fields[path] = t
+		}
+		if val.Get("properties").IsObject() {
+			walkSchemaForNumericEnums(val.Get("properties"), path, fields)
+		}
+		return true
+	})
 }
 
 // coerceNumericEnumArgs restores a function call's string-coerced enum
@@ -554,6 +561,30 @@ func flattenAnyOfOneOf(jsonStr string) string {
 				// null for a field Gemini's validator now sees as a plain
 				// (non-nullable) string/object/etc.
 				selected, _ = sjson.Set(selected, "nullable", true)
+
+				// Also strip from parent object's required array if this is a property
+				parts := splitGJSONPath(parentPath)
+				if len(parts) >= 2 && parts[len(parts)-2] == "properties" {
+					fieldName := unescapeGJSONPathKey(parts[len(parts)-1])
+					objectPath := strings.Join(parts[:len(parts)-2], ".")
+					reqPath := "required"
+					if objectPath != "" {
+						reqPath = objectPath + ".required"
+					}
+					if req := gjson.Get(jsonStr, reqPath); req.IsArray() {
+						var filtered []string
+						for _, r := range req.Array() {
+							if r.String() != fieldName {
+								filtered = append(filtered, r.String())
+							}
+						}
+						if len(filtered) == 0 {
+							jsonStr, _ = sjson.Delete(jsonStr, reqPath)
+						} else {
+							jsonStr, _ = sjson.Set(jsonStr, reqPath, filtered)
+						}
+					}
+				}
 			}
 
 			jsonStr = setRawAt(jsonStr, parentPath, selected)
@@ -1046,7 +1077,6 @@ func mergeDescriptionRaw(schemaRaw, parentDesc string) string {
 	}
 }
 
-
 func Walk(value gjson.Result, path string, targetKey string, paths *[]string) {
 	if value.IsArray() {
 		for i, item := range value.Array() {
@@ -1068,9 +1098,6 @@ func Walk(value gjson.Result, path string, targetKey string, paths *[]string) {
 		})
 	}
 }
-
-
-
 
 // addMissingArrayItems gives every array schema that declares no "items" an empty one.
 //
