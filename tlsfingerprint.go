@@ -120,16 +120,25 @@ func (t *fingerprintedRoundTripper) h2ConnFor(ctx context.Context, host, addr st
 	t.dialing[addr] = cond
 	t.mu.Unlock()
 
-	conn, err := t.dialH2(ctx, host, addr)
+	// dialH2 panicking (not just returning an error) used to skip this
+	// cleanup entirely — the stale t.dialing[addr] entry never gets
+	// removed and cond.Broadcast() never fires, so every OTHER goroutine
+	// already blocked in cond.Wait() above, and every future call for
+	// this same addr, waits forever: one panic here permanently wedges
+	// every request to that upstream host, not just the one that panicked.
+	var conn *http2.ClientConn
+	var err error
+	defer func() {
+		t.mu.Lock()
+		delete(t.dialing, addr)
+		cond.Broadcast()
+		if err == nil && conn != nil {
+			t.h2Conns[addr] = conn
+		}
+		t.mu.Unlock()
+	}()
 
-	t.mu.Lock()
-	delete(t.dialing, addr)
-	cond.Broadcast()
-	if err == nil && conn != nil {
-		t.h2Conns[addr] = conn
-	}
-	t.mu.Unlock()
-
+	conn, err = t.dialH2(ctx, host, addr)
 	return conn, err
 }
 

@@ -720,8 +720,30 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 		// 503, etc.) even though the outer HTTP response was 200 OK — map
 		// it the same way as a real HTTP failure so the client's SDK knows
 		// whether this is retryable instead of seeing a generic api_error
-		// for everything.
-		errType := anthropicErrorTypeForStatus(int(errNode.Get("code").Int()))
+		// for everything. The google.rpc.Status "status" string (e.g.
+		// "RESOURCE_EXHAUSTED", "UNAVAILABLE") is unambiguous regardless of
+		// whether "code" on this particular envelope turns out to be the
+		// HTTP-style number the comment above assumes or a raw gRPC status
+		// code (8, 14, ...) instead — checked first as a safe supplement,
+		// never a behavior change for whatever "code" already handles
+		// correctly.
+		var errType string
+		switch errNode.Get("status").String() {
+		case "RESOURCE_EXHAUSTED":
+			errType = "rate_limit_error"
+		case "UNAVAILABLE":
+			errType = "overloaded_error"
+		case "INVALID_ARGUMENT", "FAILED_PRECONDITION", "OUT_OF_RANGE":
+			errType = "invalid_request_error"
+		case "UNAUTHENTICATED":
+			errType = "authentication_error"
+		case "PERMISSION_DENIED":
+			errType = "permission_error"
+		case "NOT_FOUND":
+			errType = "not_found_error"
+		default:
+			errType = anthropicErrorTypeForStatus(int(errNode.Get("code").Int()))
+		}
 		errPayload := fmt.Sprintf(`{"type":"error","error":{"type":%q,"message":%q}}`, errType, "Upstream stream error: "+msg)
 		_ = s.SendRaw("error", errPayload)
 		return fmt.Errorf("upstream stream error: %s", msg)

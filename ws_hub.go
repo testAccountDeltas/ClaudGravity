@@ -17,10 +17,11 @@ type WSEvent struct {
 
 // WSClient wraps a single WebSocket connection.
 type WSClient struct {
-	ws     *websocket.Conn
-	send   chan []byte
-	closed bool
-	mu     sync.Mutex
+	ws             *websocket.Conn
+	send           chan []byte
+	closed         bool
+	mu             sync.Mutex
+	unregisterOnce sync.Once
 }
 
 // WSHub coordinates live connections and broadcasts events to all connected clients.
@@ -71,9 +72,7 @@ func (h *WSHub) run() {
 			for client := range h.clients {
 				if !client.SafeSend(msg) {
 					// Closed or slow client buffer full: unregister to avoid stalling
-					go func(c *WSClient) {
-						h.unregister <- c
-					}(client)
+					go client.requestUnregister(h)
 				}
 			}
 			h.mu.RUnlock()
@@ -91,6 +90,22 @@ func (h *WSHub) run() {
 			h.mu.RUnlock()
 		}
 	}
+}
+
+// requestUnregister sends this client to the hub's unregister channel
+// exactly once, however many of (writer pump, reader pump, a failed
+// broadcast SafeSend) notice the disconnect — each used to send
+// independently on a small (32-slot) buffered channel with a plain
+// blocking send, so a burst of simultaneous client disconnects (e.g. a
+// server restart dropping every open dashboard tab's WebSocket at once)
+// could file up to 2-3x as many unregister sends as there are clients,
+// filling that buffer and leaving the extra goroutines blocked until the
+// hub's single-threaded run() loop drained far more entries than there
+// were ever real clients.
+func (c *WSClient) requestUnregister(h *WSHub) {
+	c.unregisterOnce.Do(func() {
+		h.unregister <- c
+	})
 }
 
 func (c *WSClient) Close() {
@@ -197,9 +212,7 @@ func HandleWS(ws *websocket.Conn) {
 
 	// Writer pump: pipes send channel to WebSocket
 	go func() {
-		defer func() {
-			globalWSHub.unregister <- client
-		}()
+		defer client.requestUnregister(globalWSHub)
 		for msg := range client.send {
 			_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if _, err := ws.Write(msg); err != nil {
@@ -209,9 +222,7 @@ func HandleWS(ws *websocket.Conn) {
 	}()
 
 	// Reader pump: reads control messages / client pings
-	defer func() {
-		globalWSHub.unregister <- client
-	}()
+	defer client.requestUnregister(globalWSHub)
 
 	buf := make([]byte, 1024)
 	for {

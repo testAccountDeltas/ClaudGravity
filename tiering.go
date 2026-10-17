@@ -56,17 +56,39 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 		} else {
 			switch effort {
 			case "low":
-				model = base + "-low"
-				budget = 2048
-			case "medium":
-				model = base + "-medium"
-				budget = 8192
-			case "high":
-				model = base + "-high"
-				budget = 16384
-			case "xhigh", "max", "ultracode":
-				model = "gemini-3.8-flash-tiered"
-				budget = -1 // Native Google ModeAuto
+				if wasTieredClass {
+					// Opus/Fable/Mythos never degrade all the way to the
+					// bottom tier even on an explicit "low" — same floor
+					// the rest of this class gets below.
+					model = base + "-medium"
+					budget = 8192
+				} else {
+					model = base + "-low"
+					budget = 2048
+				}
+			case "medium", "high", "xhigh", "max", "ultracode":
+				if wasTieredClass {
+					// Asking for MORE effort on an Opus-class model used to
+					// map "high" to a capped 16384-token budget — strictly
+					// LESS thinking than the unlimited ModeAuto tier that
+					// same request got with NO effort specified at all, so
+					// explicitly requesting more reasoning quality made it
+					// worse. Every non-"low" level funnels into the same
+					// full tiered/ModeAuto treatment for this class; Google's
+					// own adaptive thinking budget already scales with the
+					// request, which an artificial fixed cap can't do.
+					model = "gemini-3.8-flash-tiered"
+					budget = -1
+				} else if effort == "medium" {
+					model = base + "-medium"
+					budget = 8192
+				} else if effort == "high" {
+					model = base + "-high"
+					budget = 16384
+				} else {
+					model = "gemini-3.8-flash-tiered"
+					budget = -1 // Native Google ModeAuto
+				}
 			default:
 				if wasTieredClass {
 					model = "gemini-3.8-flash-tiered"
@@ -123,6 +145,14 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 					budget = 2048
 				} else if strings.HasSuffix(model, "-medium") {
 					budget = 8192
+				} else if model == "gemini-2.5-flash" {
+					// Haiku's whole point is a fast, cheap response — none
+					// of the suffix checks above match this model name, so
+					// it fell through to the outer "budget := 8192" default
+					// set at the top of this function, forcing a medium
+					// thinking pass (and its latency/cost) onto every
+					// Haiku request that doesn't explicitly ask for one.
+					budget = 0
 				}
 			}
 		}

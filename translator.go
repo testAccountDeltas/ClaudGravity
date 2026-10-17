@@ -916,6 +916,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 func ScrubBillingHeader(txt string) string {
 	var cleanLines []string
 	skipSection := false
+	skipSectionLines := 0
 
 	for _, line := range strings.Split(txt, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -944,18 +945,28 @@ func ScrubBillingHeader(txt string) string {
 		// Unix (export, ls, grep) on a Windows box as often as not.
 		if trimmed == "# Environment" {
 			skipSection = true
+			skipSectionLines = 0
 			cleanLines = append(cleanLines, line)
 			continue
 		}
 		if skipSection {
+			skipSectionLines++
 			// Any heading level ends the section, not just another
 			// top-level "# " one — a "## Guidelines"/"### Rules" subsection
 			// nested under "# Environment" (or following it before the next
 			// real top-level heading) matched neither "# " nor the
 			// Environment whitelist below, so it and everything after it
 			// kept getting silently dropped as if it were still environment
-			// noise, sometimes eating the rest of the system prompt.
-			if strings.HasPrefix(trimmed, "#") {
+			// noise, sometimes eating the rest of the system prompt. But
+			// "# Environment" can also be the LAST heading in the real
+			// prompt entirely — no heading of any level ever follows it —
+			// in which case that fix alone still ate everything to the end
+			// of the prompt (model description, skills catalog, date). The
+			// known Environment fields (platform/shell/os/working
+			// directory/git-repo/scratchpad) comfortably fit well under 20
+			// lines; past that, whatever follows isn't this section
+			// anymore even without a heading to prove it.
+			if strings.HasPrefix(trimmed, "#") || skipSectionLines > 20 {
 				skipSection = false
 			} else {
 				if strings.Contains(lower, "platform:") ||

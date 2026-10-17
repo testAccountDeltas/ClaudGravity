@@ -10,17 +10,37 @@ import (
 const ToolOutputCharLimit = 65536 // 64 KB limit
 
 // extractPlainText concatenates the text of every "text" content block in a
-// normalized ([]map[string]interface{}) message content value.
+// message content value — either already-normalized ([]map[string]interface{},
+// built by this file's own Step 1 loop) or raw-from-json.Unmarshal
+// ([]interface{} — a plain json.Unmarshal into interface{} never produces
+// []map[string]interface{} for a JSON array, only []interface{} with each
+// element itself a map[string]interface{}; this used to only handle the
+// normalized shape, so calling it on a RAW message — e.g. messages[0] before
+// Step 1 even runs — silently returned "" every time), plus a bare string
+// content value.
 func extractPlainText(content interface{}) string {
-	blocks, ok := content.([]map[string]interface{})
-	if !ok {
-		return ""
-	}
 	var sb strings.Builder
-	for _, b := range blocks {
-		if b["type"] == "text" {
-			if t, ok := b["text"].(string); ok {
-				sb.WriteString(t)
+	switch c := content.(type) {
+	case string:
+		return c
+	case []map[string]interface{}:
+		for _, b := range c {
+			if b["type"] == "text" {
+				if t, ok := b["text"].(string); ok {
+					sb.WriteString(t)
+				}
+			}
+		}
+	case []interface{}:
+		for _, item := range c {
+			b, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if b["type"] == "text" {
+				if t, ok := b["text"].(string); ok {
+					sb.WriteString(t)
+				}
 			}
 		}
 	}

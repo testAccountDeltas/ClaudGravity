@@ -217,6 +217,33 @@ func isAnthropicHost(host string) bool {
 	return false
 }
 
+// isBlockedConnectTarget reports whether host resolves to a private,
+// link-local, loopback, or cloud-metadata address — this gateway only ever
+// legitimately proxies to public internet hosts, so a CONNECT tunnel to
+// anything in these ranges has no real use case and is refused outright
+// rather than handed to net.DialTimeout.
+func isBlockedConnectTarget(host string) bool {
+	ips := []net.IP{net.ParseIP(host)}
+	if ips[0] == nil {
+		resolved, err := net.LookupIP(host)
+		if err != nil {
+			// Can't resolve it at all — DialTimeout will fail the exact
+			// same way a moment later; nothing to block here.
+			return false
+		}
+		ips = resolved
+	}
+	for _, ip := range ips {
+		if ip == nil {
+			continue
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return true
+		}
+	}
+	return false
+}
+
 // HandleConnectTunnel implements native HTTP CONNECT proxying and TLS interception.
 // proxySecret, when non-empty, is required as a "Proxy-Authorization: Bearer
 // <secret>" header on every CONNECT request — without it, anyone who can
@@ -231,6 +258,19 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 	host := r.Host
 	if h, _, err := net.SplitHostPort(r.Host); err == nil {
 		host = h
+	}
+
+	// This gateway's whole job is proxying to public hosts
+	// (api.anthropic.com, github.com, npm/pypi registries, ...) — it has
+	// no legitimate reason to ever CONNECT to a private, link-local, or
+	// loopback address, so a client that knows (or defeats) the proxy
+	// secret can't use this as an SSRF pivot into the host's own internal
+	// network or cloud metadata endpoint (169.254.169.254). Checked before
+	// Hijack() so a normal HTTP error response still works here.
+	if !isAnthropicHost(host) && isBlockedConnectTarget(host) {
+		LogGateway("[SuperRelay Gateway] Refused CONNECT to private/internal address: %s", host)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
 	}
 
 	hijacker, ok := w.(http.Hijacker)
@@ -277,7 +317,8 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 		return
 	}
 
-	// 3. Transparent TCP tunnel for all other external hosts
+	// 3. Transparent TCP tunnel for all other external hosts (private/
+	// internal targets already refused above, before Hijack()).
 	targetConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
 		clientConn.Close()

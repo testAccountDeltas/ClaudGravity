@@ -144,10 +144,16 @@ func (as *AccountSelector) SelectAccount(apiKey string, conversationKey string, 
 
 // SelectAccountExcluding chooses an account while skipping accounts in the excluded map (useful for Failover).
 func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey string, tenant TenantConfig, excluded map[string]bool) (*AccountRecord, error) {
+	// Deep-copies every account's Quotas slice — fetched before taking
+	// as.mu (it only touches AccountManager's own lock, nothing in as)
+	// so this snapshot cost isn't paid while holding the selector's lock
+	// and serializing every OTHER concurrent request's own account pick
+	// behind it.
+	accounts := globalAccountManager.GetAccounts()
+
 	as.mu.Lock()
 	defer as.mu.Unlock()
 
-	accounts := globalAccountManager.GetAccounts()
 	if len(accounts) == 0 {
 		return nil, fmt.Errorf("no accounts available in pool")
 	}
@@ -188,8 +194,19 @@ func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey
 		}
 	}
 
-	// 3. Fallback: Sticky per API Key
-	if (tenant.Strategy == "sticky" || tenant.Strategy == "") && apiKey != "" {
+	// 3. Fallback: Sticky per API Key — main thread / non-subagent requests
+	// only. A subagent's conversationKey is "sid:<session>:<instanceID>"
+	// (see DeriveConversationAnchor); on its very FIRST turn, step 2 above
+	// always misses (nothing has bound that exact composite key yet), so
+	// without this guard every subagent fell straight through to the same
+	// per-apiKey sticky account every OTHER request already uses — there's
+	// only one stickyMap entry per apiKey, shared by the main thread and
+	// every subagent, so this collapsed 5-10 parallel subagents onto the
+	// exact same Google account on their first request and then PERSISTED
+	// that via bindAffinityLocked below, undoing the whole point of
+	// qualifying conversationKey by instanceID in the first place.
+	isSubagentKey := strings.Count(conversationKey, ":") >= 2
+	if !isSubagentKey && (tenant.Strategy == "sticky" || tenant.Strategy == "") && apiKey != "" {
 		if assignedEmail, ok := as.stickyMap[apiKey]; ok {
 			for _, acc := range accounts {
 				if acc.Email == assignedEmail && !isExcluded(acc) && hasRemainingQuota(acc) {
@@ -244,10 +261,11 @@ func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey
 // GetOrAssignStickyAccount guarantees returning the assigned sticky account for an API key.
 // If not yet bound, it deterministically picks the best non-exhausted account and pins it permanently to the key.
 func (as *AccountSelector) GetOrAssignStickyAccount(apiKey string, tenant TenantConfig) *AccountRecord {
+	accounts := globalAccountManager.GetAccounts()
+
 	as.mu.Lock()
 	defer as.mu.Unlock()
 
-	accounts := globalAccountManager.GetAccounts()
 	if len(accounts) == 0 {
 		return nil
 	}

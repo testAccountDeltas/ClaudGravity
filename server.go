@@ -901,6 +901,17 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			return
 		}
 
+		// The client disconnecting (Ctrl+C, closed terminal) cancels
+		// baseCtx, which is exactly why the upstream call just failed —
+		// that's not a verdict on activeAcc at all, and retrying on a
+		// DIFFERENT account for a request nobody is listening for anymore
+		// just cycles through the rest of the pool for no reason before
+		// finally giving up once maxAttempts runs out.
+		if r.Context().Err() != nil {
+			LogGateway("[#%d] Client disconnected (%v), aborting retry loop without touching account state", rid, r.Context().Err())
+			return
+		}
+
 		// If failure occurred before headers were sent, we can safely retry on another account
 		if activeAcc != nil {
 			excludedAccounts[activeAcc.Email] = true
