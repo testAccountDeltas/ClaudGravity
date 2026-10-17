@@ -131,14 +131,17 @@ func isAllHexDigits(s string) bool {
 
 // sealFunctionResponseTurn enforces Gemini's "a turn carrying a
 // functionResponse must contain ONLY functionResponse parts" rule (the same
-// constraint already handled for LoopGuard nudges in loopguard.go and for
-// tool_result images above): if parts mixes functionResponse entries with
-// anything else — plain text, images — the mix is folded into the first
-// functionResponse (text as response.user_note, images nested under
-// functionResponse.parts) and only the now-self-contained functionResponse
-// entries are returned. Returns parts unchanged when there's no
-// functionResponse, or nothing else to fold (already pure).
-func sealFunctionResponseTurn(parts []string) []string {
+// constraint already handled for LoopGuard nudges in loopguard.go): if parts
+// mixes functionResponse entries with anything else — plain text, images —
+// the text is folded into the first functionResponse's response.user_note.
+// Images are NOT nested under functionResponse.parts — multiple independent
+// reports agree Google's real FunctionResponse message has exactly 3 fields
+// (name, response, id) and no "parts", so that previously silently lost any
+// screenshot/plot a tool returned. Returns the now-pure functionResponse
+// entries, plus any image parts the caller must emit as a separate
+// following turn (role "user", pure inlineData — unambiguously valid
+// Gemini syntax, unlike the removed functionResponse.parts guess).
+func sealFunctionResponseTurn(parts []string) (sealed []string, followUpImages []string) {
 	var fnResp, other []string
 	for _, p := range parts {
 		if gjson.Get(p, "functionResponse").Exists() {
@@ -148,11 +151,10 @@ func sealFunctionResponseTurn(parts []string) []string {
 		}
 	}
 	if len(fnResp) == 0 || len(other) == 0 {
-		return parts
+		return parts, nil
 	}
 
 	var note strings.Builder
-	var imgParts []string
 	for _, p := range other {
 		if t := gjson.Get(p, "text"); t.Exists() {
 			if note.Len() > 0 {
@@ -160,7 +162,7 @@ func sealFunctionResponseTurn(parts []string) []string {
 			}
 			note.WriteString(t.String())
 		} else if gjson.Get(p, "inlineData").Exists() {
-			imgParts = append(imgParts, p)
+			followUpImages = append(followUpImages, p)
 		}
 	}
 
@@ -168,19 +170,8 @@ func sealFunctionResponseTurn(parts []string) []string {
 	if note.Len() > 0 {
 		target, _ = sjson.Set(target, "functionResponse.response.user_note", note.String())
 	}
-	if len(imgParts) > 0 {
-		var combinedImgParts []string
-		if existing := gjson.Get(target, "functionResponse.parts"); existing.IsArray() {
-			existing.ForEach(func(_, v gjson.Result) bool {
-				combinedImgParts = append(combinedImgParts, v.Raw)
-				return true
-			})
-		}
-		combinedImgParts = append(combinedImgParts, imgParts...)
-		target, _ = sjson.SetRaw(target, "functionResponse.parts", "["+strings.Join(combinedImgParts, ",")+"]")
-	}
 	fnResp[0] = target
-	return fnResp
+	return fnResp, followUpImages
 }
 
 // ConvertClaudeRequestToGemini converts an Anthropic Messages API payload into
@@ -368,13 +359,25 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						// mimeType (application/pdf here instead of
 						// image/*).
 						src := p.Get("source")
-						if src.Get("type").String() == "base64" {
+						switch src.Get("type").String() {
+						case "base64":
 							mediaType := src.Get("media_type").String()
 							b64Data := src.Get("data").String()
 							if b64Data != "" {
 								part := `{"inlineData":{"mimeType":"","data":""}}`
 								part, _ = sjson.Set(part, "inlineData.mimeType", mediaType)
 								part, _ = sjson.Set(part, "inlineData.data", b64Data)
+								partsJSON = append(partsJSON, part)
+							}
+						case "text":
+							// A plain-text document source (source.data is
+							// the literal text, not base64) was silently
+							// dropped entirely — only "base64" was ever
+							// handled. Gemini has no document type at all;
+							// the real content is just text either way.
+							if txt := src.Get("data").String(); txt != "" {
+								part := `{"text":""}`
+								part, _ = sjson.Set(part, "text", txt)
 								partsJSON = append(partsJSON, part)
 							}
 						}
@@ -466,7 +469,8 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 									// blocks were read), silently losing any
 									// screenshot/plot/PDF a tool returned.
 									src := item.Get("source")
-									if src.Get("type").String() == "base64" {
+									switch src.Get("type").String() {
+									case "base64":
 										mediaType := src.Get("media_type").String()
 										data := src.Get("data").String()
 										if mediaType != "" && data != "" {
@@ -474,6 +478,10 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 											imgPart, _ = sjson.Set(imgPart, "inlineData.mimeType", mediaType)
 											imgPart, _ = sjson.Set(imgPart, "inlineData.data", data)
 											imageParts = append(imageParts, imgPart)
+										}
+									case "text":
+										if txt := src.Get("data").String(); txt != "" {
+											sb.WriteString(txt)
 										}
 									}
 								}
@@ -575,7 +583,8 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			if len(partsJSON) == 0 {
 				partsJSON = append(partsJSON, `{"text":"..."}`)
 			}
-			partsJSON = sealFunctionResponseTurn(partsJSON)
+			var followUpImages []string
+			partsJSON, followUpImages = sealFunctionResponseTurn(partsJSON)
 
 			if geminiRole == lastRole && contentIdx > 0 {
 				targetIdx := contentIdx - 1
@@ -592,7 +601,9 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 					return true
 				})
 				combined = append(combined, partsJSON...)
-				combined = sealFunctionResponseTurn(combined)
+				var mergedFollowUp []string
+				combined, mergedFollowUp = sealFunctionResponseTurn(combined)
+				followUpImages = append(followUpImages, mergedFollowUp...)
 				combinedJSON := "[" + strings.Join(combined, ",") + "]"
 				out, _ = sjson.SetRaw(out, fmt.Sprintf("contents.%d.parts", targetIdx), combinedJSON)
 			} else {
@@ -604,12 +615,37 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				contentIdx++
 			}
 
+			if len(followUpImages) > 0 {
+				// A functionResponse turn's images, as their own
+				// immediately-following plain "user" turn — unambiguously
+				// valid Gemini syntax, unlike nesting them under
+				// functionResponse.parts (see sealFunctionResponseTurn).
+				out, _ = sjson.Set(out, fmt.Sprintf("contents.%d.role", contentIdx), "user")
+				notePart := `{"text":"Visual output from the previous tool call:"}`
+				out, _ = sjson.SetRaw(out, fmt.Sprintf("contents.%d.parts.-1", contentIdx), notePart)
+				for _, pjson := range followUpImages {
+					out, _ = sjson.SetRaw(out, fmt.Sprintf("contents.%d.parts.-1", contentIdx), pjson)
+				}
+				lastRole = "user"
+				contentIdx++
+			}
+
 			return true
 		})
 	}
 
 	// 6. Tools Declaration
 	syntheticReasonTools := make(map[string]bool)
+	// Tracks which tool names actually made it into Gemini's
+	// functionDeclarations (post strip_search_tools/web_search filtering)
+	// — NOT the same set as declaredToolNames above, which reflects
+	// everything the CLIENT originally declared before any of that
+	// filtering. tool_choice's allowedFunctionNames guard below needs the
+	// post-filter set: Grep/Glob stay in declaredToolNames even when
+	// stripped, so checking against that let tool_choice:{"type":"tool",
+	// "name":"Grep"} through, 400ing with "allowed_function_names contains
+	// 'Grep' which is not in function_declarations".
+	sentToolNames := make(map[string]bool)
 	if tools := root.Get("tools"); tools.IsArray() {
 		var decls []string
 		hasWebSearch := false
@@ -664,6 +700,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			decl, _ = sjson.Set(decl, "description", desc)
 			decl, _ = sjson.SetRaw(decl, "parameters", schemaRaw)
 			decls = append(decls, decl)
+			sentToolNames[name] = true
 			return true
 		})
 
@@ -708,7 +745,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				case "any":
 					out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.mode", "ANY")
 				case "tool":
-					if name := tc.Get("name").String(); name != "" {
+					if name := tc.Get("name").String(); name != "" && sentToolNames[name] {
 						out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.mode", "ANY")
 						out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.allowedFunctionNames.0", name)
 					}
@@ -858,7 +895,14 @@ func ScrubBillingHeader(txt string) string {
 			continue
 		}
 		if strings.Contains(line, "Claude Agent SDK") || strings.Contains(line, "built on Anthropic") {
-			cleanLines = append(cleanLines, "You are a helpful coding assistant.")
+			// Same class of bug as the "you are claude code" self-ID fix
+			// below: replacing the WHOLE line risked discarding real
+			// trailing instructions that continue past the identifying
+			// phrase on the same line. Strip just the phrases themselves
+			// instead of guessing the full sentence structure.
+			scrubbed := strings.ReplaceAll(line, "Claude Agent SDK", "a coding assistant")
+			scrubbed = strings.ReplaceAll(scrubbed, "built on Anthropic", "")
+			cleanLines = append(cleanLines, scrubbed)
 			continue
 		}
 

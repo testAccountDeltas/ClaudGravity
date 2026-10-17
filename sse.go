@@ -462,9 +462,13 @@ func (s *SSEStreamer) FinishWithError(err error) {
 	if finished {
 		return
 	}
+	// event:error is itself terminal in Anthropic's SSE state machine — the
+	// other two event:error sites in this file (ProcessGeminiChunk's
+	// upstream-error and blocked-prompt paths) never follow it with
+	// message_stop either, and a strict client parser that expects nothing
+	// more after "error" would be confused by one arriving anyway.
 	errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":%q}}`, "Stream connection broken: "+err.Error())
 	_ = s.SendRaw("error", errPayload)
-	_ = s.SendRaw("message_stop", `{"type":"message_stop"}`)
 }
 
 func (s *SSEStreamer) FinishStream(finishReason string) error {
@@ -495,7 +499,8 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	// show, which beats discarding it.
 	isSafetyBlock := finishReason == "SAFETY" || finishReason == "RECITATION" || finishReason == "BLOCKLIST" ||
 		finishReason == "PROHIBITED_CONTENT" || finishReason == "SPII"
-	isEmptyRefusal := isSafetyBlock && !s.toolUseOccurred && s.textChars == 0 && s.thinkingChars == 0
+	isGenuinelyEmpty := !s.toolUseOccurred && s.textChars == 0 && s.thinkingChars == 0
+	isEmptyRefusal := isSafetyBlock && isGenuinelyEmpty
 
 	// MAX_TOKENS must win over tool_use: toolUseOccurred only means a
 	// functionCall part was seen, not that it arrived complete. If
@@ -512,6 +517,18 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 		// empty content array from zero content_block_start/stop events,
 		// which a strict SDK's schema validation rejects outright.
 		if err := s.HandleText("I'm not able to help with that request."); err != nil {
+			return err
+		}
+		if err := s.closeCurrentBlock(); err != nil {
+			return err
+		}
+	} else if isGenuinelyEmpty {
+		// Same minItems:1 problem, but for a non-safety finishReason
+		// (plain "STOP" or anything else) that still ended with literally
+		// nothing ever streamed — a rarer edge case than the safety-block
+		// one above, but the empty-content array is exactly as invalid
+		// either way.
+		if err := s.HandleText("(empty response)"); err != nil {
 			return err
 		}
 		if err := s.closeCurrentBlock(); err != nil {

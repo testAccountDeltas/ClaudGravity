@@ -17,6 +17,12 @@ import (
 var (
 	sessionCWDLock sync.RWMutex
 	sessionCWDMap  = make(map[string]string)
+	// sessionCWDSeen bounds sessionCWDMap's otherwise-unbounded growth —
+	// each entry is keyed by sessionID:instanceID (one per subagent
+	// instance ever seen), and without a sweep this grew forever for the
+	// life of the gateway process across every session/subagent that ever
+	// connected, same leak class sessionSnapMap already guards against.
+	sessionCWDSeen = make(map[string]time.Time)
 )
 
 func RecordSessionCWD(sessionID, cwd string) {
@@ -26,6 +32,19 @@ func RecordSessionCWD(sessionID, cwd string) {
 	sessionCWDLock.Lock()
 	defer sessionCWDLock.Unlock()
 	sessionCWDMap[sessionID] = filepath.Clean(strings.TrimSpace(cwd))
+	sessionCWDSeen[sessionID] = time.Now()
+}
+
+func sweepStaleSessionCWD() {
+	sessionCWDLock.Lock()
+	defer sessionCWDLock.Unlock()
+	cutoff := time.Now().Add(-sessionSnapStaleAfter)
+	for sessionID, t := range sessionCWDSeen {
+		if t.Before(cutoff) {
+			delete(sessionCWDSeen, sessionID)
+			delete(sessionCWDMap, sessionID)
+		}
+	}
 }
 
 func GetSessionCWD(sessionID string) string {
@@ -85,6 +104,7 @@ func init() {
 		defer ticker.Stop()
 		for range ticker.C {
 			sweepStaleSessionSnapshots()
+			sweepStaleSessionCWD()
 		}
 	}()
 }

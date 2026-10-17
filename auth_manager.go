@@ -78,8 +78,15 @@ type AccountRecord struct {
 	Email           string       `json:"email"`
 	ProjectID       string       `json:"project_id"`
 	ProjectIDProbed bool         `json:"project_id_probed"` // discovered via loadCodeAssist/onboardUser (or confirmed), not just the generic fallback — never re-probe once true
-	RefreshToken    string       `json:"refresh_token"`
-	AccessToken     string       `json:"access_token"`
+	// Never serialized: GetAccounts()/GetAccount() snapshots of this struct
+	// go straight out over /api/accounts and the dashboard websocket
+	// (ws_hub.go's BroadcastAccounts) to anyone with the dashboard
+	// password — these are long-lived Google OAuth credentials, not
+	// display data, and nothing reads them back through JSON (on-disk
+	// persistence in auth_manager.go builds its own anonymous map, it
+	// never marshals AccountRecord itself).
+	RefreshToken string `json:"-"`
+	AccessToken  string `json:"-"`
 	ExpiresAt       time.Time    `json:"expires_at"`
 	Disabled        bool         `json:"disabled"`
 	FilePath        string       `json:"file_path"`

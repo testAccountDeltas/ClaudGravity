@@ -220,6 +220,15 @@ func stripThoughtFieldsForPublicAPI(geminiBody []byte) []byte {
 				delete(pm, "thought")
 				delete(pm, "thoughtSignature")
 				changed = true
+			} else if _, hasSig := pm["thoughtSignature"]; hasSig {
+				// A functionCall part carries its own thoughtSignature too
+				// (translator.go sets one on every replayed tool_use, to
+				// preserve call identity) — it has no "thought" key at all,
+				// so the check above missed it, and thoughtSignature is
+				// output-only on the public API the exact same way "thought"
+				// itself is.
+				delete(pm, "thoughtSignature")
+				changed = true
 			}
 		}
 	}
@@ -738,13 +747,10 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		//    it's an estimate; if it still undershoots, bump the
 		//    deterministic session id instead of losing history or burning
 		//    an account-rotation slot on it.
-		// Each bump just retries the same account with a fresh session
-		// bucket -- it costs a lost prefix cache on that one retry, not an
-		// account-rotation slot, so there is little downside to allowing
-		// more of them. 2 ran out within 1-2 hours of a long, subagent-
-		// heavy session hitting the wall repeatedly, forcing the request
-		// to fall through to full account rotation instead.
-		const maxSessionBumps = 8
+		// maxBumpsPerAttempt bounds ONE request's own retry loop (see the
+		// isSessionTokenWallError branch below for why this is no longer
+		// checked against the session's cumulative bump count).
+		const maxBumpsPerAttempt = 3
 		const maxLocationGatePasses = 2 // full passes over antigravityHosts
 		hostIdx := 0
 		locationGatePasses := 0
@@ -769,6 +775,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		// attempt first, burning a wasted round-trip on every single turn for
 		// the rest of the conversation instead of just the first one.
 		bump := getSessionBump(antigravitySessionKey)
+		bumpsThisAttempt := 0
 		var success bool
 		for {
 			upstreamURL := directURL
@@ -809,27 +816,41 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			}
 			errText := fmt.Sprint(lastErr)
 
-			if isAntigravityLocationGateError(lastStatus, errText) {
+			if isAntigravityLocationGateError(lastStatus, errText) || isTransientNetworkError(lastStatus, errText) {
 				hostIdx++
 				if hostIdx >= len(antigravityHosts) {
 					hostIdx = 0
 					locationGatePasses++
 				}
 				if locationGatePasses >= maxLocationGatePasses {
-					LogGateway("[#%d] !! Location gate exhausted all hosts %d time(s) on %s, giving up on this account", rid, locationGatePasses, accLabel)
+					LogGateway("[#%d] !! Location/network gate exhausted all hosts %d time(s) on %s, giving up on this account", rid, locationGatePasses, accLabel)
 					break
 				}
-				LogGateway("[#%d] !! Location gate on %s, retrying on next host (%s)", rid, accLabel, antigravityHosts[hostIdx])
+				LogGateway("[#%d] !! Location/network error on %s, retrying on next host (%s): %s", rid, accLabel, antigravityHosts[hostIdx], errText)
 				continue
 			}
 
 			if isSessionTokenWallError(lastStatus, errText) {
-				if bump >= maxSessionBumps {
+				// bump is PERSISTED across this session's whole lifetime
+				// (getSessionBump above reads back whatever the last
+				// request that hit the wall saved) — capping against it
+				// directly meant a long, heavily-used session that
+				// organically accumulated maxSessionBumps hits over HOURS
+				// of real work (each one a separate request, no looping
+				// involved) permanently lost the ability to recover from
+				// the wall ever again, since every later request starts
+				// from that same already-maxed-out bump. Each bump is
+				// cheap (loses that one prefix-cache bucket, nothing more),
+				// so there's no reason to cap the session's lifetime total
+				// at all — only cap bumpsThisAttempt, a local counter reset
+				// every request, to bound a single request's retry loop.
+				if bumpsThisAttempt >= maxBumpsPerAttempt {
 					break
 				}
+				bumpsThisAttempt++
 				bump++
 				setSessionBump(antigravitySessionKey, bump)
-				LogGateway("[#%d] !! Session token-wall (~1,048,576) hit on %s, bumping to a fresh session bucket and retrying same account", rid, accLabel)
+				LogGateway("[#%d] !! Session token-wall (~1,048,576) hit on %s, bumping to a fresh session bucket (gen %d) and retrying same account", rid, accLabel, bump)
 				continue
 			}
 
@@ -1434,19 +1455,37 @@ func executeNonStreaming(
 			for _, p := range parts.Array() {
 				if p.Get("thought").Bool() {
 					if t := p.Get("text").String(); t != "" {
-						block := map[string]interface{}{
-							"type":     "thinking",
-							"thinking": t,
-						}
-						// Same reasoning as sse.go's closeCurrentBlock: a
-						// missing "signature" fails Pydantic/Zod schema
-						// validation outright, not just a wrong one.
 						sig := p.Get("thoughtSignature").String()
-						if sig == "" {
-							sig = "skip_thought_signature_validator"
+						contentBlocks := claudeResp["content"].([]map[string]interface{})
+						// Anthropic allows at most ONE thinking block per
+						// message, and it must come first — but Gemini can
+						// split one thinking chain across several adjacent
+						// "thought" parts in the same candidate. sse.go's
+						// streaming path already coalesces these (it only
+						// opens a new content_block when the type changes);
+						// this path used to create a brand new block per
+						// part instead, producing multiple thinking blocks
+						// that fail Pydantic/Zod schema validation outright.
+						if n := len(contentBlocks); n > 0 && contentBlocks[n-1]["type"] == "thinking" {
+							last := contentBlocks[n-1]
+							last["thinking"] = last["thinking"].(string) + t
+							if sig != "" {
+								last["signature"] = sig
+							}
+						} else {
+							block := map[string]interface{}{
+								"type":     "thinking",
+								"thinking": t,
+							}
+							// Same reasoning as sse.go's closeCurrentBlock: a
+							// missing "signature" fails Pydantic/Zod schema
+							// validation outright, not just a wrong one.
+							if sig == "" {
+								sig = "skip_thought_signature_validator"
+							}
+							block["signature"] = sig
+							claudeResp["content"] = append(contentBlocks, block)
 						}
-						block["signature"] = sig
-						claudeResp["content"] = append(claudeResp["content"].([]map[string]interface{}), block)
 					}
 				} else if t := p.Get("text").String(); t != "" {
 					claudeResp["content"] = append(claudeResp["content"].([]map[string]interface{}), map[string]interface{}{
@@ -1588,6 +1627,17 @@ func executeNonStreaming(
 	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress, readWindowSize)
 	hasIgnoreTag := strings.Contains(lastText, OscIgnoreTag)
 	globalLoopGuard.RecordToolCalls(loopKey, toolCallSignatures, hasIgnoreTag)
+
+	// Anthropic's Message.content has minItems:1 — a candidate with zero
+	// parts at all (safety block, or just genuinely empty) otherwise left
+	// this as [], same issue already guarded against in sse.go's streaming
+	// path.
+	if contentBlocks, ok := claudeResp["content"].([]map[string]interface{}); ok && len(contentBlocks) == 0 {
+		claudeResp["content"] = append(contentBlocks, map[string]interface{}{
+			"type": "text",
+			"text": "(empty response)",
+		})
+	}
 
 	outJSON, _ := json.Marshal(claudeResp)
 	applyRateLimitHeaders(w.Header(), activeAcc, modelName)

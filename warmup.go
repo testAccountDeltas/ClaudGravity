@@ -56,6 +56,30 @@ func isAntigravityLocationGateError(status int, errText string) bool {
 	return strings.Contains(strings.ToLower(errText), "user location is not supported")
 }
 
+// isTransientNetworkError reports whether a failed upstream call never got a
+// real HTTP response at all — a DNS lookup failure, a dial timeout, a reset
+// connection — as opposed to Google's own application-level 429/403/400
+// rejecting the request. httpClient.Do's own failure surfaces as a synthetic
+// http.StatusBadGateway with the raw Go net error text. This is a verdict on
+// the network path to one host, not on the calling OAuth account at all — a
+// DNS hiccup resolving one antigravityHosts entry fails identically no
+// matter which account's token is in the Authorization header, so routing
+// it through account exclusion/cooldown (like a real 429/403) just burns
+// through the whole account pool for a problem rotating accounts can never
+// fix, while never trying the other host that might actually be reachable.
+func isTransientNetworkError(status int, errText string) bool {
+	if status != http.StatusBadGateway || errText == "" {
+		return false
+	}
+	lower := strings.ToLower(errText)
+	for _, marker := range []string{"dial tcp", "lookup", "no such host", "connection reset", "connection refused", "i/o timeout", "eof", "operation was canceled", "context deadline exceeded"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // WrapAntigravityPayload wraps a Gemini request for the Antigravity envelope.
 // generation selects which deterministic session bucket to use: 0 is the
 // conversation's normal, stable bucket (same every call, for prompt-cache

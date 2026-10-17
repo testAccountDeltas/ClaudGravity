@@ -517,6 +517,7 @@ func HandleBootstrapSpoof(w http.ResponseWriter, r *http.Request) {
 }
 
 type MitmResponseWriter struct {
+	mu          sync.Mutex
 	conn        net.Conn
 	header      http.Header
 	buf         bytes.Buffer
@@ -540,10 +541,14 @@ func (w *MitmResponseWriter) Header() http.Header {
 }
 
 func (w *MitmResponseWriter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.buf.Write(b)
 }
 
 func (w *MitmResponseWriter) WriteHeader(statusCode int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !w.wroteHeader {
 		w.statusCode = statusCode
 		w.wroteHeader = true
@@ -606,6 +611,8 @@ func (w *MitmResponseWriter) writeNewBytes() {
 // http.Flusher (SSEStreamer.SendRaw, in particular) — exactly the case
 // sendHeaders(true)/writeNewBytes above exist to make safe.
 func (w *MitmResponseWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !w.headersSent {
 		w.sendHeaders(true)
 	}
@@ -621,6 +628,8 @@ func (w *MitmResponseWriter) Flush() {
 // already on the wire in chunked framing; this just sends the trailing
 // bytes and the terminating zero-length chunk.
 func (w *MitmResponseWriter) Close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !w.headersSent {
 		w.sendHeaders(false)
 	}
