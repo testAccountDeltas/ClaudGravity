@@ -77,7 +77,12 @@ func isSpecSensitiveHeader(name string) bool {
 	if l == "authorization" || l == "x-api-key" || l == "proxy-authorization" {
 		return true
 	}
-	return strings.Contains(l, "secret") || strings.Contains(l, "token")
+	// Deliberately NOT a bare "token" substring match — that also matches
+	// the entirely non-sensitive anthropic-ratelimit-tokens-limit/
+	// -remaining/-reset headers (rate-limit NUMBERS, not credentials),
+	// hiding exactly the structural data this capture exists to keep.
+	return strings.Contains(l, "secret") || strings.Contains(l, "access-token") ||
+		strings.Contains(l, "refresh-token") || strings.Contains(l, "bearer")
 }
 
 func redactHeaders(h http.Header) map[string]string {
@@ -110,6 +115,8 @@ type SpecSnapshot struct {
 type inFlightCapture struct {
 	rid       uint64
 	timestamp time.Time
+	sessionID string
+	agentKey  string
 
 	claudeRequest  *SpecSnapshot
 	geminiRequest  *SpecSnapshot
@@ -177,6 +184,22 @@ func (s *SpecCaptureStore) get(rid uint64) *inFlightCapture {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.inFlight[rid]
+}
+
+// SetSessionMeta attaches the gateway's own session/agent identifiers —
+// the same ones the dashboard already shows per request — to the capture
+// so `cmd/speccheck -session <id>` can find every request belonging to
+// one conversation. Called once sessionID is known (shortly before
+// translation, later than Begin), so it's a separate method rather than
+// a Begin parameter.
+func (s *SpecCaptureStore) SetSessionMeta(rid uint64, sessionID, agentKey string) {
+	if !s.enabled {
+		return
+	}
+	if c := s.get(rid); c != nil {
+		c.sessionID = sessionID
+		c.agentKey = agentKey
+	}
 }
 
 func (s *SpecCaptureStore) RecordClaudeRequest(rid uint64, headers http.Header, body []byte) {
@@ -275,6 +298,12 @@ func (s *SpecCaptureStore) Finish(rid uint64) {
 		"rid":       c.rid,
 		"timestamp": c.timestamp.UTC().Format(time.RFC3339Nano),
 	}
+	if c.sessionID != "" {
+		out["session_id"] = c.sessionID
+	}
+	if c.agentKey != "" {
+		out["agent_key"] = c.agentKey
+	}
 	if c.claudeRequest != nil {
 		out["claude_request"] = c.claudeRequest
 	}
@@ -292,9 +321,14 @@ func (s *SpecCaptureStore) Finish(rid uint64) {
 		out["claude_response"] = map[string]interface{}{"events": c.claudeEvents}
 	}
 
-	// Nothing but rid/timestamp got recorded (e.g. an auth failure before
-	// Begin's caller ever reached a capture point) — not worth a line.
-	if len(out) <= 2 {
+	// Nothing but rid/timestamp/session/agent-key got recorded (e.g. an
+	// auth failure before Begin's caller ever reached a capture point) —
+	// not worth a line.
+	_, hasClaudeReq := out["claude_request"]
+	_, hasGeminiReq := out["gemini_request"]
+	_, hasGeminiResp := out["gemini_response"]
+	_, hasClaudeResp := out["claude_response"]
+	if !hasClaudeReq && !hasGeminiReq && !hasGeminiResp && !hasClaudeResp {
 		return
 	}
 

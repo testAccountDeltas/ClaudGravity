@@ -717,6 +717,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		return
 	}
 	globalSpecCapture.RecordGeminiRequest(rid, nil, geminiBody)
+	globalSpecCapture.SetSessionMeta(rid, sessionID, agentKey)
 
 	isStream := gjson.GetBytes(bodyBytes, "stream").Bool()
 	serverCfg := cfgMgr.GetServerConfig()

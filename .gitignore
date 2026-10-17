@@ -24,6 +24,7 @@ gateway_new.exe
 gateway.exe.bak
 gateway.exe~
 gateway_linux*
+speccheck_linux*
 *.exe
 
 # ===== Деплойный конфиг с реальным public_host/секретами текущего сервера =====
