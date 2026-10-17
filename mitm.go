@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -209,6 +210,10 @@ func proxyAuthOK(r *http.Request, secret string) bool {
 // contains it anywhere.
 func isAnthropicHost(host string) bool {
 	host = strings.ToLower(host)
+	// A trailing "." (valid DNS syntax for "fully qualified") must not let
+	// a client dodge this match and fall through to the plain tunnel path
+	// below, where none of this gateway's response doctoring applies.
+	host = strings.TrimSuffix(host, ".")
 	for _, domain := range []string{"anthropic.com", "claude.ai"} {
 		if host == domain || strings.HasSuffix(host, "."+domain) {
 			return true
@@ -218,9 +223,12 @@ func isAnthropicHost(host string) bool {
 }
 
 // checkConnectTarget reports whether host resolves to a public, safe address.
-// It returns the first verified safe IP, or an error if the target is private,
-// loopback, link-local, unresolvable, or cloud metadata.
-func checkConnectTarget(host string) (net.IP, error) {
+// It returns every verified safe IP (IPv4 addresses first — a dual-stack
+// DNS answer commonly lists AAAA before A, and a host with no outbound IPv6
+// route failed every CONNECT with "network is unreachable" when only the
+// first-returned address was ever tried), or an error if the target is
+// private, loopback, link-local, unresolvable, or cloud metadata.
+func checkConnectTarget(host string) ([]net.IP, error) {
 	ips := []net.IP{net.ParseIP(host)}
 	if ips[0] == nil {
 		resolved, err := net.LookupIP(host)
@@ -237,7 +245,12 @@ func checkConnectTarget(host string) (net.IP, error) {
 			return nil, fmt.Errorf("blocked target address: %s", ip)
 		}
 	}
-	return ips[0], nil
+	sorted := make([]net.IP, len(ips))
+	copy(sorted, ips)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].To4() != nil && sorted[j].To4() == nil
+	})
+	return sorted, nil
 }
 
 // HandleConnectTunnel implements native HTTP CONNECT proxying and TLS interception.
@@ -265,15 +278,15 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 	// secret can't use this as an SSRF pivot into the host's own internal
 	// network or cloud metadata endpoint (169.254.169.254). Checked before
 	// Hijack() so a normal HTTP error response still works here.
-	var verifiedIP net.IP
+	var verifiedIPs []net.IP
 	if !isAnthropicHost(host) {
-		ip, err := checkConnectTarget(host)
+		ips, err := checkConnectTarget(host)
 		if err != nil {
 			LogGateway("[SuperRelay Gateway] Refused CONNECT to target %s: %v", host, err)
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
-		verifiedIP = ip
+		verifiedIPs = ips
 	}
 
 	hijacker, ok := w.(http.Hijacker)
@@ -320,13 +333,23 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 		return
 	}
 
-	// 3. Transparent TCP tunnel for all other external hosts. Dial the pre-verified IP
-	// to prevent TOCTOU DNS rebinding SSRF attacks.
-	dialAddr := r.Host
-	if verifiedIP != nil {
-		dialAddr = net.JoinHostPort(verifiedIP.String(), port)
+	// 3. Transparent TCP tunnel for all other external hosts. Dial a
+	// pre-verified IP (never re-resolving the hostname) to prevent TOCTOU
+	// DNS rebinding SSRF attacks, falling through the rest of the verified
+	// list if the first (IPv4-preferred) address is unreachable from this
+	// host — e.g. no outbound IPv6 route even though the name also
+	// resolves to an AAAA address.
+	var targetConn net.Conn
+	if len(verifiedIPs) == 0 {
+		targetConn, err = net.DialTimeout("tcp", r.Host, 10*time.Second)
+	} else {
+		for _, ip := range verifiedIPs {
+			targetConn, err = net.DialTimeout("tcp", net.JoinHostPort(ip.String(), port), 10*time.Second)
+			if err == nil {
+				break
+			}
+		}
 	}
-	targetConn, err := net.DialTimeout("tcp", dialAddr, 10*time.Second)
 	if err != nil {
 		clientConn.Close()
 		return

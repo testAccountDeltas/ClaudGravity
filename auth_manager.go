@@ -115,6 +115,20 @@ var globalAccountManager = &AccountManager{
 	authDir:  "auths",
 }
 
+// deadRefreshTokens remembers, per account email, that Google's own OAuth
+// server just said "invalid_grant" (the refresh token itself is revoked/
+// expired, not a transient failure) — without this, N requests arriving
+// concurrently for that account all queue on acc.refreshMu and each
+// serially burn up to the full 15s timeout re-making the exact same
+// doomed network call, instead of failing instantly after the first one
+// already proved it's hopeless.
+var (
+	deadRefreshTokensMu sync.Mutex
+	deadRefreshTokens   = make(map[string]time.Time)
+)
+
+const deadRefreshTokenCooldown = 5 * time.Minute
+
 func InitAccountManager(authDir string) error {
 	globalAccountManager.authDir = authDir
 	return globalAccountManager.LoadAll()
@@ -193,6 +207,18 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 		return cachedToken, nil
 	}
 
+	deadRefreshTokensMu.Lock()
+	deadUntil, isDead := deadRefreshTokens[email]
+	deadRefreshTokensMu.Unlock()
+	if isDead {
+		if time.Now().Before(deadUntil) {
+			return "", fmt.Errorf("refresh token for %s is known invalid (invalid_grant), retry after cooldown", email)
+		}
+		deadRefreshTokensMu.Lock()
+		delete(deadRefreshTokens, email)
+		deadRefreshTokensMu.Unlock()
+	}
+
 	data := url.Values{}
 	data.Set("client_id", AntigravityClientID)
 	data.Set("client_secret", AntigravityClientSecret)
@@ -217,6 +243,11 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		if gjson.GetBytes(bodyBytes, "error").String() == "invalid_grant" {
+			deadRefreshTokensMu.Lock()
+			deadRefreshTokens[email] = time.Now().Add(deadRefreshTokenCooldown)
+			deadRefreshTokensMu.Unlock()
+		}
 		return "", fmt.Errorf("refresh failed (%d): %s", resp.StatusCode, string(bodyBytes))
 	}
 

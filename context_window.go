@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 )
 
 // contextSafetyMarginTokens reserves headroom beyond the reserved output
@@ -69,9 +71,19 @@ func blockTokenEstimate(bMap map[string]interface{}) int {
 		if src, ok := bMap["source"].(map[string]interface{}); ok {
 			if dataStr, isStr := src["data"].(string); isStr {
 				if src["type"] == "base64" {
-					est := len(dataStr) / 500
-					if est < 2500 {
-						return 2500
+					mediaType := strings.ToLower(fmt.Sprint(src["media_type"]))
+					if mediaType == "application/pdf" || mediaType == "" {
+						est := len(dataStr) / 500
+						if est < 2500 {
+							return 2500
+						}
+						return est
+					}
+					// For base64-encoded text documents (code, logs, CSVs), decode to raw text density:
+					decodedBytes := len(dataStr) * 3 / 4
+					est := decodedBytes / 2
+					if est < 1 {
+						return 1
 					}
 					return est
 				}

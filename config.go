@@ -61,7 +61,14 @@ func LoadConfig(path string) (*ConfigManager, error) {
 		cfg.Server.Port = 8898
 	}
 	if cfg.Server.PanicTimeoutSeconds == 0 {
-		cfg.Server.PanicTimeoutSeconds = 30
+		// Live production logs show real, successful TTFTs regularly
+		// landing in the 35-52s range for Opus-class ModeAuto (unlimited
+		// thinking budget) requests — 30s fired this "panic" early-headers
+		// fallback 8 times in a single ~20-minute window, each one
+		// permanently losing the ability to fail over to another account
+		// if Google had answered with a 429 instead of a real response a
+		// moment later (see executeStreamingWithWatchdog's earlyHeadersSent gate).
+		cfg.Server.PanicTimeoutSeconds = 60
 	}
 	if cfg.Server.TTFTTimeoutSeconds == 0 {
 		cfg.Server.TTFTTimeoutSeconds = 180
@@ -172,11 +179,11 @@ func (cm *ConfigManager) CreateAPIKey(name string, stickyAccount string, strateg
 	}
 
 	tenant := TenantConfig{
-		Name:             name,
-		GoogleAuthType:   authType,
-		GoogleBaseURL:    "https://daily-cloudcode-pa.sandbox.googleapis.com",
-		DefaultModel:     model,
-		ThinkingBudget:   -1,
+		Name:           name,
+		GoogleAuthType: authType,
+		GoogleBaseURL:  "https://daily-cloudcode-pa.sandbox.googleapis.com",
+		DefaultModel:   model,
+		ThinkingBudget: -1,
 		// Stripped by default: Grep/Glob's schema is rich enough (pattern,
 		// path, glob, output_mode, -i/-n/-A/-B/-C, context, multiline,
 		// head_limit, offset) that Gemini has real room to mangle a call —

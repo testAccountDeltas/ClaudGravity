@@ -260,6 +260,17 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 	}
 	if status == http.StatusTooManyRequests {
 		w.Header().Set("Retry-After", "5")
+		// Claude Code's own rate-limit backoff/countdown reads
+		// anthropic-ratelimit-unified-reset, not Retry-After — without it,
+		// a 429 reported through this path (as opposed to
+		// applyRateLimitHeaders' real quota-derived value on a normal
+		// response) left the CLI with no reset time to count down to.
+		// 15 minutes matches MarkAccountCooldown's own cooldown window for
+		// a 429/RESOURCE_EXHAUSTED account elsewhere in this file.
+		if w.Header().Get("anthropic-ratelimit-unified-reset") == "" {
+			w.Header().Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", time.Now().Add(15*time.Minute).Unix()))
+			w.Header().Set("anthropic-ratelimit-unified-status", "rejected")
+		}
 	} else if errType == "overloaded_error" {
 		w.Header().Set("Retry-After", "3")
 	}
@@ -466,6 +477,17 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	// Same gap as /v1/messages and /v1/usage above: these five internal
+	// control endpoints were only ever registered on the plain dashboard
+	// mux, so an HTTPS_PROXY-only client fell through to PassthroughToReal
+	// here and got a real 401 from api.anthropic.com for every one of
+	// them (no genuine Anthropic session behind this gateway's key).
+	interceptedMux.HandleFunc("/api/claude_cli_profile", handleProfileJSON)
+	interceptedMux.HandleFunc("/api/oauth/profile", handleProfileJSON)
+	interceptedMux.HandleFunc("/api/oauth/validate", handleValidateJSON)
+	interceptedMux.HandleFunc("/api/claude_code/organizations/metrics_enabled", handleMetricsJSON)
+	interceptedMux.HandleFunc("/api/claude_code/settings", handleSettingsJSON)
+	interceptedMux.HandleFunc("/managed/settings", handleSettingsJSON)
 	interceptedMux.HandleFunc("/", PassthroughToReal)
 
 	proxySecret := cfgMgr.ProxySecret()
@@ -620,10 +642,21 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// 2.2 Fast-Path Intercept: Claude Code 1-token rate-limit probe
+	// 2.2 Fast-Path Intercept: Claude Code 1-token rate-limit probe. The
+	// SDK can serialize a single-text-block message's content as either a
+	// bare string or [{"type":"text","text":"quota"}] — gjson's .String()
+	// on the array form returns its raw JSON, never matching "quota"
+	// directly, so both shapes need checking or this probe always misses
+	// and falls through to a full Gemini round-trip.
 	msgsArr := gjson.GetBytes(bodyBytes, "messages").Array()
+	content0 := gjson.GetBytes(bodyBytes, "messages.0.content")
+	isQuotaProbeContent := content0.String() == "quota"
+	if !isQuotaProbeContent && content0.IsArray() {
+		blocks := content0.Array()
+		isQuotaProbeContent = len(blocks) == 1 && blocks[0].Get("type").String() == "text" && blocks[0].Get("text").String() == "quota"
+	}
 	if len(msgsArr) == 1 &&
-		gjson.GetBytes(bodyBytes, "messages.0.content").String() == "quota" &&
+		isQuotaProbeContent &&
 		gjson.GetBytes(bodyBytes, "max_tokens").Int() == 1 {
 		acc := globalSelector.GetOrAssignStickyAccount(clientKey, tenant)
 		applyRateLimitHeaders(w.Header(), acc, "gemini-3.8-flash-tiered")
@@ -998,6 +1031,30 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	}
 }
 
+// isModifyingToolName reports whether a called tool name represents real
+// forward progress for LoopGuard's read-loop detection — not just the
+// built-in Write/Edit/NotebookEdit, but any MCP-server tool whose name
+// signals a write/mutation (e.g. "mcp__filesystem__write_file"). Without
+// this, an agent doing real work entirely through an MCP write tool looked
+// identical to one stuck re-reading the same files, since only the three
+// built-in names ever cleared the read-loop streak.
+func isModifyingToolName(name string) bool {
+	switch name {
+	case "Write", "Edit", "NotebookEdit":
+		return true
+	}
+	lower := strings.ToLower(name)
+	if !strings.HasPrefix(lower, "mcp__") {
+		return false
+	}
+	for _, kw := range []string{"write", "edit", "create", "delete", "update", "insert", "modify", "patch"} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 func hasAssistantTurns(claudeBody []byte) bool {
 	msgs := gjson.GetBytes(claudeBody, "messages")
 	if !msgs.IsArray() {
@@ -1342,7 +1399,7 @@ UpstreamReady:
 	for _, t := range streamer.toolNames {
 		if t == "Read" {
 			readCount++
-		} else if t == "Write" || t == "Edit" || t == "NotebookEdit" {
+		} else if isModifyingToolName(t) {
 			madeProgress = true
 		}
 	}
@@ -1752,7 +1809,7 @@ func executeNonStreaming(
 	for _, t := range toolsCalled {
 		if t == "Read" {
 			readCount++
-		} else if t == "Write" || t == "Edit" || t == "NotebookEdit" {
+		} else if isModifyingToolName(t) {
 			madeProgress = true
 		}
 	}

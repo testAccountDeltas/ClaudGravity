@@ -235,16 +235,30 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 
 	// 2. Loop-Guard Nudges (Read-Loop & Oscillation)
 	hasModifyingTools := false
+	isPlanMode := false
 	if toolsArr, ok := reqMap["tools"].([]interface{}); ok {
 		for _, t := range toolsArr {
 			if tMap, isMap := t.(map[string]interface{}); isMap {
 				name := strings.ToLower(fmt.Sprint(tMap["name"]))
-				if name == "edit" || name == "write" || name == "notebookedit" || name == "str_replace_editor" {
+				switch name {
+				case "edit", "write", "notebookedit", "str_replace_editor":
 					hasModifyingTools = true
-					break
+				case "exitplanmode":
+					// Claude Code declares Edit/Write alongside ExitPlanMode
+					// even while Plan Mode is active — the tool catalog
+					// doesn't shrink, the system prompt just instructs the
+					// model not to call them. Their mere presence must not
+					// count as "modifying tools available" here, or every
+					// Plan Mode investigation (which is Read/Grep-heavy by
+					// design) gets the tight main-agent read-loop threshold
+					// instead of the relaxed explore one.
+					isPlanMode = true
 				}
 			}
 		}
+	}
+	if isPlanMode {
+		hasModifyingTools = false
 	}
 	_, readThreshold := readLoopLimits(agentKey, hasModifyingTools)
 	if hasModifyingTools {

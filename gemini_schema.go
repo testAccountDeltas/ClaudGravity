@@ -335,11 +335,8 @@ func removePlaceholderFields(jsonStr string) string {
 
 // convertRefsToHints converts $ref to description hints (Lazy Hint strategy).
 func convertRefsToHints(jsonStr string) string {
-	// Resolving refs can itself introduce nested $ref (a $defs entry that
-	// points at another $defs entry), so loop until a pass finds none —
-	// bounded defensively since a malformed/circular schema must not hang
-	// the request.
-	for pass := 0; pass < 10; pass++ {
+	visitedRefs := make(map[string]int)
+	for pass := 0; pass < 5; pass++ {
 		paths := findPaths(jsonStr, "$ref")
 		if len(paths) == 0 {
 			break
@@ -350,15 +347,20 @@ func convertRefsToHints(jsonStr string) string {
 			refVal := gjson.Get(jsonStr, p).String()
 			parentPath := trimSuffix(p, ".$ref")
 
-			// A $defs/$definitions entry is still present in jsonStr at
-			// this point (Phase 1 runs before removeUnsupportedKeywords
-			// strips them in Phase 3) — Pydantic/Zod-generated schemas
-			// overwhelmingly use this LOCAL, self-contained form rather
-			// than a remote $ref URL. Inline the real definition instead
-			// of discarding its actual type/enum for a bare {"type":
-			// "object"} stub, which silently turned e.g. a string enum
-			// parameter into an object the model then fills in wrong.
+			defName := refVal
+			if idx := strings.LastIndex(refVal, "/"); idx >= 0 {
+				defName = refVal[idx+1:]
+			}
+
+			// Prevent recursive schema explosion and OOM: stop after expanding each ref once
+			if visitedRefs[refVal] >= 1 {
+				replacement := fmt.Sprintf(`{"type":"object","description":"Recursive reference: See %s"}`, defName)
+				jsonStr = setRawAt(jsonStr, parentPath, replacement)
+				continue
+			}
+
 			if def := resolveLocalRef(jsonStr, refVal); def != "" {
+				visitedRefs[refVal]++
 				if existingDesc := gjson.Get(jsonStr, joinPath(parentPath, "description")).String(); existingDesc != "" {
 					def, _ = sjson.Set(def, "description", existingDesc)
 				}
@@ -366,10 +368,6 @@ func convertRefsToHints(jsonStr string) string {
 				continue
 			}
 
-			defName := refVal
-			if idx := strings.LastIndex(refVal, "/"); idx >= 0 {
-				defName = refVal[idx+1:]
-			}
 			hint := fmt.Sprintf("See: %s", defName)
 			if existing := gjson.Get(jsonStr, descriptionPath(parentPath)).String(); existing != "" {
 				hint = fmt.Sprintf("%s (%s)", existing, hint)
@@ -487,12 +485,14 @@ func addAdditionalPropertiesHints(jsonStr string) string {
 
 var unsupportedConstraints = []string{
 	"minLength", "maxLength", "exclusiveMinimum", "exclusiveMaximum",
-	"minimum", "maximum", // MCP tools with numeric validators commonly set these; Gemini's schema doesn't document support for them
-	"pattern", "minItems", "maxItems", "format",
-	"default", "examples", // Claude rejects these in VALIDATED mode
+	"minimum", "maximum", "multipleOf", // MCP tools with numeric validators commonly set these; Gemini's schema doesn't document support for them
+	"pattern", "minItems", "maxItems", "minProperties", "maxProperties", "format",
+	"default", "example", "examples", // Claude rejects these in VALIDATED mode
 	"prefixItems", "uniqueItems", "contains", "minContains", "maxContains",
 	"dependentRequired", "dependentSchemas", "contentEncoding", "contentMediaType",
 	"readOnly", "writeOnly", "deprecated",
+	"unevaluatedProperties", "unevaluatedItems", "$comment",
+	"if", "then", "else", "not",
 }
 
 func moveConstraintsToDescription(jsonStr string) string {

@@ -254,7 +254,14 @@ func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey
 		}
 	}
 
-	if bestAcc != nil {
+	// maxQuota starts at -1.0, so a pool where every account is sitting at
+	// 0% remaining quota still satisfies q(0.0) > maxQuota(-1.0) on the
+	// very first account iterated — bestAcc was never nil in that case,
+	// so step 5's honest round-robin below was dead code: every request
+	// piled onto whichever single exhausted account iteration order
+	// happened to try first, instead of spreading load across the pool
+	// while everyone waits out the same cooldown.
+	if bestAcc != nil && maxQuota > 0 {
 		if !isSubagentKey && apiKey != "" {
 			as.stickyMap[apiKey] = bestAcc.Email
 		}

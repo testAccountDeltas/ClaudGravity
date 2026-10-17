@@ -440,10 +440,32 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 				})
 			}
 		}
-		if len(toolUseBlocks) == 0 {
-			continue
-		}
 		nextIsUser := i+1 < len(newMsgs) && newMsgs[i+1]["role"] == "user"
+		if len(toolUseBlocks) == 0 {
+			// This assistant turn made no tool_use at all, so it has
+			// nothing to answer — but the client may still have put a
+			// tool_result in the following user turn answering some OLDER
+			// call (e.g. a delayed subagent handback, or truncation/an
+			// intervening text-only turn separating it from its real
+			// functionCall). toolUsesSeen above only checked that the id
+			// exists SOMEWHERE in history, not in THIS immediately
+			// preceding turn, so it survives that pass unmodified. Gemini
+			// requires every functionResponse to match a functionCall in
+			// the immediately preceding turn, so it still has to be
+			// scrubbed to text below, same as the partial-match case.
+			hasStrayResult := false
+			if nextIsUser {
+				for _, b := range newMsgs[i+1]["content"].([]map[string]interface{}) {
+					if b["type"] == "tool_result" {
+						hasStrayResult = true
+						break
+					}
+				}
+			}
+			if !hasStrayResult {
+				continue
+			}
+		}
 		// Even with nothing to synthesize, the client is allowed to send
 		// genuine tool_result blocks in any order (parallel tool calls can
 		// finish out of order) — Gemini still requires functionResponse

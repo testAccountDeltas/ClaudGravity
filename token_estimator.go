@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"math"
+	"strings"
 
 	"github.com/tidwall/gjson"
 )
@@ -159,7 +160,22 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 								case "document":
 									src := item.Get("source")
 									if src.Get("type").String() == "base64" {
-										est := len(src.Get("data").String()) / 500
+										mediaType := strings.ToLower(src.Get("media_type").String())
+										dataStr := src.Get("data").String()
+										var est int
+										if mediaType == "application/pdf" || mediaType == "" {
+											// PDF token density (~258 tokens/page, ~1 token per
+											// 500 base64 chars) — len/2 here would price a 2MB
+											// scanned PDF at ~1.33M tokens, see context_window.go.
+											est = len(dataStr) / 500
+										} else {
+											// A base64 text document (code, logs, CSV) has none
+											// of a PDF's image-heavy byte density — decode to raw
+											// text and price at the normal char/token ratio, or
+											// this undercounts a 1MB text file by ~100x.
+											decodedBytes := len(dataStr) * 3 / 4
+											est = decodedBytes / 2
+										}
 										if est < 1600 {
 											est = 1600
 										}
