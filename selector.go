@@ -55,7 +55,20 @@ var globalSelector = &AccountSelector{
 // DeriveConversationAnchor creates a stable identifier for a multi-turn conversation.
 // Every turn of the same conversation shares the same anchor (first user message + system prefix),
 // allowing all turns to hit the exact same Google account for 100% prompt caching.
-func DeriveConversationAnchor(bodyBytes []byte) string {
+//
+// headerSessionID is Claude Code's own terminal-session id
+// (x-claude-code-session-id / x-session-id), which — unlike the first user
+// message — never changes for the life of the conversation. Without it, a
+// long conversation that crosses TruncateConversationToFit's drop threshold
+// gets its oldest messages replaced by a synthetic "[Gateway notice: ...]"
+// message; on the very next turn THAT notice becomes the new "first user
+// message", the hash changes, and the conversation gets silently rebound to
+// a different Google account with none of the prior turns' prefix cache.
+func DeriveConversationAnchor(bodyBytes []byte, headerSessionID string) string {
+	if headerSessionID != "" {
+		return "sid:" + headerSessionID
+	}
+
 	root := gjson.ParseBytes(bodyBytes)
 
 	// If client explicitly sent a session id, use it
@@ -63,24 +76,31 @@ func DeriveConversationAnchor(bodyBytes []byte) string {
 		return "sid:" + sid
 	}
 
-	// Find the first user message
+	// Find the first user message — skipping this gateway's own injected
+	// truncation notices, so the anchor stays on the oldest surviving real
+	// message instead of flipping to the notice text itself.
 	firstUserMsg := ""
 	msgs := root.Get("messages")
 	if msgs.IsArray() {
 		for _, m := range msgs.Array() {
 			if m.Get("role").String() == "user" {
 				c := m.Get("content")
+				candidate := ""
 				if c.Type == gjson.String {
-					firstUserMsg = c.String()
+					candidate = c.String()
 				} else if c.IsArray() {
 					for _, part := range c.Array() {
 						if part.Get("type").String() == "text" {
-							firstUserMsg = part.Get("text").String()
+							candidate = part.Get("text").String()
 							break
 						}
 					}
 				}
-				if firstUserMsg != "" {
+				if strings.HasPrefix(strings.TrimSpace(candidate), "[Gateway notice:") {
+					continue
+				}
+				if candidate != "" {
+					firstUserMsg = candidate
 					break
 				}
 			}

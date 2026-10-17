@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -102,6 +103,41 @@ func recoverMiddleware(next http.Handler) http.Handler {
 				writeAnthropicError(w, http.StatusInternalServerError, "internal_error", "internal gateway error")
 			}
 		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+var requestIDCounter uint64
+
+// nextRequestID mints an id in the shape of a real Anthropic request-id
+// (req_<hex>) for the request-id response header below — never parsed by
+// clients, just expected to be present and look like one.
+func nextRequestID() string {
+	n := atomic.AddUint64(&requestIDCounter, 1)
+	h := sha256.Sum256([]byte(fmt.Sprintf("%d-%d", time.Now().UnixNano(), n)))
+	return "req_" + hex.EncodeToString(h[:12])
+}
+
+// commonAPIMiddleware answers browser/Electron CORS preflight (OPTIONS)
+// requests and stamps every response with anthropic-version/request-id —
+// both expected unconditionally by the official Anthropic SDKs and by any
+// web/Electron-based client (Claude Web Artifacts, Cursor's webview,
+// LibreChat, OpenWebUI, browser extensions), none of which this gateway
+// previously sent at all, leaving browser clients blocked entirely by the
+// browser's own CORS policy before the request even reached this code.
+func commonAPIMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE, PUT")
+		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, x-claude-code-request-class, x-claude-code-agent-type, x-claude-code-agent-id, x-claude-code-prompt-id, x-session-id, x-claude-code-session-id")
+		h.Set("Access-Control-Expose-Headers", "anthropic-version, request-id, anthropic-ratelimit-unified-5h-status, anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, anthropic-ratelimit-unified-7d-status, anthropic-ratelimit-unified-7d-utilization, anthropic-ratelimit-unified-7d-reset, anthropic-ratelimit-unified-status, anthropic-ratelimit-unified-representative-claim, anthropic-ratelimit-unified-reset")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.Set("anthropic-version", "2023-06-01")
+		h.Set("request-id", nextRequestID())
 		next.ServeHTTP(w, r)
 	})
 }
@@ -223,6 +259,8 @@ func main() {
 	mux := http.NewServeMux()
 	RegisterUIHandlers(mux, cfgMgr)
 
+	apiMux := commonAPIMiddleware(mux)
+
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			handleMessages(cfgMgr, w, r)
@@ -266,6 +304,29 @@ func main() {
 	interceptedMux.HandleFunc("/api/claude_cli/bootstrap", func(w http.ResponseWriter, r *http.Request) {
 		HandleBootstrapSpoof(w, r)
 	})
+	// A client set up with only HTTPS_PROXY (no ANTHROPIC_BASE_URL override)
+	// sends its real traffic as a CONNECT tunnel to api.anthropic.com, MITM'd
+	// by mitmCA above — previously only the two routes above were answered
+	// here, and /v1/messages itself fell through to PassthroughToReal, which
+	// forwards straight to the real Anthropic server where this gateway's
+	// own key is meaningless and gets a 401. Answer the same routes here
+	// that the plain-HTTP/TLS listeners already serve.
+	interceptedMux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			handleMessages(cfgMgr, w, r)
+		} else {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	interceptedMux.HandleFunc("/v1/messages/count_tokens", func(w http.ResponseWriter, r *http.Request) {
+		handleCountTokens(cfgMgr, w, r)
+	})
+	interceptedMux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		handleModels(cfgMgr, w, r)
+	})
+	interceptedMux.HandleFunc("/v1/models/{id}", func(w http.ResponseWriter, r *http.Request) {
+		handleModelByID(cfgMgr, w, r)
+	})
 	interceptedMux.HandleFunc("/", PassthroughToReal)
 
 	proxySecret := cfgMgr.ProxySecret()
@@ -276,7 +337,7 @@ func main() {
 			HandleConnectTunnel(w, r, mitmCA, interceptedMux, proxySecret)
 			return
 		}
-		mux.ServeHTTP(w, r)
+		apiMux.ServeHTTP(w, r)
 	}))
 
 	addr := fmt.Sprintf(":%d", serverCfg.Port)
@@ -304,7 +365,7 @@ func main() {
 		} else {
 			tlsSrv = &http.Server{
 				Addr:      fmt.Sprintf(":%d", tlsPort),
-				Handler:   recoverMiddleware(mux),
+				Handler:   recoverMiddleware(apiMux),
 				TLSConfig: &tls.Config{Certificates: []tls.Certificate{gwCert}},
 			}
 			go func() {
@@ -387,7 +448,11 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	}
 
 	// 2. Derive Conversation Anchor for Session Affinity (Prompt Caching)
-	convAnchor := DeriveConversationAnchor(bodyBytes)
+	headerSessionID := r.Header.Get("x-claude-code-session-id")
+	if headerSessionID == "" {
+		headerSessionID = r.Header.Get("x-session-id")
+	}
+	convAnchor := DeriveConversationAnchor(bodyBytes, headerSessionID)
 
 	// 2.1 Fast-Path Intercept: Claude Code Native WebSearch Sub-Request
 	if searchQuery, isSearch := IsClaudeCodeDirectWebSearch(bodyBytes); isSearch {
@@ -1322,18 +1387,22 @@ func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Req
 // previously only the list existed, and any client calling the per-model
 // lookup (the official Anthropic SDKs do, to validate a model id) got a
 // plain 404 instead of that model's metadata.
+// "type": "model" (not "object": "model") and "created_at" match the real
+// Anthropic Models API schema — the official SDKs validate against that
+// schema (Pydantic/Zod) and raise a deserialization error on the OpenAI-style
+// "object" field this used to send instead.
 var knownModels = []map[string]interface{}{
-	{"id": "gemini-2.5-flash", "object": "model", "display_name": "Gemini 2.5 Flash"},
-	{"id": "gemini-2.5-pro", "object": "model", "display_name": "Gemini 2.5 Pro"},
-	{"id": "gemini-3.8-flash-tiered", "object": "model", "display_name": "Gemini 3.8 Flash Tiered"},
-	{"id": "claude-3-5-haiku-20241022", "object": "model", "display_name": "Claude 3.5 Haiku"},
-	{"id": "claude-3-5-haiku-latest", "object": "model", "display_name": "Claude 3.5 Haiku"},
-	{"id": "claude-3-5-sonnet-20241022", "object": "model", "display_name": "Claude 3.5 Sonnet"},
-	{"id": "claude-3-5-sonnet-latest", "object": "model", "display_name": "Claude 3.5 Sonnet"},
-	{"id": "claude-3-7-sonnet-20250219", "object": "model", "display_name": "Claude 3.7 Sonnet"},
-	{"id": "claude-3-7-sonnet-latest", "object": "model", "display_name": "Claude 3.7 Sonnet"},
-	{"id": "claude-3-opus-20240229", "object": "model", "display_name": "Claude 3 Opus"},
-	{"id": "claude-opus-4-6-thinking", "object": "model", "display_name": "Claude Opus 4.6 Thinking"},
+	{"id": "gemini-2.5-flash", "type": "model", "display_name": "Gemini 2.5 Flash", "created_at": "2025-01-01T00:00:00Z"},
+	{"id": "gemini-2.5-pro", "type": "model", "display_name": "Gemini 2.5 Pro", "created_at": "2025-01-01T00:00:00Z"},
+	{"id": "gemini-3.8-flash-tiered", "type": "model", "display_name": "Gemini 3.8 Flash Tiered", "created_at": "2026-01-01T00:00:00Z"},
+	{"id": "claude-3-5-haiku-20241022", "type": "model", "display_name": "Claude 3.5 Haiku", "created_at": "2024-10-22T00:00:00Z"},
+	{"id": "claude-3-5-haiku-latest", "type": "model", "display_name": "Claude 3.5 Haiku", "created_at": "2024-10-22T00:00:00Z"},
+	{"id": "claude-3-5-sonnet-20241022", "type": "model", "display_name": "Claude 3.5 Sonnet", "created_at": "2024-10-22T00:00:00Z"},
+	{"id": "claude-3-5-sonnet-latest", "type": "model", "display_name": "Claude 3.5 Sonnet", "created_at": "2024-10-22T00:00:00Z"},
+	{"id": "claude-3-7-sonnet-20250219", "type": "model", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z"},
+	{"id": "claude-3-7-sonnet-latest", "type": "model", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z"},
+	{"id": "claude-3-opus-20240229", "type": "model", "display_name": "Claude 3 Opus", "created_at": "2024-02-29T00:00:00Z"},
+	{"id": "claude-opus-4-6-thinking", "type": "model", "display_name": "Claude Opus 4.6 Thinking", "created_at": "2026-01-01T00:00:00Z"},
 }
 
 // allModels merges the static Claude-alias/canonical-Gemini-name list with
@@ -1356,8 +1425,9 @@ func allModels() []map[string]interface{} {
 		seen[m.ID] = true
 		out = append(out, map[string]interface{}{
 			"id":           m.ID,
-			"object":       "model",
+			"type":         "model",
 			"display_name": m.DisplayName,
+			"created_at":   "2026-01-01T00:00:00Z",
 		})
 	}
 	return out
@@ -1366,8 +1436,7 @@ func allModels() []map[string]interface{} {
 func handleModels(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
 	models := allModels()
 	resp := map[string]interface{}{
-		"object": "list",
-		"data":   models,
+		"data": models,
 		// This gateway's whole catalog fits in one page — has_more is
 		// always false, but the fields themselves are still expected by
 		// the official SDKs' pagination handling.
@@ -1582,6 +1651,26 @@ func bucketResetSec(b *QuotaBucket, fallback time.Duration) int64 {
 // it does not mean the session is blocked.
 func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName string) {
 	if acc == nil {
+		// A tenant on google_auth_type "api_key" (direct Google AI Studio
+		// key) never goes through the OAuth account pool, so there is no
+		// AccountRecord and no real quota numbers to report. Without ANY
+		// anthropic-ratelimit-unified-* headers, Claude Code's /usage
+		// progress bars disappear entirely and the CLI has no signal
+		// distinguishing "healthy, low usage" from "server misbehaving" —
+		// send a stable, low-utilization synthetic window instead, same
+		// spirit as the synthetic org/workspace IDs below.
+		now := time.Now()
+		header.Set("anthropic-ratelimit-unified-5h-status", "allowed")
+		header.Set("anthropic-ratelimit-unified-5h-utilization", "0.05")
+		header.Set("anthropic-ratelimit-unified-5h-reset", fmt.Sprintf("%d", now.Add(5*time.Hour).Unix()))
+		header.Set("anthropic-ratelimit-unified-7d-status", "allowed")
+		header.Set("anthropic-ratelimit-unified-7d-utilization", "0.05")
+		header.Set("anthropic-ratelimit-unified-7d-reset", fmt.Sprintf("%d", now.Add(7*24*time.Hour).Unix()))
+		header.Set("anthropic-ratelimit-unified-status", "allowed")
+		header.Set("anthropic-ratelimit-unified-representative-claim", "five_hour")
+		header.Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", now.Add(5*time.Hour).Unix()))
+		header.Set("anthropic-ratelimit-unified-overage-status", "rejected")
+		header.Set("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled")
 		return
 	}
 

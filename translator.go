@@ -752,7 +752,13 @@ func ScrubBillingHeader(txt string) string {
 				if strings.Contains(lower, "platform:") ||
 					strings.Contains(lower, "shell:") ||
 					strings.Contains(lower, "os version:") ||
-					strings.Contains(lower, "working directory:") {
+					strings.Contains(lower, "working directory:") ||
+					// Dropping this line left Gemini with no idea what the
+					// real current date/year is, so it would default to
+					// whatever's baked into its training data — guessing
+					// 2023/2024, misdating git log filters, and generally
+					// reasoning about "now" incorrectly.
+					strings.Contains(lower, "current local time") {
 					cleanLines = append(cleanLines, line)
 				}
 				continue

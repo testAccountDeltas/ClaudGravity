@@ -403,6 +403,19 @@ func HandleBootstrapSpoof(w http.ResponseWriter, r *http.Request) {
 			{"api_name": "claude-haiku-5-5", "entitled": true},
 			{"api_name": "claude-fable-5-1", "entitled": true},
 			{"api_name": "gemini-3.8-flash-tiered", "entitled": true},
+			// Older canonical Claude model ids/aliases: a client pinned to one
+			// of these via `/model <id>` or `--model` checks this list before
+			// switching and fails with "Model not entitled for this
+			// organization" if its target isn't here, even though this
+			// gateway happily routes any model name through to Gemini.
+			{"api_name": "claude-3-7-sonnet-20250219", "entitled": true},
+			{"api_name": "claude-3-7-sonnet-latest", "entitled": true},
+			{"api_name": "claude-3-5-sonnet-20241022", "entitled": true},
+			{"api_name": "claude-3-5-sonnet-latest", "entitled": true},
+			{"api_name": "claude-3-5-haiku-20241022", "entitled": true},
+			{"api_name": "claude-3-5-haiku-latest", "entitled": true},
+			{"api_name": "claude-3-opus-20240229", "entitled": true},
+			{"api_name": "claude-opus-4-6-thinking", "entitled": true},
 		},
 	}
 	_ = json.NewEncoder(w).Encode(resp)
