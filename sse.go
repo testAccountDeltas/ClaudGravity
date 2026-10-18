@@ -202,6 +202,7 @@ type SSEStreamer struct {
 	cachePrefixFrac          float64           // 0 if the client's request set no Anthropic cache_control breakpoint; otherwise the approximate fraction of uncached input tokens that sit before the breakpoint — gates AND scales the cache_creation_input_tokens simulation in FinishStream, see cacheBreakpointPrefixFraction's doc comment
 	disableParallelToolUse   bool              // client's disable_parallel_tool_use — HandleFunctionCall drops any call past the first when set, see wantsSingleToolUse's doc comment
 	reverseToolNameMap       map[string]string // sanitized (Gemini-bound) tool name -> original Claude-side name, for tools translator.go had to rewrite (e.g. hyphens stripped) — see sanitizeGeminiFunctionName's doc comment
+	stopSequences            []string          // client's stop_sequences — Gemini's finishReason is just "STOP" either way, so FinishStream checks s.lastText's own suffix against these to recover stop_reason:"stop_sequence" when that's really what happened
 }
 
 type GroundingSource struct {
@@ -216,7 +217,7 @@ const (
 	TypeToolUse  = 3
 )
 
-func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool, cachePrefixFrac float64, disableParallelToolUse bool, reverseToolNameMap map[string]string) *SSEStreamer {
+func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool, cachePrefixFrac float64, disableParallelToolUse bool, reverseToolNameMap map[string]string, stopSequences []string) *SSEStreamer {
 	return &SSEStreamer{
 		rid:                    rid,
 		w:                      w,
@@ -234,6 +235,7 @@ func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, mod
 		disableParallelToolUse: disableParallelToolUse,
 		reverseToolNameMap:     reverseToolNameMap,
 		hasPriorTurns:          hasPriorTurns,
+		stopSequences:          stopSequences,
 	}
 }
 
@@ -293,6 +295,29 @@ func (s *SSEStreamer) EnsureMessageStart() error {
 			}
 		}
 	}
+	// An audit caught that the SAME "SDKs latch from message_start only"
+	// principle documented above for cache_read was never applied to
+	// cache_creation: this always declared cache_creation_input_tokens:0
+	// here, then FinishStream's message_delta later reports the REAL
+	// split (a same-turn cache WRITE moves a large chunk of tokens from
+	// input_tokens into cache_creation_input_tokens). A client that only
+	// reads input_tokens from message_start — exactly the behavior this
+	// file already assumes for cache_read — keeps its original full
+	// estimate and then ADDS message_delta's cache_creation on top,
+	// double-counting a turn-1 cache write by up to the full size of the
+	// cached prefix. Pre-simulate the same split here using the
+	// pre-stream estimate when this isn't already a cache-read turn
+	// (those two don't happen on the same turn), so a client that only
+	// reads message_start still gets numbers in the right ballpark
+	// instead of needing message_delta's correction at all.
+	cacheCreationEstimate := int64(0)
+	if cachedEstimate == 0 && s.cachePrefixFrac > 0 && uncachedEstimate > cacheCreationThreshold(s.model) {
+		cacheCreationEstimate = int64(float64(uncachedEstimate) * s.cachePrefixFrac)
+		uncachedEstimate -= cacheCreationEstimate
+		if uncachedEstimate < 0 {
+			uncachedEstimate = 0
+		}
+	}
 	startPayload := map[string]interface{}{
 		"type": "message_start",
 		"message": map[string]interface{}{
@@ -306,7 +331,7 @@ func (s *SSEStreamer) EnsureMessageStart() error {
 			"usage": map[string]interface{}{
 				"input_tokens":                uncachedEstimate,
 				"output_tokens":               0,
-				"cache_creation_input_tokens": 0,
+				"cache_creation_input_tokens": cacheCreationEstimate,
 				"cache_read_input_tokens":     cachedEstimate,
 			},
 		},
@@ -421,6 +446,18 @@ func (s *SSEStreamer) HandleText(text string) error {
 	if err := s.EnsureMessageStart(); err != nil {
 		return err
 	}
+	if s.toolUseOccurred {
+		// An audit caught that nothing here stopped Gemini from emitting
+		// more text AFTER a functionCall already fired in the same
+		// response — Anthropic's spec requires tool_use to be the LAST
+		// content block whenever stop_reason ends up "tool_use", and a
+		// strict client parsing content[content.length-1] as the tool
+		// call breaks outright if a text block follows it. Drop it
+		// rather than open a new block after the call, the same
+		// discard-over-leak choice already made for a second interleaved
+		// thought block above.
+		return nil
+	}
 	if s.currentType != TypeText {
 		if err := s.closeCurrentBlock(); err != nil {
 			return err
@@ -466,7 +503,22 @@ func (s *SSEStreamer) HandleText(text string) error {
 // parses to a string, not an object, crashing SDK validation. The
 // non-streaming path (server.go) has the equivalent fix on the parsed Go
 // value directly; this is the streaming-path version operating on raw text.
-func normalizeToolCallArgsToObject(argsRaw string) string {
+// toolPrimaryStringParam names the one argument a tool's bare-string args
+// (see normalizeToolCallArgsToObject) should be mapped onto, for tools
+// whose schema has an obvious single required string field a model is
+// likely to collapse its args into.
+var toolPrimaryStringParam = map[string]string{
+	"bash":               "command",
+	"read":               "file_path",
+	"write":              "file_path",
+	"edit":               "file_path",
+	"notebookedit":       "notebook_path",
+	"grep":               "pattern",
+	"glob":               "pattern",
+	"str_replace_editor": "path",
+}
+
+func normalizeToolCallArgsToObject(name, argsRaw string) string {
 	var v interface{}
 	if err := json.Unmarshal([]byte(argsRaw), &v); err != nil {
 		return "{}"
@@ -478,6 +530,22 @@ func normalizeToolCallArgsToObject(argsRaw string) string {
 			v = inner
 			wasDoubleEncoded = true
 		}
+	}
+	if s, ok := v.(string); ok {
+		// An audit caught that a bare string that ISN'T double-encoded
+		// JSON — Gemini just emitting args:"git status" instead of
+		// args:{"command":"git status"} — fell through to the generic
+		// "not an object" discard below, silently dropping the model's
+		// actual command and running the tool with no arguments at all
+		// instead of the real intent. Map it onto the tool's one obvious
+		// primary string parameter when known.
+		if param, ok := toolPrimaryStringParam[strings.ToLower(name)]; ok {
+			b, err := json.Marshal(map[string]interface{}{param: s})
+			if err == nil {
+				return string(b)
+			}
+		}
+		return "{}"
 	}
 	if _, ok := v.(map[string]interface{}); !ok {
 		return "{}"
@@ -501,7 +569,7 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSig
 		// second tool_use block the client explicitly said it can't handle.
 		return nil
 	}
-	argsRaw = normalizeToolCallArgsToObject(argsRaw)
+	argsRaw = normalizeToolCallArgsToObject(name, argsRaw)
 	argsRaw = coerceNumericEnumArgs(name, argsRaw)
 	if repaired, ok := RepairEditToolCall(name, argsRaw, s.sessionID); ok {
 		argsRaw = repaired
@@ -668,6 +736,27 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 		stopReason = "tool_use"
 	}
 
+	// An audit caught that stop_sequences was translated into Gemini's
+	// own generationConfig.stopSequences, but Gemini's finishReason for
+	// that case is just "STOP" — identical to a normal, unprompted end of
+	// generation — so this always reported stop_reason:"end_turn" and
+	// stop_sequence:null even when the model stopped BECAUSE it hit a
+	// client-requested sequence. A client branching on
+	// stop_reason=="stop_sequence" (e.g. to strip the sequence and
+	// continue generating itself) never sees that branch fire. Recover
+	// it by checking whether the generated text's own ending matches one
+	// of the requested sequences.
+	matchedStopSequence := ""
+	if stopReason == "end_turn" && len(s.stopSequences) > 0 {
+		for _, seq := range s.stopSequences {
+			if seq != "" && strings.HasSuffix(s.lastText, seq) {
+				matchedStopSequence = seq
+				stopReason = "stop_sequence"
+				break
+			}
+		}
+	}
+
 	// Gemini's promptTokenCount is the FULL input (cached + uncached), but
 	// Anthropic's input_tokens means only the uncached delta — cached reads
 	// are reported separately via cache_read_input_tokens.
@@ -720,9 +809,13 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 		usage["cache_read_input_tokens"] = s.cacheTokens
 	}
 
+	var stopSequenceField interface{}
+	if matchedStopSequence != "" {
+		stopSequenceField = matchedStopSequence
+	}
 	deltaMap := map[string]interface{}{
 		"stop_reason":   stopReason,
-		"stop_sequence": nil,
+		"stop_sequence": stopSequenceField,
 	}
 	if stopReason == "refusal" {
 		deltaMap["stop_details"] = map[string]interface{}{

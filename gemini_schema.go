@@ -47,62 +47,86 @@ func stripNestedOpenDictReason(toolName, argsRaw string) string {
 	fields := openDictArgFields[toolName]
 	openDictArgFieldsMu.Unlock()
 	for _, field := range fields {
-		// An audit caught that a field ending in ".items" — the marker
-		// addEmptySchemaPlaceholder's caller leaves behind for "this open
-		// dict placeholder was injected into an array's element schema,
-		// not a plain nested object" — was handled identically to a plain
-		// nested object: path = field + ".reason" assumes a single object,
-		// but gjson/sjson have no "items" path token, so this never
-		// matched any real element and the "reason" placeholder leaked
-		// into every element of the array unstripped.
-		if arrayField, ok := strings.CutSuffix(field, ".items"); ok {
-			arr := gjson.Get(argsRaw, arrayField)
-			if arr.IsArray() {
-				n := len(arr.Array())
-				for i := n - 1; i >= 0; i-- {
-					path := fmt.Sprintf("%s.%d.reason", arrayField, i)
-					if gjson.Get(argsRaw, path).Exists() {
-						if cleaned, err := sjson.Delete(argsRaw, path); err == nil {
-							argsRaw = cleaned
-						}
-					}
+		argsRaw = stripReasonAtFieldSpec(argsRaw, "", field)
+	}
+	return argsRaw
+}
+
+// stripReasonAtFieldSpec walks a single openDictArgFields entry against the
+// real argument VALUES, deleting a synthetic "reason" placeholder wherever
+// the spec resolves. The spec can contain any number of ".items"/".items."
+// array markers (addEmptySchemaPlaceholder's own convention for "this
+// placeholder sat inside an array's element schema", possibly nested
+// several arrays deep — e.g. "matrix.items.items.metadata" for a 2D array
+// of arrays of objects with a "metadata" dict). An audit caught the
+// original version only ever peeled off ONE such marker before falling
+// back to flat string concatenation for everything after it — correct for
+// one array dimension, but a second (or deeper) dimension's own "items"
+// token then became part of that flat path literally, matching nothing in
+// the real data and leaking the placeholder through unstripped.
+// pathPrefix is the real gjson/sjson path already resolved so far (starts
+// empty at the top level, grows by one concrete array index per
+// recursion); field is the remaining, not-yet-resolved tail of the spec.
+func stripReasonAtFieldSpec(argsRaw, pathPrefix, field string) string {
+	joined := func(key string) string {
+		if pathPrefix == "" {
+			return key
+		}
+		if key == "" {
+			return pathPrefix
+		}
+		return pathPrefix + "." + key
+	}
+	// The spec's leading segment is itself an array marker — either this
+	// recursion starts fresh on an "items"-prefixed remainder peeled off
+	// by the caller, or (rarer) the whole spec is just "items".
+	if field == "items" {
+		return stripReasonAcrossArray(argsRaw, joined(""), "")
+	}
+	if rest, ok := strings.CutPrefix(field, "items."); ok {
+		return stripReasonAcrossArray(argsRaw, joined(""), rest)
+	}
+	if arrayField, ok := strings.CutSuffix(field, ".items"); ok {
+		return stripReasonAcrossArray(argsRaw, joined(arrayField), "")
+	}
+	if idx := strings.Index(field, ".items."); idx != -1 {
+		arrayField := field[:idx]
+		remainder := field[idx+len(".items."):]
+		return stripReasonAcrossArray(argsRaw, joined(arrayField), remainder)
+	}
+	// No more array markers — a plain nested-object path, delete "reason"
+	// directly under it.
+	path := joined(field) + ".reason"
+	if gjson.Get(argsRaw, path).Exists() {
+		if cleaned, err := sjson.Delete(argsRaw, path); err == nil {
+			argsRaw = cleaned
+		}
+	}
+	return argsRaw
+}
+
+// stripReasonAcrossArray iterates every element of the array at arrayPath,
+// recursing into stripReasonAtFieldSpec for each one with remainder as the
+// still-unresolved tail — remainder may itself contain further array
+// markers for additional dimensions.
+func stripReasonAcrossArray(argsRaw, arrayPath, remainder string) string {
+	arr := gjson.Get(argsRaw, arrayPath)
+	if !arr.IsArray() {
+		return argsRaw
+	}
+	n := len(arr.Array())
+	for i := n - 1; i >= 0; i-- {
+		elemPrefix := fmt.Sprintf("%s.%d", arrayPath, i)
+		if remainder == "" {
+			path := elemPrefix + ".reason"
+			if gjson.Get(argsRaw, path).Exists() {
+				if cleaned, err := sjson.Delete(argsRaw, path); err == nil {
+					argsRaw = cleaned
 				}
 			}
 			continue
 		}
-		// An audit caught that the ".items" handling above only covers
-		// "reason" sitting directly on each array element — a free-form
-		// dict ONE LEVEL DEEPER inside an array element's own sub-object
-		// (e.g. "tasks.items.metadata", for tasks[].metadata) produces a
-		// field string with ".items." in the MIDDLE, not at the end, so
-		// it fell through to the plain-path branch below, which built
-		// "tasks.items.metadata.reason" — not a real gjson/sjson path
-		// (neither library treats ".items." as an array-index wildcard),
-		// so it never matched anything and the placeholder leaked into
-		// every element of the array unstripped.
-		if idx := strings.Index(field, ".items."); idx != -1 {
-			arrayField := field[:idx]
-			remainder := field[idx+len(".items."):]
-			arr := gjson.Get(argsRaw, arrayField)
-			if arr.IsArray() {
-				n := len(arr.Array())
-				for i := n - 1; i >= 0; i-- {
-					path := fmt.Sprintf("%s.%d.%s.reason", arrayField, i, remainder)
-					if gjson.Get(argsRaw, path).Exists() {
-						if cleaned, err := sjson.Delete(argsRaw, path); err == nil {
-							argsRaw = cleaned
-						}
-					}
-				}
-			}
-			continue
-		}
-		path := field + ".reason"
-		if gjson.Get(argsRaw, path).Exists() {
-			if cleaned, err := sjson.Delete(argsRaw, path); err == nil {
-				argsRaw = cleaned
-			}
-		}
+		argsRaw = stripReasonAtFieldSpec(argsRaw, elemPrefix, remainder)
 	}
 	return argsRaw
 }
@@ -741,11 +765,30 @@ func moveConstraintsToDescription(jsonStr string) string {
 	for _, key := range unsupportedConstraints {
 		for _, p := range pathsByField[key] {
 			val := gjson.Get(jsonStr, p)
-			if !val.Exists() || val.IsObject() || val.IsArray() {
+			if !val.Exists() {
 				continue
 			}
 			parentPath := trimSuffix(p, "."+key)
 			if isPropertyDefinition(parentPath) {
+				continue
+			}
+			if val.IsObject() || val.IsArray() {
+				// An audit caught that object/array-valued constraints —
+				// dependentRequired/dependencies/dependentSchemas describe
+				// real structural rules ("if credit_card is set,
+				// billing_address becomes required"), not just a scalar
+				// limit like minLength — were skipped here entirely, with
+				// no hint of any kind. removeUnsupportedKeywords then
+				// deletes the keyword outright later in the pipeline
+				// (every key in unsupportedConstraints is also in that
+				// delete list), so the rule vanished completely instead
+				// of degrading to a plain-text description, the same way
+				// every scalar constraint here already does. Use the
+				// compact JSON form as the hint text — lossy (the model
+				// can't enforce it structurally either way, same
+				// limitation as every other constraint this function
+				// handles), but strictly better than total silence.
+				jsonStr = appendHint(jsonStr, parentPath, fmt.Sprintf("%s: %s", key, val.Raw))
 				continue
 			}
 			jsonStr = appendHint(jsonStr, parentPath, fmt.Sprintf("%s: %s", key, val.String()))
@@ -792,6 +835,45 @@ func mergeAllOfPropertiesInto(jsonStr, propsDestPath string, props gjson.Result)
 			}
 			if k == "properties" && attrVal.IsObject() {
 				jsonStr = mergeAllOfPropertiesInto(jsonStr, destPath+".properties", attrVal)
+				return true
+			}
+			if k == "items" && attrVal.IsObject() {
+				// An audit caught this fell through to the generic
+				// "only set if destPath.k doesn't exist yet" rule below
+				// too, same as "required" above was fixed for — when two
+				// allOf branches both constrain an array's element
+				// schema (e.g. one branch adds a "name" field to items,
+				// another adds "id"), only the FIRST branch's "items" was
+				// ever kept, destroying the second branch's own
+				// constraints on the array's elements.
+				itemsDestPath := destPath + ".items"
+				if !gjson.Get(jsonStr, itemsDestPath).Exists() {
+					jsonStr, _ = sjson.SetRaw(jsonStr, itemsDestPath, attrVal.Raw)
+					return true
+				}
+				if itemsProps := attrVal.Get("properties"); itemsProps.IsObject() {
+					jsonStr = mergeAllOfPropertiesInto(jsonStr, itemsDestPath+".properties", itemsProps)
+				}
+				if itemsReq := attrVal.Get("required"); itemsReq.IsArray() {
+					reqPath := itemsDestPath + ".required"
+					seen := make(map[string]bool)
+					var merged []string
+					if existing := gjson.Get(jsonStr, reqPath); existing.IsArray() {
+						for _, r := range existing.Array() {
+							if !seen[r.String()] {
+								seen[r.String()] = true
+								merged = append(merged, r.String())
+							}
+						}
+					}
+					for _, r := range itemsReq.Array() {
+						if !seen[r.String()] {
+							seen[r.String()] = true
+							merged = append(merged, r.String())
+						}
+					}
+					jsonStr, _ = sjson.Set(jsonStr, reqPath, merged)
+				}
 				return true
 			}
 			if k == "required" && attrVal.IsArray() {
@@ -1139,11 +1221,41 @@ func mergeObjectBranches(branches []gjson.Result) string {
 					entry = &propEntry{raw: pv.Raw}
 					props[key] = entry
 					order = append(order, key)
+				} else if pv.Get("properties").IsObject() && gjson.Parse(entry.raw).Get("properties").IsObject() {
+					// An audit caught that a non-discriminator shared
+					// property — a nested object like "config" that
+					// different branches declare with DIFFERENT sub-fields
+					// for their own action — used first-branch-wins here:
+					// only the FIRST branch's version of "config" was ever
+					// kept, silently erasing every other branch's own
+					// sub-properties for it. Recursively merge, the same
+					// way mergeAllOfPropertiesInto already does for allOf
+					// collisions.
+					entry.raw = mergeAllOfPropertiesInto(entry.raw, "properties", pv.Get("properties"))
+					if newReq := pv.Get("required"); newReq.IsArray() {
+						seen := make(map[string]bool)
+						var merged []string
+						if existingReq := gjson.Parse(entry.raw).Get("required"); existingReq.IsArray() {
+							for _, r := range existingReq.Array() {
+								if !seen[r.String()] {
+									seen[r.String()] = true
+									merged = append(merged, r.String())
+								}
+							}
+						}
+						for _, r := range newReq.Array() {
+							if !seen[r.String()] {
+								seen[r.String()] = true
+								merged = append(merged, r.String())
+							}
+						}
+						entry.raw, _ = sjson.Set(entry.raw, "required", merged)
+					}
 				}
 				if c := pv.Get("const"); c.Exists() {
 					entry.isConstField = true
 					entry.constValues = append(entry.constValues, c.String())
-				} else if en := pv.Get("enum"); en.IsArray() && len(en.Array()) == 1 {
+				} else if en := pv.Get("enum"); en.IsArray() && len(en.Array()) >= 1 {
 					// An audit caught that JSON Schema Draft-04/07 commonly
 					// expresses a discriminated-union tag as a single-
 					// element enum ("enum":["delete"]) rather than "const" —
@@ -1152,8 +1264,17 @@ func mergeObjectBranches(branches []gjson.Result) string {
 					// value was silently dropped (its properties never even
 					// got merged, since the "already exists" check above
 					// skips straight past a repeated property key).
+					//
+					// A follow-up audit caught the len==1 restriction itself:
+					// a single branch can validly cover MULTIPLE discriminator
+					// values at once ("enum":["create","insert"]), and that
+					// whole branch's values were dropped entirely rather than
+					// just its first one — accumulate every element, not only
+					// a lone one.
 					entry.isConstField = true
-					entry.constValues = append(entry.constValues, en.Array()[0].String())
+					for _, v := range en.Array() {
+						entry.constValues = append(entry.constValues, v.String())
+					}
 				}
 				return true
 			})
@@ -1246,7 +1367,22 @@ func selectBest(items []gjson.Result) (bestIdx int, types []string) {
 				score, t = 1, "string"
 			}
 		default:
-			t = orDefault(t, "null")
+			// An audit caught that a branch with NO type signal at all —
+			// not even an enum, e.g. just {"description": "any valid
+			// filter"} — fell into this same default as a genuinely
+			// explicit {"type":"null"} branch (t is already "null" going
+			// in for that case, so orDefault leaves it alone either way).
+			// flattenAnyOfOneOf can't tell "unknown type" from "explicitly
+			// nullable" apart afterward, and treats both as proof the
+			// field can be null — wrongly marking a required parameter
+			// nullable and stripping it from "required" just because
+			// its type happened to be unknown, not because anything ever
+			// said it could be absent. Only a genuinely explicit null
+			// should reach that path; an unknown type falls back to
+			// OpenAPI's base scalar type instead.
+			if t == "" {
+				t = "string"
+			}
 		}
 
 		if t != "" {
@@ -1297,6 +1433,19 @@ func flattenTypeArrays(jsonStr string) string {
 		firstType := "string"
 		if len(nonNullTypes) > 0 {
 			firstType = nonNullTypes[0]
+		}
+		// An audit caught that picking purely by array POSITION broke a
+		// type array like ["string","object"] whose schema ALSO declares
+		// "properties" — Gemini's own validator rejects a string-typed
+		// field carrying "properties"/"items", a combination that only
+		// makes sense for the object/array member of the union. Prefer
+		// whichever declared type actually matches the schema's own
+		// structural keywords over the union's declaration order.
+		parentPathPeek := trimSuffix(p, ".type")
+		if gjson.Get(jsonStr, joinPath(parentPathPeek, "properties")).IsObject() && contains(nonNullTypes, "object") {
+			firstType = "object"
+		} else if gjson.Get(jsonStr, joinPath(parentPathPeek, "items")).Exists() && contains(nonNullTypes, "array") {
+			firstType = "array"
 		}
 
 		jsonStr, _ = sjson.Set(jsonStr, p, firstType)
@@ -1541,7 +1690,20 @@ func addEmptySchemaPlaceholder(jsonStr string, openDictPaths map[string]bool) (s
 
 			if field, ok := strings.CutPrefix(parentPath, "properties."); ok {
 				argPath := strings.ReplaceAll(field, ".properties.", ".")
-				nestedOpenDictFields = append(nestedOpenDictFields, unescapeGJSONPathKey(argPath))
+				// An audit caught that unescaping here, so a property
+				// name with a literal dot (e.g. "app.env") round-tripped
+				// back to that literal dot instead of staying as the
+				// escaped "app\.env" segment it already was, broke
+				// stripNestedOpenDictReason downstream: it builds a
+				// gjson/sjson path by plain string concatenation
+				// (field+".reason"), and both libraries treat an
+				// unescaped "." as a path separator — "app.env.reason"
+				// parses as three nested levels (app -> env -> reason),
+				// not "the literal key app.env, then reason", so the
+				// synthetic placeholder never matched and leaked through
+				// to the client. Keep it in its already-escaped form;
+				// nothing downstream needs the literal (unescaped) name.
+				nestedOpenDictFields = append(nestedOpenDictFields, argPath)
 			}
 		}
 		// Previously also force-added a bogus "_": {"type":"boolean"}

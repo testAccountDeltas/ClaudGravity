@@ -84,6 +84,19 @@ func DeriveConversationAnchor(bodyBytes []byte, headerSessionID string, instance
 
 	// If client explicitly sent a session id, use it
 	if sid := root.Get("metadata.session_id").String(); sid != "" {
+		// An audit caught that this branch, unlike the header-based one
+		// just above it, never appended instanceID — when the
+		// x-claude-code-session-id header isn't set (so execution falls
+		// through to the body's own metadata.session_id), every parallel
+		// subagent of the same session shares this exact string, with no
+		// instanceID to tell them apart. isSubagentKey downstream
+		// requires >=2 colons to recognize a subagent key at all, so
+		// these all collapsed onto the SAME conversation anchor — and
+		// thus the same Google account — instantly hitting that one
+		// account's 429 instead of spreading across the pool.
+		if instanceID != "" {
+			return "sid:" + sid + ":" + instanceID
+		}
 		return "sid:" + sid
 	}
 
@@ -450,7 +463,19 @@ func hasRemainingQuota(acc *AccountRecord) bool {
 	}
 	now := time.Now()
 	for _, grp := range acc.Quotas {
-		if strings.Contains(strings.ToLower(grp.DisplayName), "gemini") {
+		// An audit caught this used a WHITELIST (only "gemini"-named
+		// groups) while getEffectiveQuotaFraction below uses a BLACKLIST
+		// (every group except "claude"-named ones) — for a quota group
+		// matching neither substring (e.g. "Cloud AI Companion"), this
+		// function silently ignored it entirely while the other function
+		// used it to drag the account's ranked fraction down, so the two
+		// disagreed on the SAME account: this one said "has quota," the
+		// other said "nearly exhausted." Unified to the blacklist
+		// approach, which has an actual documented reason (exclude only
+		// the known-irrelevant 3P Claude bucket) rather than an
+		// unexplained narrow whitelist that silently dropped other real
+		// Gemini-adjacent quota groups.
+		if !strings.Contains(strings.ToLower(grp.DisplayName), "claude") {
 			for _, b := range grp.Buckets {
 				if b.RemainingFraction <= 0.05 {
 					// This bucket's own fraction is a snapshot from the

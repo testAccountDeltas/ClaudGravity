@@ -739,7 +739,7 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 				// line added/removed), reapplyLineIndents falls back to a
 				// uniform best-effort indent for lines 1..N instead of a
 				// precise 1:1 mapping.
-				if reindented, did := reapplyLineIndents(effectiveNewStr, lineIndents, fileLine0Indent); did {
+				if reindented, did := reapplyLineIndents(effectiveNewStr, lineIndents, fileLine0Indent, oldStr); did {
 					effectiveNewStr = reindented
 				}
 				if effectiveNewStr != newStr {
@@ -773,7 +773,7 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 // that preserved prefix, but nothing should be prepended here.
 const stripOnlyIndentMarker = "\x00strip-only\x00"
 
-func reapplyLineIndents(newStr string, lineIndents []string, fileLine0Indent string) (string, bool) {
+func reapplyLineIndents(newStr string, lineIndents []string, fileLine0Indent string, oldStr string) (string, bool) {
 	hasAny := false
 	for _, ind := range lineIndents {
 		if ind != "" {
@@ -794,6 +794,14 @@ func reapplyLineIndents(newStr string, lineIndents []string, fileLine0Indent str
 	}
 	lines := strings.Split(newStr, "\n")
 	changed := false
+
+	// Captured before line 0 is potentially rewritten below — the
+	// model's OWN relative indentation between line 0 and later lines
+	// (e.g. line 0 has none of its own, line 3 has 4 extra spaces of its
+	// own) is real signal about nesting depth that a flat "apply one
+	// uniform indent to every line" replacement throws away. See its use
+	// in the differing-line-count branch below.
+	origLine0OwnIndent := lines[0][:len(lines[0])-len(strings.TrimLeft(lines[0], " \t"))]
 
 	// Line 0 is handled the same way regardless of whether the rest of
 	// the lines correspond 1:1: lineIndents[0] already holds the exact
@@ -863,15 +871,22 @@ func reapplyLineIndents(newStr string, lineIndents []string, fileLine0Indent str
 				baseIndent = ind
 			}
 		}
-		if baseIndent == "" && len(lineIndents) == 1 && fileLine0Indent != "" {
-			// old_string was a single line, so there's no lines-1..N
-			// indentation to have detected in the first place — fall
-			// back to the file's own indentation at that single matched
-			// line as a best-effort base for whatever new lines the
-			// model inserted after it.
-			baseIndent = fileLine0Indent
-		}
-		if baseIndent != "" {
+		if len(lineIndents) == 1 && fileLine0Indent != "" {
+			// old_string was a single line, so there's no real lines-1..N
+			// detected indentation at all to pick a baseIndent from
+			// (counts is necessarily empty) — this is the ONLY case
+			// handled by relative-delta preservation below, specifically
+			// because it's the only case with no per-line ground truth to
+			// prefer instead. An audit caught that naively using
+			// fileLine0Indent as a flat baseIndent here flattens nested
+			// structure: expanding "def foo():" into
+			// "def foo():\n    return 42" (new_string's own text already
+			// correctly shows line 1 four spaces DEEPER than its own line
+			// 0 baseline) lost that relative nesting and put both lines
+			// at the identical depth, corrupting Python's indentation
+			// rules. Layer new_string's own relative indentation (vs. its
+			// own line 0) on top of the file's real indentation instead
+			// of discarding it.
 			for j := range lines {
 				if j == 0 {
 					continue // line 0 already handled above
@@ -879,11 +894,108 @@ func reapplyLineIndents(newStr string, lineIndents []string, fileLine0Indent str
 				if strings.TrimSpace(lines[j]) == "" {
 					continue // don't indent a genuinely blank line
 				}
-				trimmed := strings.TrimLeft(lines[j], " \t")
-				if baseIndent+trimmed == lines[j] {
+				ownLeadingLen := len(lines[j]) - len(strings.TrimLeft(lines[j], " \t"))
+				ownIndent := lines[j][:ownLeadingLen]
+				trimmed := lines[j][ownLeadingLen:]
+				var target string
+				if strings.HasPrefix(ownIndent, origLine0OwnIndent) {
+					delta := ownIndent[len(origLine0OwnIndent):]
+					target = fileLine0Indent + delta + trimmed
+				} else {
+					// Own indentation doesn't extend line 0's baseline
+					// (e.g. an actual dedent) — a prefix-delta can't
+					// express that; best-effort flat fallback.
+					target = fileLine0Indent + trimmed
+				}
+				if target == lines[j] {
 					continue // already correct
 				}
-				lines[j] = baseIndent + trimmed
+				lines[j] = target
+				changed = true
+			}
+		} else if baseIndent != "" {
+			// An audit caught that applying the SAME flat baseIndent to
+			// every line here flattens genuinely nested structure within
+			// the replacement itself: old_string spanning a for-loop with
+			// an if nested inside it has lines at 3 different real
+			// depths, but adding one new line inside that if (changing
+			// the line count, which is why we're in this branch at all)
+			// collapsed the for-header, the if-header, the body, AND
+			// both closing braces onto the SAME single depth — not just
+			// at the line-0 boundary (the narrower case fixed above), but
+			// throughout the whole block.
+			//
+			// old_string's own lines (split the same way
+			// findFuzzyLineMatch did, to stay index-aligned with
+			// lineIndents) already carry the REAL per-line file
+			// indentation for any line whose own TEXT is unchanged in
+			// new_string. A plain content->indent map collides on
+			// duplicate lines (two bare "}" closing braces at DIFFERENT
+			// real depths hash to the same key, so the second overwrites
+			// the first) — match them in ORDER instead, like a simple
+			// diff: walk old_string's lines once, and for each one scan
+			// new_string forward from just past the previous match to
+			// find its next occurrence, assigning that old line's real
+			// indent to that exact position. Lines in new_string with no
+			// match at all (walked past without ever being found) are
+			// genuinely new insertions with no ground truth, and still
+			// fall back to baseIndent.
+			oldLines := strings.Split(strings.ReplaceAll(oldStr, "\r\n", "\n"), "\n")
+			if (strings.HasSuffix(oldStr, "\n") || strings.HasSuffix(oldStr, "\r")) && len(oldLines) > 1 && oldLines[len(oldLines)-1] == "" {
+				oldLines = oldLines[:len(oldLines)-1]
+			}
+			assignedIndent := make([]string, len(lines))
+			assigned := make([]bool, len(lines))
+			searchFrom := 1
+			for k := 1; k < len(oldLines) && k < len(lineIndents); k++ {
+				oldOwnLeadingLen := len(oldLines[k]) - len(strings.TrimLeft(oldLines[k], " \t"))
+				oldContent := normalizeLineForMatch(oldLines[k][oldOwnLeadingLen:])
+				for j := searchFrom; j < len(lines); j++ {
+					if normalizeLineForMatch(strings.TrimLeft(lines[j], " \t")) != oldContent {
+						continue
+					}
+					realIndent := lineIndents[k]
+					if realIndent == "" {
+						// Nothing was missing for this old line, meaning
+						// its own leading whitespace already equals the
+						// file's — that own whitespace IS the real indent.
+						realIndent = oldLines[k][:oldOwnLeadingLen]
+					}
+					assignedIndent[j] = realIndent
+					assigned[j] = true
+					searchFrom = j + 1
+					break
+				}
+			}
+			// A genuinely new (unmatched) line most likely sits right next
+			// to a matched one in the model's own intended structure (a
+			// new statement inserted after doA() is almost certainly a
+			// sibling of doA(), not sitting at the enclosing block's
+			// average depth) — prefer the nearest PRECEDING matched
+			// line's real indent over the generic baseIndent guess when
+			// one is available.
+			nearestPreceding := ""
+			for j := range lines {
+				if j == 0 {
+					continue // line 0 already handled above
+				}
+				if assigned[j] {
+					nearestPreceding = assignedIndent[j]
+				}
+				if strings.TrimSpace(lines[j]) == "" {
+					continue // don't indent a genuinely blank line
+				}
+				trimmed := strings.TrimLeft(lines[j], " \t")
+				target := baseIndent + trimmed
+				if assigned[j] {
+					target = assignedIndent[j] + trimmed
+				} else if nearestPreceding != "" {
+					target = nearestPreceding + trimmed
+				}
+				if target == lines[j] {
+					continue // already correct
+				}
+				lines[j] = target
 				changed = true
 			}
 		}
@@ -1128,7 +1240,15 @@ func RepairGrepToolCall(argsRaw string) (string, bool) {
 			return fixed, true
 		}
 	}
-	if path != "" && (strings.ContainsAny(path, "*?[]()|^$+\\") || !strings.ContainsAny(path, "/\\")) {
+	// An audit caught that "\\" in the first check (regex special chars)
+	// falsely matched ANY Windows-style path at all — "\" is also a
+	// literal path separator there, and "controllers\auth.go" has no
+	// genuine regex metacharacter, just a normal Windows directory
+	// separator. Keep "\\" in the SECOND check (no separator at all —
+	// still correctly recognizes "\" as a valid separator there, so a
+	// real Windows path doesn't also trip that one), but drop it from
+	// the regex-metacharacter set.
+	if path != "" && (strings.ContainsAny(path, "*?[]()|^$+") || !strings.ContainsAny(path, "/\\")) {
 		fixed, _ := sjson.Set(argsRaw, "pattern", path)
 		fixed, _ = sjson.Delete(fixed, "path")
 		return fixed, true
@@ -1160,6 +1280,18 @@ func RepairGlobToolCall(argsRaw string) (string, bool) {
 	path := parsed.Get("path").String()
 	if pattern != "" {
 		return argsRaw, false
+	}
+	// An audit caught that, unlike RepairGrepToolCall just above, this had
+	// no alias-key fallback at all — a model calling Glob(glob:"*.go")
+	// (an entirely plausible alias given the tool's own name) left
+	// "pattern" missing, the required-parameter validation on Claude
+	// Code's side rejecting the call outright.
+	for _, aliasKey := range []string{"glob", "query", "search"} {
+		if alias := parsed.Get(aliasKey).String(); alias != "" {
+			fixed, _ := sjson.Set(argsRaw, "pattern", alias)
+			fixed, _ = sjson.Delete(fixed, aliasKey)
+			return fixed, true
+		}
 	}
 	if path != "" && strings.ContainsAny(path, "*?[]") {
 		fixed, _ := sjson.Set(argsRaw, "pattern", path)

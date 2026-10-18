@@ -252,6 +252,18 @@ var cgnatSubnet = &net.IPNet{
 	Mask: net.CIDRMask(10, 32),
 }
 
+// thisNetworkSubnet is the reserved 0.0.0.0/8 "this network" block. Go's
+// net.IP.IsLoopback() only matches 127.0.0.0/8 (and ::1) — it does not
+// cover this range at all. An audit flagged that some systems' network
+// stacks still treat addresses in 0.0.0.0/8 (0.0.0.1 etc.) as reaching
+// localhost/this-host services, a documented SSRF bypass vector. There's
+// no legitimate reason for a CONNECT target to resolve here regardless,
+// so it's blocked outright alongside loopback/private/link-local.
+var thisNetworkSubnet = &net.IPNet{
+	IP:   net.IPv4(0, 0, 0, 0),
+	Mask: net.CIDRMask(8, 32),
+}
+
 // checkConnectTarget reports whether host resolves to a public, safe address.
 // It returns every verified safe IP (IPv4 addresses first — a dual-stack
 // DNS answer commonly lists AAAA before A, and a host with no outbound IPv6
@@ -271,7 +283,7 @@ func checkConnectTarget(host string) ([]net.IP, error) {
 		return nil, fmt.Errorf("no addresses found for %s", host)
 	}
 	for _, ip := range ips {
-		if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() || (ip.To4() != nil && cgnatSubnet.Contains(ip.To4())) {
+		if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() || (ip.To4() != nil && (cgnatSubnet.Contains(ip.To4()) || thisNetworkSubnet.Contains(ip.To4()))) {
 			return nil, fmt.Errorf("blocked target address: %s", ip)
 		}
 	}
@@ -501,10 +513,23 @@ func serveInterceptedTLS(tlsConn *tls.Conn, handler http.Handler) {
 		// Any read activity here — new bytes or an error/EOF — means the
 		// client is done with this tunnel either way, so stop the upstream
 		// call.
+		// An audit caught that this only read ONCE: if the client sent
+		// unexpected bytes (n>0, err==nil — a stray pipelined byte, a
+		// benign protocol quirk, anything short of an actual close/EOF),
+		// the comment's own assumption ("new bytes... means the client
+		// is done") was wrong, but worse, the goroutine then exited
+		// without ever calling cancel() — permanently ending this
+		// connection's disconnect detection. A GENUINE later disconnect
+		// (the user hitting Ctrl+C) then went completely unnoticed,
+		// leaving the upstream Gemini call running to completion for no
+		// reason. Loop on an unexpected read instead of exiting.
 		buf := make([]byte, 1)
-		n, err := tlsConn.Read(buf)
-		if err != nil || n == 0 {
-			cancel()
+		for {
+			n, err := tlsConn.Read(buf)
+			if err != nil || n == 0 {
+				cancel()
+				return
+			}
 		}
 	}()
 	req = req.WithContext(ctx)
@@ -588,8 +613,20 @@ func PassthroughToReal(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+// An audit caught that http.Client's Timeout bounds the ENTIRE exchange —
+// connect, headers, AND the full response body read (per net/http's own
+// docs) — so any passthrough request or stream that happened to run
+// longer than 30s got killed with a 502 partway through, regardless of
+// whether it was making real progress. PassthroughToReal exists
+// specifically for real Anthropic endpoints this gateway hasn't
+// implemented, which can legitimately be slow or long-running (a big
+// upload, a long-lived stream). Bound only the "is anything ever going to
+// respond at all" phase via the Transport's ResponseHeaderTimeout —
+// once a response starts, let it run to completion.
 var passthroughClient = &http.Client{
-	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		ResponseHeaderTimeout: 30 * time.Second,
+	},
 }
 
 // HandleBootstrapSpoof handles GET /api/claude_cli/bootstrap
@@ -608,7 +645,12 @@ func HandleBootstrapSpoof(w http.ResponseWriter, r *http.Request) {
 			"override_user_selection": false,
 		},
 		"oauth_account": map[string]interface{}{
-			"account_uuid":                 "0bad747f-0000-4000-a000-000000000000",
+			// An audit caught this hardcoded the SAME literal UUID as
+			// fakeOrgID below it, for a different entity (the account,
+			// not the organization) — now uses the distinct fakeAccountID,
+			// consistent with server.go's /api/oauth/profile and
+			// /api/oauth/validate responses.
+			"account_uuid":                 fakeAccountID,
 			"account_email":                "user@claudgravity.local",
 			"organization_uuid":            fakeOrgID,
 			"organization_name":            "ClaudGravity Workspace",

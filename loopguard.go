@@ -155,7 +155,14 @@ var awkNRPattern = regexp.MustCompile(`(?i)\bNR\s*[<>=!]`)
 // redirect, e.g. `cat << 'EOF' > file.go`, or `cat file1 file2 > out`) —
 // an audit caught this counting as a Read when it's actually genuine
 // progress (a file write), which should reset the window, not add to it.
-var catIsWritePattern = regexp.MustCompile(`(?i)\bcat\b[^|]*>`)
+//
+// A follow-up audit caught that this same confusion isn't unique to
+// "cat": `head -n 50 in.txt > out.txt` or `sed -n '1,50p' in.txt >
+// out.txt` are just as genuinely a file WRITE (both head and sed also
+// match readEquivalentBashPattern as read-equivalent tools, same as cat),
+// but only "cat" itself was ever checked here — head/tail/sed-based
+// writes still counted as unproductive reads.
+var catIsWritePattern = regexp.MustCompile(`(?i)\b(cat|head|tail|sed)\b[^|]*>`)
 
 // stderrRedirectPattern matches a file-descriptor-specific redirect used to
 // suppress error output — `2>/dev/null`, `2>&1`, `2>$null` (PowerShell) —
@@ -188,7 +195,16 @@ var grepInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])(grep|rg)\b`)
 // intentionally excluded here since it's checked separately with a plain
 // substring match (a file path segment named exactly "select-string" is
 // implausible enough not to bother with a command-boundary check).
-var psSearchInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])(findstr|grep|rg)\b`)
+//
+// An audit caught "sls" — PowerShell's standard built-in alias for
+// Select-String, as common in practice as "grep" itself — was missing
+// entirely: `gc file.txt | sls "pattern"` counted as an unproductive read
+// instead of a real search, same failure as grep/rg would have had
+// without the boundary check. Unlike "select-string", "sls" is short
+// enough to plausibly appear as a substring of something else (e.g. a
+// Serverless Framework project directory literally named "sls"), so it
+// needs the real command-boundary check here, not a bare substring match.
+var psSearchInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])(findstr|grep|rg|sls)\b`)
 
 func isReadEquivalentBashCommand(command string) bool {
 	lc := strings.ToLower(command)
@@ -205,7 +221,8 @@ func isReadEquivalentBashCommand(command string) bool {
 	if strings.Contains(lc, "readlines") || strings.Contains(lc, "splitlines") {
 		return true
 	}
-	if strings.Contains(lc, "cat") && catIsWritePattern.MatchString(stripStderrRedirects(command)) {
+	if (strings.Contains(lc, "cat") || strings.Contains(lc, "head") || strings.Contains(lc, "tail") || strings.Contains(lc, "sed")) &&
+		catIsWritePattern.MatchString(stripStderrRedirects(command)) {
 		return false
 	}
 	return readEquivalentBashPattern.MatchString(command)
@@ -393,6 +410,25 @@ func (lg *LoopGuardManager) touchLocked(agentKey string) {
 // substantial amount of actual explanatory text/thinking — not just "let me
 // check X") wipes the window: that's real forward motion, not skimming.
 func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeProgress bool, windowSize int) {
+	lg.RecordReadTurnWithRealProgress(agentKey, readCount, madeProgress, madeProgress, windowSize)
+}
+
+// RecordReadTurnWithRealProgress separates "this turn resets the read-count
+// window" (madeProgress, which includes a zero-tool-call turn with a
+// substantial text reply — reasonably treated as real progress for
+// deciding whether to detect a loop at all) from "this turn earns a clean
+// slate on the NUDGE ESCALATION WORDING too" (realProgress — an audit
+// caught these being conflated under one flag broke the exact escalation
+// CheckAndResetReadStreak's own doc comment describes: a model that
+// politely ACKNOWLEDGES a soft nudge with a long text reply but makes no
+// Write/Edit, then immediately resumes reading, previously reset
+// nudgeCount via that acknowledgment alone — the second read-loop
+// occurrence fired the same soft wording again instead of escalating,
+// even though nothing was actually fixed between the two. Only genuine
+// Write/Edit progress should earn that clean slate; a text-only turn
+// still resets the detection WINDOW (so unrelated activity doesn't
+// falsely accumulate), just not the escalation level.
+func (lg *LoopGuardManager) RecordReadTurnWithRealProgress(agentKey string, readCount int, madeProgress, realProgress bool, windowSize int) {
 	if agentKey == "" || agentKey == "auxiliary" || strings.HasPrefix(agentKey, "auxiliary|") {
 		return
 	}
@@ -402,7 +438,9 @@ func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeP
 
 	if madeProgress {
 		delete(lg.readWindows, agentKey)
-		delete(lg.nudgeCount, agentKey) // genuine progress earns a clean slate for the nudge wording too
+		if realProgress {
+			delete(lg.nudgeCount, agentKey) // genuine progress earns a clean slate for the nudge wording too
+		}
 		return
 	}
 

@@ -205,16 +205,33 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 											decodedBytes := len(dataStr) * 3 / 4
 											est = decodedBytes / 2
 										}
-										// The 1600-token floor approximates a minimum
-										// "page" cost for PDFs — applying it to a small
-										// text document (a short code snippet, a tiny
-										// CSV) overstates its real size for no reason.
-										if (mediaType == "application/pdf" || mediaType == "") && est < 1600 {
-											est = 1600
+										// minPDFTokenFloor (context_window.go) approximates
+										// a minimum "page" cost for PDFs — applying it to a
+										// small text document (a short code snippet, a tiny
+										// CSV) overstates its real size for no reason. An
+										// audit caught this file and context_window.go had
+										// drifted to two DIFFERENT floor values (1600 here,
+										// 2500 there) despite being the same approximation;
+										// now shares one constant.
+										if (mediaType == "application/pdf" || mediaType == "") && est < minPDFTokenFloor {
+											est = minPDFTokenFloor
 										}
 										total += est
 									} else if src.Get("type").String() == "content" {
 										total += estimateApproxTokens(estimateContentSourceText(src))
+									} else if src.Get("type").String() == "url" {
+										// An audit caught this priced a
+										// url-sourced document at 0 tokens
+										// (src.data is empty for a url
+										// source) — but the real content
+										// sent to Gemini is a short
+										// "[Attached by URL: <url>]" text
+										// placeholder (translator.go never
+										// fetches the URL), so the honest
+										// estimate scales with the URL
+										// string's length, matching
+										// context_window.go's equivalent fix.
+										total += estimateApproxTokens("[Attached by URL: " + src.Get("url").String() + "]")
 									} else {
 										total += estimateApproxTokens(src.Get("data").String())
 									}
@@ -239,19 +256,18 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 								decodedBytes := len(dataStr) * 3 / 4
 								est = decodedBytes / 2
 							}
-							// Same PDF-only floor as the tool_result document
-							// case above (and context_window.go) — applying
-							// it to every media type inflated a small base64
-							// text/code/CSV document's displayed estimate for
-							// no reason. This is the top-level "document"
-							// content block's own copy of that same bug; the
-							// nested tool_result one was already fixed.
-							if (mediaType == "application/pdf" || mediaType == "") && est < 1600 {
-								est = 1600
+							// Same shared minPDFTokenFloor as the tool_result
+							// document case above (and context_window.go).
+							if (mediaType == "application/pdf" || mediaType == "") && est < minPDFTokenFloor {
+								est = minPDFTokenFloor
 							}
 							total += est
 						} else if src.Get("type").String() == "content" {
 							total += estimateApproxTokens(estimateContentSourceText(src))
+						} else if src.Get("type").String() == "url" {
+							// Same url-source fix as the tool_result
+							// document case above.
+							total += estimateApproxTokens("[Attached by URL: " + src.Get("url").String() + "]")
 						} else {
 							total += estimateApproxTokens(src.Get("data").String())
 						}

@@ -243,7 +243,24 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		if gjson.GetBytes(bodyBytes, "error").String() == "invalid_grant" {
+		// An audit caught this only ever cooled down on "invalid_grant" —
+		// but OAuth2's other definitively-non-retriable error codes
+		// (RFC 6749 §5.2) mean exactly the same thing in practice: this
+		// account's credentials are broken and retrying won't help.
+		// "invalid_request" (malformed refresh request — a corrupted
+		// stored token) and "unauthorized_client"/"invalid_client" (the
+		// account's client registration itself was revoked) all leave
+		// the account selector blind to a definitively-dead account the
+		// same way invalid_grant did, burning a real refresh round-trip
+		// on every single request routed to it until someone notices.
+		// Deliberately NOT included: "server_error"/"temporarily_unavailable"
+		// (Google's OWN transient failure, not this account's problem —
+		// cooling down over a passing Google outage would be wrong) and
+		// "unsupported_grant_type"/"invalid_scope" (a bug in OUR request
+		// shape, not something retrying — or cooling down — this
+		// particular account fixes).
+		oauthErr := gjson.GetBytes(bodyBytes, "error").String()
+		if oauthErr == "invalid_grant" || oauthErr == "invalid_request" || oauthErr == "unauthorized_client" || oauthErr == "invalid_client" {
 			deadRefreshTokensMu.Lock()
 			deadRefreshTokens[email] = time.Now().Add(deadRefreshTokenCooldown)
 			deadRefreshTokensMu.Unlock()

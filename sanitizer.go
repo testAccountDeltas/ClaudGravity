@@ -145,6 +145,27 @@ func dedupedRepeatedReads(newMsgs []map[string]interface{}) bool {
 				if text == "" {
 					continue
 				}
+				// An audit caught that InjectUserNudge (loopguard.go)
+				// folds its nudge text directly into a tool_result's own
+				// content when that's the turn's last turn — the ONLY
+				// place it safely can, since Gemini rejects a sibling
+				// text block next to a functionResponse — including,
+				// plausibly often, a Read tool_result (LoopGuard tends to
+				// fire exactly when recent calls were Reads). If THIS
+				// pass sees that nudge-suffixed text, caching it verbatim
+				// under seenContent[path] poisons the comparison: a LATER
+				// genuine re-read of the same file arrives with its own
+				// clean (un-suffixed) content and no longer exact-matches
+				// the cached value, silently defeating dedup for every
+				// later occurrence of this path. Strip a trailing nudge
+				// suffix before comparing or caching, so the comparison
+				// is keyed on the real file content either way.
+				if idx := strings.Index(text, "\n\n[Notice from the gateway"); idx != -1 {
+					text = text[:idx]
+				}
+				if text == "" {
+					continue
+				}
 				// An audit caught that on a SECOND pass over the same
 				// messages (SanitizeMessagesAndGraph can run more than
 				// once per request), a block this function already

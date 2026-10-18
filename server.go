@@ -376,6 +376,18 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 		}
 	} else if errType == "overloaded_error" {
 		w.Header().Set("Retry-After", "3")
+		// An audit caught that a 529 never set ANY
+		// anthropic-ratelimit-unified-* headers — Claude Code's own
+		// backoff/countdown display reads anthropic-ratelimit-unified-reset
+		// regardless of which status triggered it (not just 429), and
+		// without it on an overload response the CLI has nothing to count
+		// down to. A short window matches the short Retry-After above —
+		// Gemini overload is typically transient, unlike a real quota
+		// exhaustion.
+		if w.Header().Get("anthropic-ratelimit-unified-reset") == "" {
+			w.Header().Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", time.Now().Add(30*time.Second).Unix()))
+			w.Header().Set("anthropic-ratelimit-unified-status", "rejected")
+		}
 	}
 	w.WriteHeader(wireStatus)
 	body, _ := json.Marshal(map[string]interface{}{
@@ -510,23 +522,32 @@ func main() {
 	// Claude Code CLI internal control endpoints: when ANTHROPIC_BASE_URL is set,
 	// the CLI queries these paths. If unhandled on mux, they fall through to "/"
 	// (dashboard HTML), breaking profile validation, metrics, and remote settings.
+	// An audit caught that these spoofed CLI responses all shared the
+	// EXACT SAME UUID for the account, the organization, AND settings —
+	// three conceptually different entities. A client that caches
+	// fetched objects keyed by UUID (not by UUID+type) could overwrite
+	// one entity's cached fields with another's. fakeAccountID (account/
+	// settings) and fakeOrgID (organization) below are now distinct.
 	handleProfileJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("anthropic-organization-id", "0bad747f-0000-4000-a000-000000000000")
-		w.Header().Set("anthropic-workspace-id", "wrkspc_0000000000000000000000000")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
+		w.Header().Set("anthropic-workspace-id", fakeWorkspaceID)
 		// An audit flagged (independent of its own unverifiable claude.exe
 		// decompilation) that this response only had "email_address", not
 		// "email" — checkable directly against our own structural claim
 		// here. Keep both so any client reading either name works.
-		_, _ = w.Write([]byte(`{"account":{"uuid":"0bad747f-0000-4000-a000-000000000000","email":"user@claudgravity.local","email_address":"user@claudgravity.local"},"organization":{"uuid":"0bad747f-0000-4000-a000-000000000000","name":"ClaudGravity Workspace"}}`))
+		_, _ = w.Write([]byte(`{"account":{"uuid":"` + fakeAccountID + `","email":"user@claudgravity.local","email_address":"user@claudgravity.local"},"organization":{"uuid":"` + fakeOrgID + `","name":"ClaudGravity Workspace"}}`))
 	}
 	handleValidateJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Same audit flagged this response lacked account_uuid/
 		// organization_uuid alongside "valid" — add them so a client that
 		// expects to read them back after validating doesn't see them as
-		// missing.
-		_, _ = w.Write([]byte(`{"valid":true,"account_uuid":"0bad747f-0000-4000-a000-000000000000","organization_uuid":"0bad747f-0000-4000-a000-000000000000"}`))
+		// missing. An audit caught these were also hardcoded to the SAME
+		// value as /api/oauth/profile's nested account.uuid/organization.uuid
+		// here, inconsistent as flat vs. nested keys but at least
+		// referencing the SAME two distinct underlying entities now.
+		_, _ = w.Write([]byte(`{"valid":true,"account_uuid":"` + fakeAccountID + `","organization_uuid":"` + fakeOrgID + `"}`))
 	}
 	handleMetricsJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -534,7 +555,7 @@ func main() {
 	}
 	handleSettingsJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"uuid":"0bad747f-0000-4000-a000-000000000000","checksum":"none","settings":{}}`))
+		_, _ = w.Write([]byte(`{"uuid":"` + fakeAccountID + `","checksum":"none","settings":{}}`))
 	}
 	handleTelemetryJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -548,11 +569,16 @@ func main() {
 	// timeout. Same spirit as handleProfileJSON/handleValidateJSON above.
 	handleOrganizationsCurrentJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"uuid":"0bad747f-0000-4000-a000-000000000000","name":"ClaudGravity Workspace","organization_type":"enterprise","rate_limit_tier":"tier_4"}`))
+		_, _ = w.Write([]byte(`{"uuid":"` + fakeOrgID + `","name":"ClaudGravity Workspace","organization_type":"enterprise","rate_limit_tier":"tier_4"}`))
 	}
 	handleAuthCurrentUserJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"uuid":"0bad747f-0000-4000-a000-000000000000","email":"user@claudgravity.local","organizations":[{"uuid":"0bad747f-0000-4000-a000-000000000000","name":"ClaudGravity Workspace"}]}`))
+		// An audit caught the real Anthropic endpoint also returns a
+		// "memberships" array ({"organization":...,"role":"admin"}), not
+		// just "organizations" — a strict client reading memberships to
+		// determine org membership saw an empty/missing list and
+		// concluded the user belongs to no organization at all.
+		_, _ = w.Write([]byte(`{"uuid":"` + fakeAccountID + `","email":"user@claudgravity.local","organizations":[{"uuid":"` + fakeOrgID + `","name":"ClaudGravity Workspace"}],"memberships":[{"organization":{"uuid":"` + fakeOrgID + `","name":"ClaudGravity Workspace"},"role":"admin"}]}`))
 	}
 	handleBillingJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -591,8 +617,20 @@ func main() {
 	mux.HandleFunc("/api/auth/current_user", handleAuthCurrentUserJSON)
 	mux.HandleFunc("/api/organizations/current/billing", handleBillingJSON)
 	mux.HandleFunc("/api/organizations/{id}/billing", handleBillingJSON)
+	// An audit caught the bare "/api/organizations/{id}" (no "/billing"
+	// suffix) was never registered at all — Claude Code queries this
+	// directly after startup for org details. Unlike the already-handled
+	// "/current" and "/{id}/billing" variants, this fell through
+	// entirely: on the plain mux to the dashboard's Basic Auth 401, and
+	// on interceptedMux to PassthroughToReal (this gateway's own local
+	// key sent to the REAL api.anthropic.com, a guaranteed 401 there).
+	mux.HandleFunc("/api/organizations/{id}", handleOrganizationsCurrentJSON)
 	mux.HandleFunc("/api/claude_code/policy_limits", handlePolicyLimitsJSON)
 	mux.HandleFunc("/api/organization/claude_code_first_token_date", handleFirstTokenDateJSON)
+	// An audit caught only the singular "organization" form was ever
+	// registered — some CLI versions request the plural
+	// "organizations" form instead.
+	mux.HandleFunc("/api/organizations/claude_code_first_token_date", handleFirstTokenDateJSON)
 
 	// Separate mux for TLS-intercepted anthropic.com/claude.ai traffic (see
 	// HandleConnectTunnel). This must NOT be the same mux as above: that one
@@ -674,8 +712,16 @@ func main() {
 	interceptedMux.Handle("/api/auth/current_user", commonAPIMiddleware(http.HandlerFunc(handleAuthCurrentUserJSON)))
 	interceptedMux.Handle("/api/organizations/current/billing", commonAPIMiddleware(http.HandlerFunc(handleBillingJSON)))
 	interceptedMux.Handle("/api/organizations/{id}/billing", commonAPIMiddleware(http.HandlerFunc(handleBillingJSON)))
+	// Same gaps fixed on the plain mux above (bare "/api/organizations/{id}"
+	// was never registered at all; only the singular "organization" form of
+	// the first-token-date endpoint existed) — the MITM-tunneled path needs
+	// both too, same reasoning: without them this fell through to
+	// PassthroughToReal, sending this gateway's own local key to the real
+	// api.anthropic.com for a guaranteed 401.
+	interceptedMux.Handle("/api/organizations/{id}", commonAPIMiddleware(http.HandlerFunc(handleOrganizationsCurrentJSON)))
 	interceptedMux.Handle("/api/claude_code/policy_limits", commonAPIMiddleware(http.HandlerFunc(handlePolicyLimitsJSON)))
 	interceptedMux.Handle("/api/organization/claude_code_first_token_date", commonAPIMiddleware(http.HandlerFunc(handleFirstTokenDateJSON)))
+	interceptedMux.Handle("/api/organizations/claude_code_first_token_date", commonAPIMiddleware(http.HandlerFunc(handleFirstTokenDateJSON)))
 	interceptedMux.Handle("/v1/embeddings", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleEmbeddings(cfgMgr, w, r)
 	})))
@@ -783,6 +829,43 @@ func main() {
 	}
 }
 
+// estimateInlineDataBytes sums the byte length of every base64 "data"
+// string that will actually become a Gemini inlineData part: image or
+// document content blocks (at the top level of a message, or nested
+// inside a tool_result's own content array) whose source.type is
+// "base64". A plain-text document/content source, or an unrelated "data"
+// key anywhere else in the request, never reaches inlineData and must
+// not count against its 20MB limit.
+func estimateInlineDataBytes(root gjson.Result) int {
+	total := 0
+	var walkBlocks func(blocks gjson.Result)
+	walkBlocks = func(blocks gjson.Result) {
+		if !blocks.IsArray() {
+			return
+		}
+		blocks.ForEach(func(_, block gjson.Result) bool {
+			switch block.Get("type").String() {
+			case "image", "document":
+				src := block.Get("source")
+				if src.Get("type").String() == "base64" {
+					total += len(src.Get("data").String())
+				}
+			case "tool_result":
+				c := block.Get("content")
+				if c.IsArray() {
+					walkBlocks(c)
+				}
+			}
+			return true
+		})
+	}
+	root.Get("messages").ForEach(func(_, msg gjson.Result) bool {
+		walkBlocks(msg.Get("content"))
+		return true
+	})
+	return total
+}
+
 func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
 	rid := nextReqID()
 	t0 := time.Now()
@@ -876,15 +959,20 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	// (above) is looser than Gemini's inlineData payload limit (20MB) —
 	// a request between 20-25MB passes our check but still 400s upstream
 	// once translated, instead of getting a clean, fast rejection here.
-	// Sum every base64 "data" field (image/document source blocks) as a
-	// proxy for total inlineData size.
-	var totalInlineDataBytes int
-	for _, p := range findPaths(string(bodyBytes), "data") {
-		if v := gjson.GetBytes(bodyBytes, p); v.Type == gjson.String {
-			totalInlineDataBytes += len(v.Str)
-		}
-	}
+	// An audit caught that summing EVERY JSON key literally named "data"
+	// anywhere in the whole request tree (findPaths has no concept of
+	// "is this actually base64 inlineData bound for Gemini") double-
+	// counted completely unrelated things against Gemini's inlineData
+	// budget: a plain-TEXT document's source.data (never becomes
+	// inlineData at all — translator.go decodes it straight to a text
+	// part), or any tool's own "data" argument key that happens to share
+	// the name. A large text attachment or an unrelated tool call could
+	// trip a false 413 that has nothing to do with the limit it's
+	// supposed to enforce. Walk only the specific shape that actually
+	// becomes inlineData: image/document content blocks (including ones
+	// nested inside a tool_result) whose source.type is "base64".
 	const maxInlineDataBytes = 20 * 1024 * 1024
+	totalInlineDataBytes := estimateInlineDataBytes(gjson.ParseBytes(bodyBytes))
 	if totalInlineDataBytes > maxInlineDataBytes {
 		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Combined size of inline image/document data exceeds the 20MB upstream limit")
 		return
@@ -893,6 +981,19 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		toolsArr := gjson.GetBytes(bodyBytes, "tools")
 		if !toolsArr.IsArray() || len(toolsArr.Array()) == 0 {
 			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "\"tool_choice\": provided without any \"tools\" declared")
+			return
+		}
+		// An audit caught that an invalid tool_choice.type (anything
+		// other than the spec's "auto"/"any"/"tool"/"none") was never
+		// rejected here, and translator.go's own switch over this same
+		// field has no default case either — an unrecognized type just
+		// matched nothing, silently falling back to Gemini's own AUTO
+		// instead of the hard 400 Anthropic's spec requires for a
+		// malformed value.
+		switch tc.Get("type").String() {
+		case "auto", "any", "tool", "none":
+		default:
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("\"tool_choice.type\": %q is not one of auto, any, tool, none", tc.Get("type").String()))
 			return
 		}
 		if tc.Get("type").String() == "tool" {
@@ -1296,6 +1397,17 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				} else if lastStatus == http.StatusForbidden {
 					globalAccountManager.MarkAccountCooldown(activeAcc.Email, 60*time.Minute)
 					globalSelector.UnstickAccount(activeAcc.Email)
+				} else if lastStatus == http.StatusUnauthorized {
+					// An audit caught this early-headers-sent branch was
+					// missing the SAME 401 case the below (pre-headers)
+					// branch already has — a revoked token discovered only
+					// AFTER the panic watchdog already committed early SSE
+					// headers to the client still left acc.AccessToken
+					// cached and un-invalidated, so the next request
+					// (possibly for the same conversation) reused and
+					// re-failed on the same dead token instead of forcing
+					// a genuine refresh.
+					globalAccountManager.InvalidateAccessToken(activeAcc.Email)
 				}
 			}
 			return
@@ -1362,11 +1474,20 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 // identical to one stuck re-reading the same files, since only the three
 // built-in names ever cleared the read-loop streak.
 func isModifyingToolName(name string) bool {
-	switch name {
-	case "Write", "Edit", "NotebookEdit":
+	lower := strings.ToLower(name)
+	// An audit caught this switch was case-sensitive against the exact
+	// Claude Code tool names, and missing other real editing tool names
+	// entirely (str_replace_editor — the Anthropic text-editor tool's own
+	// name in some SDK/tool-use contexts, and "update" as used by some
+	// clients). A model calling any of these in a different case (or
+	// using str_replace_editor/update) never counted as progress here,
+	// so LoopGuard's read-streak counter never reset after a real,
+	// successful edit — it could inject a stop-reading nudge immediately
+	// after the model just finished modifying the file it was reading.
+	switch lower {
+	case "write", "edit", "notebookedit", "str_replace_editor", "update":
 		return true
 	}
-	lower := strings.ToLower(name)
 	if !strings.HasPrefix(lower, "mcp__") {
 		return false
 	}
@@ -1797,7 +1918,24 @@ UpstreamReady:
 		// real Anthropic billing.
 		cachePrefixFrac = cacheBreakpointPrefixFraction(claudeBodyBytes)
 	}
-	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior, cachePrefixFrac, wantsSingleToolUse(claudeBodyBytes), reverseToolNameMap)
+	// An audit caught that stop_sequences was translated into Gemini's
+	// generationConfig.stopSequences (translator.go) but never carried
+	// through to the response side at all — when the model actually
+	// stopped on one, Gemini's finishReason is just "STOP" (it doesn't
+	// distinguish a natural end from a stop-sequence match the way
+	// Anthropic's own API does), so this always reported
+	// stop_reason:"end_turn" and stop_sequence:null, leaving a client
+	// that branches on stop_reason=="stop_sequence" waiting forever for
+	// a continuation that was never coming.
+	var stopSequences []string
+	if seqs := gjson.GetBytes(claudeBodyBytes, "stop_sequences"); seqs.IsArray() {
+		for _, s := range seqs.Array() {
+			if s.Type == gjson.String {
+				stopSequences = append(stopSequences, s.String())
+			}
+		}
+	}
+	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior, cachePrefixFrac, wantsSingleToolUse(claudeBodyBytes), reverseToolNameMap, stopSequences)
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	if err != nil {
@@ -1826,12 +1964,13 @@ UpstreamReady:
 	// check lines 100-200 to be sure...") wiped the loop-detection window
 	// on every single read-loop turn purely by being verbose, which is
 	// exactly the chatty-but-stuck pattern this guard exists to catch.
+	realProgress := madeProgress // genuine Write/Edit only, before the text-length credit below
 	if readCount == 0 && !madeProgress {
 		madeProgress = streamer.textChars > 200
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
 	readWindowSize, _ := readLoopLimits(agentKey, !isPlanModeRequest(claudeBodyBytes))
-	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress, readWindowSize)
+	globalLoopGuard.RecordReadTurnWithRealProgress(loopKey, readCount, madeProgress, realProgress, readWindowSize)
 
 	hasIgnoreTag := strings.Contains(streamer.lastText, OscIgnoreTag)
 	globalLoopGuard.RecordToolCalls(loopKey, streamer.toolCallSignatures, hasIgnoreTag)
@@ -2204,6 +2343,20 @@ func executeNonStreaming(
 						claudeResp["content"] = append([]map[string]interface{}{block}, contentBlocks...)
 					}
 				} else if t := p.Get("text").String(); t != "" {
+					if len(toolsCalled) > 0 {
+						// An audit caught that nothing here stopped a
+						// trailing text part (after a functionCall
+						// already appeared earlier in this same
+						// response) from being appended as a text block
+						// AFTER the tool_use block — Anthropic's spec
+						// requires tool_use to be the LAST content block
+						// whenever stop_reason ends up "tool_use", and a
+						// strict client reading content[length-1] as the
+						// tool call breaks if a text block follows it.
+						// Drop it instead, matching sse.go's streaming
+						// path.
+						continue
+					}
 					claudeResp["content"] = append(claudeResp["content"].([]map[string]interface{}), map[string]interface{}{
 						"type": "text",
 						"text": t,
@@ -2231,6 +2384,17 @@ func executeNonStreaming(
 					if argsRaw == "" || argsRaw == "null" {
 						argsRaw = "{}"
 					}
+					// An audit caught that this called RepairEditToolCall
+					// on argsRaw BEFORE unwrapping a double-encoded JSON
+					// string (sse.go's streaming path does it in the
+					// opposite, correct order) — Gemini occasionally
+					// emits args as a STRING containing escaped JSON
+					// rather than a plain object, and RepairEditToolCall's
+					// sjson/gjson field lookups (old_string/new_string/
+					// file_path) find nothing at all against an opaque
+					// string blob, silently skipping the repair entirely.
+					// Unwrap first, matching sse.go.
+					argsRaw = normalizeToolCallArgsToObject(fname, argsRaw)
 					argsRaw = coerceNumericEnumArgs(fname, argsRaw)
 					if repairedArgs, ok := RepairEditToolCall(fname, argsRaw, cwdKey); ok {
 						argsRaw = repairedArgs
@@ -2278,7 +2442,22 @@ func executeNonStreaming(
 						// object. Any other non-object primitive (bare
 						// string, number, bool, array) is coerced the same
 						// way rather than passed through.
-						argsObj = map[string]interface{}{}
+						//
+						// An audit caught that a bare string specifically
+						// (Gemini emitting args:"git status" instead of
+						// args:{"command":"git status"}) silently lost the
+						// model's actual argument this way instead of being
+						// mapped onto the tool's one obvious primary string
+						// parameter, same fix as sse.go's streaming path.
+						if s, ok := argsObj.(string); ok {
+							if param, ok := toolPrimaryStringParam[strings.ToLower(fname)]; ok {
+								argsObj = map[string]interface{}{param: s}
+							} else {
+								argsObj = map[string]interface{}{}
+							}
+						} else {
+							argsObj = map[string]interface{}{}
+						}
 					}
 					toolsCalled = append(toolsCalled, fname)
 					toolCallSignatures = append(toolCallSignatures, fmt.Sprintf("%s:%s", fname, argsRaw))
@@ -2339,6 +2518,25 @@ func executeNonStreaming(
 		}
 	}
 
+	// Same recovery as sse.go's streaming FinishStream — Gemini's
+	// finishReason for "stopped because it hit a client-requested
+	// stop_sequence" is identical to a normal end ("STOP"), so without
+	// this stop_reason stayed "end_turn" and stop_sequence stayed nil
+	// even when the model's own output clearly ends with one of the
+	// requested sequences.
+	if claudeResp["stop_reason"] == "end_turn" {
+		if seqs := gjson.GetBytes(claudeBodyBytes, "stop_sequences"); seqs.IsArray() {
+			for _, seqResult := range seqs.Array() {
+				seq := seqResult.String()
+				if seq != "" && strings.HasSuffix(lastText, seq) {
+					claudeResp["stop_reason"] = "stop_sequence"
+					claudeResp["stop_sequence"] = seq
+					break
+				}
+			}
+		}
+	}
+
 	if hasSafeguards {
 		toolUsesMap := make(map[string]interface{})
 		for _, tid := range toolCallIDs {
@@ -2371,12 +2569,13 @@ func executeNonStreaming(
 			madeProgress = true
 		}
 	}
+	realProgress := madeProgress // genuine Write/Edit only, before the text-length credit below
 	if readCount == 0 && !madeProgress {
 		madeProgress = textChars > 200
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
 	readWindowSize, _ := readLoopLimits(agentKey, !isPlanModeRequest(claudeBodyBytes))
-	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress, readWindowSize)
+	globalLoopGuard.RecordReadTurnWithRealProgress(loopKey, readCount, madeProgress, realProgress, readWindowSize)
 	hasIgnoreTag := strings.Contains(lastText, OscIgnoreTag)
 	globalLoopGuard.RecordToolCalls(loopKey, toolCallSignatures, hasIgnoreTag)
 
@@ -2477,6 +2676,15 @@ func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Req
 		"input_tokens": estTokens,
 	}
 	b, _ := json.Marshal(resp)
+	// An audit caught this endpoint never called applyRateLimitHeaders
+	// at all (no anthropic-ratelimit-* headers, no organization/workspace
+	// ID) — every OTHER successful response sets these, and client-side
+	// quota-tracking tooling that expects them on every response broke
+	// specifically on count_tokens. No AccountRecord was ever selected
+	// for this endpoint (it's a pure local estimate), so pass nil — the
+	// function already has a synthetic-but-stable fallback for exactly
+	// that case.
+	applyRateLimitHeaders(w.Header(), nil, gjson.GetBytes(bodyBytes, "model").String())
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(b)
 }
@@ -2500,12 +2708,24 @@ var knownModels = []map[string]interface{}{
 	{"id": "claude-3-7-sonnet-20250219", "type": "model", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 	{"id": "claude-3-7-sonnet-latest", "type": "model", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 	{"id": "claude-3-opus-20240229", "type": "model", "display_name": "Claude 3 Opus", "created_at": "2024-02-29T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 4096, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
+	{"id": "claude-3-opus-latest", "type": "model", "display_name": "Claude 3 Opus", "created_at": "2024-02-29T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 4096, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
 	{"id": "claude-opus-4-6-thinking", "type": "model", "display_name": "Claude Opus 4.6 Thinking", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 	{"id": "claude-sonnet-4-6", "type": "model", "display_name": "Claude Sonnet 4.6", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 	{"id": "claude-opus-5-5", "type": "model", "display_name": "Claude Opus 5.5", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 128000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 	{"id": "claude-sonnet-5-5", "type": "model", "display_name": "Claude Sonnet 5.5", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 128000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 	{"id": "claude-haiku-5-5", "type": "model", "display_name": "Claude Haiku 5.5", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 	{"id": "claude-fable-5-1", "type": "model", "display_name": "Claude Fable 5.1", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 128000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	// An audit caught that Claude Code's Agent/Task tool can request a
+	// subagent model by its bare alias ("haiku", "sonnet", "opus",
+	// "fable", "mythos" — no "claude-" prefix; tiering.go already maps
+	// these to a real Gemini target, see ResolveTieringAndEffort), but
+	// GET /v1/models/{alias} only ever matched a full canonical id,
+	// 404ing on the exact short names Claude Code itself sends.
+	{"id": "haiku", "type": "model", "display_name": "Claude Haiku (alias)", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
+	{"id": "sonnet", "type": "model", "display_name": "Claude Sonnet (alias)", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "opus", "type": "model", "display_name": "Claude Opus (alias)", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "fable", "type": "model", "display_name": "Claude Fable (alias)", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "mythos", "type": "model", "display_name": "Claude Mythos (alias)", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 }
 
 // allModels merges the static Claude-alias/canonical-Gemini-name list with
@@ -2959,6 +3179,13 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 const (
 	fakeOrgID       = "0bad747f-0000-4000-a000-000000000000"
 	fakeWorkspaceID = "wrkspc_0000000000000000000000000"
+	// An audit caught that several hardcoded CLI-spoof responses used
+	// this SAME org UUID for the account/user object too — real Claude
+	// clients can cache fetched objects keyed by UUID, so a client
+	// fetching "account" and "organization" back to back saw identical
+	// UUIDs for two conceptually different entities, risking one
+	// overwriting the other's cached fields.
+	fakeAccountID = "0bad747f-0000-4000-a000-000000000001"
 )
 
 func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {

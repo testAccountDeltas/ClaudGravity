@@ -63,18 +63,30 @@ var DropSearchTools = map[string]bool{
 // notebookedit) tool_use answered by a tool_result with is_error:true —
 // the earliest point this gateway can see that outcome at all, since the
 // client only reports it on its NEXT request.
-func lastTurnHadFailedEdit(reqMap map[string]interface{}) bool {
+//
+// An audit caught that this only ever returned a single bool, which the
+// caller fed straight into RecordEditResult as "isError" — a turn with NO
+// edit at all (e.g. the model called Read to re-check context after a
+// failed edit, a common and reasonable thing to do) returned false here
+// exactly like a turn whose edit actually SUCCEEDED, and RecordEditResult
+// treats "not isError" as "reset the streak to 0". So Edit(fail) -> Read
+// -> Edit(fail) never reached the 3-failure threshold: the interposed
+// Read silently erased the first failure's count instead of leaving it
+// untouched. Returning whether an edit happened AT ALL, separately from
+// whether it failed, lets the caller leave the streak alone on a non-edit
+// turn instead of treating it as a reset.
+func lastTurnHadFailedEdit(reqMap map[string]interface{}) (hadEdit bool, failed bool) {
 	msgsRaw, ok := reqMap["messages"].([]interface{})
 	if !ok || len(msgsRaw) < 2 {
-		return false
+		return false, false
 	}
 	last, ok := msgsRaw[len(msgsRaw)-1].(map[string]interface{})
 	if !ok || last["role"] != "user" {
-		return false
+		return false, false
 	}
 	prev, ok := msgsRaw[len(msgsRaw)-2].(map[string]interface{})
 	if !ok || prev["role"] != "assistant" {
-		return false
+		return false, false
 	}
 
 	editToolIDs := make(map[string]bool)
@@ -94,7 +106,7 @@ func lastTurnHadFailedEdit(reqMap map[string]interface{}) bool {
 		}
 	}
 	if len(editToolIDs) == 0 {
-		return false
+		return false, false
 	}
 
 	if blocks, ok := last["content"].([]interface{}); ok {
@@ -104,13 +116,16 @@ func lastTurnHadFailedEdit(reqMap map[string]interface{}) bool {
 				continue
 			}
 			tid, _ := b["tool_use_id"].(string)
-			isErr, _ := b["is_error"].(bool)
-			if isErr && editToolIDs[tid] {
-				return true
+			if !editToolIDs[tid] {
+				continue
+			}
+			hadEdit = true
+			if isErr, _ := b["is_error"].(bool); isErr {
+				failed = true
 			}
 		}
 	}
-	return false
+	return hadEdit, failed
 }
 
 // isAllHexDigits backs the toolu_<name>_<nanots>_<seq> id-recovery parse in
@@ -198,6 +213,22 @@ func stripBase64Whitespace(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// stripDataURIPrefix strips a leading "data:<mime>;base64," prefix if
+// present, returning only the base64 payload after the comma. Anthropic's
+// own API never puts the prefix in a source block's "data" field (just the
+// raw base64), but some clients mistakenly pass the full data: URI through
+// anyway, which breaks every base64 decoder downstream outright since the
+// prefix text itself isn't valid base64.
+func stripDataURIPrefix(s string) string {
+	if !strings.HasPrefix(s, "data:") {
+		return s
+	}
+	if idx := strings.Index(s, ";base64,"); idx != -1 {
+		return s[idx+len(";base64,"):]
+	}
+	return s
 }
 
 // sanitizeGeminiFunctionName rewrites a tool name to satisfy Gemini's
@@ -336,9 +367,11 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		InjectUserNudge(reqMap, NudgeOscillation)
 		LogGateway(".. tool-call oscillation [%s] -> injecting loop-nudge", loopKey)
 	}
-	if editFailStreak := globalLoopGuard.RecordEditResult(loopKey, lastTurnHadFailedEdit(reqMap)); editFailStreak >= 3 {
-		InjectUserNudge(reqMap, NudgeEditFailureLoop)
-		LogGateway(".. %d consecutive Edit failures [%s] -> injecting edit-failure-loop nudge", editFailStreak, loopKey)
+	if hadEdit, editFailed := lastTurnHadFailedEdit(reqMap); hadEdit {
+		if editFailStreak := globalLoopGuard.RecordEditResult(loopKey, editFailed); editFailStreak >= 3 {
+			InjectUserNudge(reqMap, NudgeEditFailureLoop)
+			LogGateway(".. %d consecutive Edit failures [%s] -> injecting edit-failure-loop nudge", editFailStreak, loopKey)
+		}
 	}
 
 	// 3. Final graph validation after any loop-guard nudges
@@ -474,11 +507,36 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							// type for model role". Swap it for a text
 							// placeholder instead of silently producing an
 							// upstream 400.
-							mt := p.Get("source.media_type").String()
-							part := `{"text":""}`
-							part, _ = sjson.Set(part, "text", "[Assistant output "+ptype+": "+mt+"]")
-							partsJSON = append(partsJSON, part)
-							return true
+							//
+							// An audit caught that this fired unconditionally
+							// for EVERY "image"/"document" block in an
+							// assistant turn, including genuinely TEXT
+							// documents (source.type == "text"/"content", or
+							// base64 with a text-ish media_type like
+							// text/plain or text/markdown) — those decode to
+							// a plain "text" part below, which Gemini allows
+							// fine in the model role; only the actual binary
+							// cases (an image, or a base64 PDF/image) need
+							// the placeholder swap. Replacing a generated
+							// code file's full content with a one-line
+							// placeholder destroyed the model's own prior
+							// output from history for no reason.
+							srcTypePeek := p.Get("source.type").String()
+							mtPeek := strings.ToLower(p.Get("source.media_type").String())
+							isBinary := ptype == "image"
+							if ptype == "document" && srcTypePeek == "base64" {
+								effectiveMT := mtPeek
+								if effectiveMT == "" {
+									effectiveMT = "application/pdf"
+								}
+								isBinary = effectiveMT == "application/pdf" || strings.HasPrefix(effectiveMT, "image/")
+							}
+							if isBinary {
+								part := `{"text":""}`
+								part, _ = sjson.Set(part, "text", "[Assistant output "+ptype+": "+mtPeek+"]")
+								partsJSON = append(partsJSON, part)
+								return true
+							}
 						}
 						if ptype == "document" {
 							// An audit caught that Anthropic's document
@@ -542,9 +600,22 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 								// reasonable default than erroring outright.
 								mediaType = "image/png"
 							}
-							b64Data := src.Get("data").String()
+							// An audit caught two gaps here: (1) a client
+							// sending the FULL data URI ("data:image/png;
+							// base64,AAAA...") in the "data" field instead
+							// of just the base64 payload breaks any base64
+							// decoder outright — strip that prefix if
+							// present; (2) image/svg+xml matched
+							// strings.HasPrefix(mediaType, "image/") and
+							// got routed to inlineData, but SVG is XML
+							// TEXT, not a real raster/vector type Gemini's
+							// inlineData accepts — it rejects it with
+							// "Invalid mimeType: image/svg+xml". Decode it
+							// as text instead, same as any other text-ish
+							// base64 document.
+							b64Data := stripDataURIPrefix(src.Get("data").String())
 							if b64Data != "" {
-								if mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/") {
+								if mediaType != "image/svg+xml" && (mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/")) {
 									part := `{"inlineData":{"mimeType":"","data":""}}`
 									part, _ = sjson.Set(part, "inlineData.mimeType", mediaType)
 									// An audit caught that decodeBase64Loose
@@ -648,6 +719,26 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						if sig == "" {
 							sig = "skip_thought_signature_validator"
 						}
+						if role != "assistant" {
+							// An audit caught that this unconditionally
+							// emitted a functionCall regardless of the
+							// enclosing message's role — Anthropic's own
+							// spec only ever puts tool_use in an assistant
+							// turn, but a malformed/replayed/third-party
+							// client sending one inside a USER message
+							// still produced "role":"user" with a
+							// functionCall part, which Gemini's protobuf
+							// validator rejects outright ("functionCall is
+							// only supported for model role"), 400ing the
+							// WHOLE request instead of just degrading this
+							// one odd block. Fall back to a text summary
+							// instead of a part type Gemini will never
+							// accept in this role.
+							part := `{"text":""}`
+							part, _ = sjson.Set(part, "text", "[tool_use in unexpected role: "+name+"]")
+							partsJSON = append(partsJSON, part)
+							return true
+						}
 						part := `{"thoughtSignature":"","functionCall":{"name":"","args":{}}}`
 						part, _ = sjson.Set(part, "thoughtSignature", sig)
 						// An audit caught that sanitizeGeminiFunctionName
@@ -668,6 +759,23 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						partsJSON = append(partsJSON, part)
 
 					case "tool_result":
+						if role != "user" {
+							// An audit caught the same role-inversion gap
+							// as tool_use above, for the opposite
+							// direction: Anthropic's spec only puts
+							// tool_result in a USER turn, but a
+							// malformed/replayed tool_result inside an
+							// ASSISTANT message still unconditionally
+							// produced a functionResponse part under
+							// "role":"model" — which Gemini rejects
+							// outright (functionResponse is only valid in
+							// the user/function-response role), 400ing the
+							// whole request.
+							part := `{"text":""}`
+							part, _ = sjson.Set(part, "text", "[tool_result in unexpected role]")
+							partsJSON = append(partsJSON, part)
+							return true
+						}
 						toolUseID := p.Get("tool_use_id").String()
 						fnName := toolIDToName[toolUseID]
 						if fnName == "" {
@@ -741,6 +849,19 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 									// Previously dropped entirely (only "text"
 									// blocks were read), silently losing any
 									// screenshot/plot/PDF a tool returned.
+									// An audit caught that title/context
+									// metadata was handled for a top-level
+									// message's document block but ignored
+									// here — a tool returning a named/
+									// described document lost that label,
+									// leaving the model with no name to
+									// connect its analysis to.
+									if title := item.Get("title").String(); title != "" {
+										sb.WriteString("[Attached Document: \"" + title + "\"]\n")
+									}
+									if docContext := item.Get("context").String(); docContext != "" {
+										sb.WriteString("[Context: " + docContext + "]\n")
+									}
 									src := item.Get("source")
 									switch src.Get("type").String() {
 									case "base64":
@@ -750,7 +871,12 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 										// missed both checks and got wrapped
 										// as invalid-UTF-8 "text".
 										mediaType := strings.ToLower(src.Get("media_type").String())
-										data := src.Get("data").String()
+										// Same two gaps as the top-level
+										// content-block path: a full data:
+										// URI instead of a raw base64 payload,
+										// and image/svg+xml (XML text, not a
+										// real inlineData-compatible type).
+										data := stripDataURIPrefix(src.Get("data").String())
 										if mediaType == "" && data != "" {
 											// Same missing-media_type default as
 											// the top-level content-block path
@@ -766,7 +892,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 											}
 										}
 										if mediaType != "" && data != "" {
-											if mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/") {
+											if mediaType != "image/svg+xml" && (mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/")) {
 												imgPart := `{"inlineData":{"mimeType":"","data":""}}`
 												imgPart, _ = sjson.Set(imgPart, "inlineData.mimeType", mediaType)
 												imgPart, _ = sjson.Set(imgPart, "inlineData.data", stripBase64Whitespace(data))
@@ -1029,6 +1155,19 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// the function by its sanitized one.
 	reverseToolNameMap := make(map[string]string)
 	sentToolNames := make(map[string]string) // original name -> sanitized (Gemini-bound) name
+	// An audit caught that tool_choice:{"type":"tool","name":"Grep"} with
+	// strip_search_tools enabled (the default) silently did nothing: Grep
+	// never reached sentToolNames (stripped below before that point), so
+	// the tool_choice handling further down found no match and skipped
+	// setting toolConfig entirely — Gemini fell back to its own AUTO mode
+	// and answered with plain text, violating the client's explicit
+	// forced-tool-use request. A client naming a tool via tool_choice has
+	// already said it specifically needs that exact tool; honor it over
+	// the strip_search_tools default instead of silently ignoring both.
+	forcedToolName := ""
+	if tc := root.Get("tool_choice"); tc.Get("type").String() == "tool" {
+		forcedToolName = tc.Get("name").String()
+	}
 	if tools := root.Get("tools"); tools.IsArray() {
 		var decls []string
 		hasWebSearch := false
@@ -1053,7 +1192,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				// check below never actually fired either way.
 				return true
 			}
-			if tenant.StripSearchTools && DropSearchTools[name] {
+			if tenant.StripSearchTools && DropSearchTools[name] && name != forcedToolName {
 				return true
 			}
 			desc := t.Get("description").String()
@@ -1198,17 +1337,26 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// (hasMeta && !modelMeta.Thinking) skips it — an unrecognized model
 	// still gets the existing best-effort behavior, same as before.
 	if !hasMeta || modelMeta.Thinking {
+		// An audit caught the MinThinkingBudget floor below only applied
+		// inside the budget>0 branch — a model whose thinking genuinely
+		// can't be disabled at all (e.g. Gemini 2.5 Pro has a non-zero
+		// floor) still got an explicit thinkingBudget:0 whenever budget
+		// resolved to exactly 0 (the standard Anthropic "thinking":
+		// {"type":"disabled"} request, or any tiering decision landing
+		// on 0), which Google rejects with "Thinking is not supported
+		// for this model" / INVALID_ARGUMENT just the same as sending no
+		// thinkingConfig at all would for a model that requires it.
+		// Apply the floor whenever a non-negative budget is about to be
+		// sent, not just a strictly positive one.
+		if budget >= 0 && hasMeta && modelMeta.MinThinkingBudget > 0 && budget < modelMeta.MinThinkingBudget {
+			budget = modelMeta.MinThinkingBudget
+		}
 		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.includeThoughts", budget != 0)
-		if budget > 0 {
-			if hasMeta && modelMeta.MinThinkingBudget > 0 && budget < modelMeta.MinThinkingBudget {
-				budget = modelMeta.MinThinkingBudget
-			}
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", budget)
-		} else if budget < 0 {
+		if budget < 0 {
 			// -1 enables ModeAuto unbracketed
 			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", -1)
 		} else {
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", 0)
+			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", budget)
 		}
 	}
 

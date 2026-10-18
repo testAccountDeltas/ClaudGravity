@@ -26,7 +26,19 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 	// other investigation-only subagent with no edit/write tools, by
 	// convention named the same way) gets the auxiliary-style cheap tier
 	// treatment below instead.
-	isLightweightSubagent := strings.EqualFold(agentKey, "sub:Explore")
+	// An audit caught this only ever matched "sub:Explore" literally —
+	// other read-only, investigation-only subagent types (doc lookup,
+	// trivial config edits, a read-only transcript scan) got the SAME
+	// heavy ModeAuto/unlimited-thinking treatment as a full Opus-class
+	// coding subagent, for the same reason Explore originally needed
+	// this fix. Scoped to the specific known-lightweight types rather
+	// than "any subagent", since most subagent types (general-purpose,
+	// code-reviewer, etc.) genuinely do need full reasoning capacity.
+	isLightweightSubagent := false
+	switch strings.ToLower(agentKey) {
+	case "sub:explore", "sub:claude-code-guide", "sub:statusline-setup", "sub:fewer-permission-prompts":
+		isLightweightSubagent = true
+	}
 
 	// 1. Explicit native models preservation
 	if model == "claude-sonnet-4-6" || model == "claude-opus-4-6-thinking" || model == "gpt-oss-120b-medium" {
@@ -151,7 +163,24 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 		}
 	} else {
 		// Non-tiered models thinking budget
-		if reqClass == "auxiliary" || isLightweightSubagent {
+		//
+		// An audit caught two related gaps for Haiku (gemini-2.5-flash),
+		// whose whole point is a fast, cheap, thinking-free response:
+		// (1) the auxiliary/lightweight-subagent branch below ran
+		// UNCONDITIONALLY and forced budget=2048 even for Haiku, before
+		// the switch's own Haiku zero-budget default case ever got a
+		// chance to run; (2) Claude Code's CLAUDE_CODE_EFFORT_LEVEL env
+		// var (read client-side, arriving here as output_config.effort)
+		// is a GLOBAL default applied to every model including Haiku —
+		// "medium"/"low" land straight in the switch's explicit case
+		// branches, never reaching the Haiku-specific default either.
+		// Only a clear, deliberate high-effort escalation (xhigh/max/
+		// ultracode) is still honored for Haiku; that's unlikely to be a
+		// mere inherited global default and more likely a genuine ask
+		// for Haiku to actually reason hard on this one call.
+		if model == "gemini-2.5-flash" && effort != "xhigh" && effort != "max" && effort != "ultracode" {
+			budget = 0
+		} else if reqClass == "auxiliary" || isLightweightSubagent {
 			budget = 2048
 		} else {
 			switch effort {
@@ -170,14 +199,6 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 					budget = 2048
 				} else if strings.HasSuffix(model, "-medium") {
 					budget = 8192
-				} else if model == "gemini-2.5-flash" {
-					// Haiku's whole point is a fast, cheap response — none
-					// of the suffix checks above match this model name, so
-					// it fell through to the outer "budget := 8192" default
-					// set at the top of this function, forcing a medium
-					// thinking pass (and its latency/cost) onto every
-					// Haiku request that doesn't explicitly ask for one.
-					budget = 0
 				}
 			}
 		}

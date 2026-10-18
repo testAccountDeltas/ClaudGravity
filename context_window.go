@@ -10,6 +10,18 @@ import (
 // not the real tokenizer Google uses.
 const contextSafetyMarginTokens = 2000
 
+// minPDFTokenFloor is the minimum token estimate ever returned for a PDF
+// (or unrecognized-media_type, defaulted-to-PDF) base64 document, shared
+// with token_estimator.go. An audit caught these two files had previously
+// disagreed on this floor (2500 here vs. 1600 there) despite both existing
+// for the exact same reason — a safety-conservative minimum for Gemini's
+// real per-page PDF billing, which this gateway doesn't parse page counts
+// for. Two different floors for the same approximation was never a
+// deliberate choice, just drift; use the more conservative (higher) of the
+// two, since underestimating a PDF's cost risks overflowing the real
+// upstream context window, which is the worse failure mode.
+const minPDFTokenFloor = 2500
+
 // conservativeTokenEstimate deliberately ignores token_estimator.go's
 // character-class weighting (optimized for realistic prose, ~4.5 chars/
 // token for plain ASCII) and instead uses a flat, pessimistic 2 chars/token.
@@ -40,6 +52,27 @@ func conservativeTokenEstimate(v interface{}) int {
 				if !isMap {
 					continue
 				}
+				total += blockTokenEstimate(bMap)
+				counted = true
+			}
+			if counted {
+				return total
+			}
+		}
+		// An audit caught that sanitizer.go normalizes message content
+		// into the concrete type []map[string]interface{} (not
+		// []interface{}) as part of its own processing — a message
+		// passed through THIS form (the common case, since truncation
+		// runs after sanitization) missed the per-block path above
+		// entirely and fell through to the flat len(json)/2 estimate on
+		// the WHOLE message, pricing a 3MB attached image at ~1.5M
+		// "tokens" instead of the ~1600 blockTokenEstimate would give it
+		// — reintroducing, via this second concrete type, the exact
+		// image-overcount bug this function exists to prevent.
+		if blocks, isList := m["content"].([]map[string]interface{}); isList {
+			total := 0
+			counted := false
+			for _, bMap := range blocks {
 				total += blockTokenEstimate(bMap)
 				counted = true
 			}
@@ -107,6 +140,22 @@ func blockTokenEstimate(bMap map[string]interface{}) int {
 				// to enforce, since its true size was never measured.
 				return flatTokenEstimate(contentSourceTextFromBlockMap(src["content"]))
 			}
+			if src["type"] == "url" {
+				// An audit caught that a url-sourced document (no "data"
+				// field) fell through every branch below to the generic
+				// 2500-token floor — but translator.go doesn't actually
+				// fetch and attach the URL's real content at all; it
+				// replaces the whole block with a short
+				// "[Attached by URL: <url>]" text placeholder. The real
+				// cost scales with the URL string's own length, not a
+				// flat 2500 — that floor was meant for "we genuinely
+				// don't know the size," not this case, where the real
+				// size IS known (it's tiny).
+				if u, ok := src["url"].(string); ok {
+					return flatTokenEstimate("[Attached by URL: " + u + "]")
+				}
+				return flatTokenEstimate("[Attached by URL: ]")
+			}
 			if dataStr, isStr := src["data"].(string); isStr {
 				if src["type"] == "base64" {
 					// An audit caught that fmt.Sprint on a missing
@@ -127,8 +176,8 @@ func blockTokenEstimate(bMap map[string]interface{}) int {
 					}
 					if mediaType == "application/pdf" || mediaType == "" {
 						est := len(dataStr) / 500
-						if est < 2500 {
-							return 2500
+						if est < minPDFTokenFloor {
+							return minPDFTokenFloor
 						}
 						return est
 					}
