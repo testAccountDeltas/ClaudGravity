@@ -585,7 +585,13 @@ func PassthroughToReal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy error", http.StatusBadGateway)
 		return
 	}
-	outReq, err := http.NewRequest(r.Method, target.String(), bytes.NewReader(bodyBytes))
+	// An audit caught that plain http.NewRequest defaults the outbound
+	// request's context to context.Background(), never linked to r's own
+	// context — if the original client disconnects mid-request, this
+	// passthrough fetch to the real Anthropic API had no way to find out
+	// and kept running to completion regardless, wasting the outbound
+	// connection and any real API quota for a response nobody will read.
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), bytes.NewReader(bodyBytes))
 	if err != nil {
 		http.Error(w, "proxy error", http.StatusBadGateway)
 		return
@@ -728,6 +734,11 @@ func HandleBootstrapSpoof(w http.ResponseWriter, r *http.Request) {
 			{"api_name": "claude-3-5-haiku-20241022", "entitled": true},
 			{"api_name": "claude-3-5-haiku-latest", "entitled": true},
 			{"api_name": "claude-3-opus-20240229", "entitled": true},
+			// An audit caught this list had the dated id but not the
+			// "-latest" alias, while server.go's /v1/models catalog has
+			// both — a client pinned specifically to "claude-3-opus-latest"
+			// saw it listed as a real model but not entitled here.
+			{"api_name": "claude-3-opus-latest", "entitled": true},
 			{"api_name": "gpt-oss-120b-medium", "entitled": true},
 		},
 	}
@@ -784,6 +795,14 @@ func (w *MitmResponseWriter) sendHeaders(chunked bool) {
 	w.chunked = chunked
 	if chunked {
 		w.header.Set("Transfer-Encoding", "chunked")
+		// An audit caught that a Content-Length header copied from the
+		// original upstream response (before this handler decided to
+		// stream the body chunked instead) could still be sitting in
+		// w.header here — RFC 7230 §3.3.2 forbids sending both
+		// Transfer-Encoding and Content-Length on the same response, and
+		// strict HTTP/1.1 parsers (Node.js/Bun, which Claude Code's CLI
+		// runs on) reject the whole response over it.
+		w.header.Del("Content-Length")
 	} else if w.statusCode == http.StatusNoContent {
 		// An audit caught this unconditionally set Content-Length (to 0,
 		// since a 204 body is always empty) — RFC 7230 §3.3.2 says a

@@ -194,7 +194,13 @@ func dedupedRepeatedReads(newMsgs []map[string]interface{}) bool {
 // such as "[Called tool exec_command with input {...}]" which confuse models
 // into generating tool invocations as raw text instead of structured JSON calls.
 func StripPollutedToolCallText(content string) string {
-	if !strings.Contains(content, "[Called tool") && !strings.Contains(content, "[called tool") {
+	// An audit caught that pollutedToolCallTextPattern itself is
+	// case-insensitive ((?i)), but this fast-path pre-check (a perf
+	// optimization to skip running the regex on ordinary text) only
+	// tested two exact-case substrings — a third casing variant (e.g.
+	// "[CALLED TOOL ...]") failed both checks and never reached the
+	// case-insensitive regex at all, silently leaving the pollution in.
+	if !strings.Contains(strings.ToLower(content), "[called tool") {
 		return content
 	}
 	cleaned := pollutedToolCallTextPattern.ReplaceAllString(content, "")
@@ -287,7 +293,18 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 	// leaving the real system instruction sitting in the message body after
 	// "Continue." instead of actually reaching Gemini's systemInstruction —
 	// extract it into the real system field first.
-	if first, ok := msgsList[0].(map[string]interface{}); ok && first["role"] == "system" {
+	// An audit caught this only ever checked msgsList[0] ONCE — a client
+	// sending multiple CONSECUTIVE leading system-role messages (e.g.
+	// messages[0] and messages[1] both role:"system") only had the first
+	// extracted; the second one became the new msgsList[0] after the
+	// slice below but was never re-checked, leaving a stray role:"system"
+	// message that nothing downstream knows how to translate (Gemini only
+	// has user/model). Loop while the new head is still role:"system".
+	for len(msgsList) > 0 {
+		first, ok := msgsList[0].(map[string]interface{})
+		if !ok || first["role"] != "system" {
+			break
+		}
 		// system can also be an array of blocks carrying its own
 		// cache_control — overwriting it outright with a plain string
 		// would silently discard that, so the array case appends a block
@@ -503,7 +520,6 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 
 	// Step 4: Tool Use / Result Graph Consistency
 	toolUsesSeen := make(map[string]bool)
-	toolResultsSeen := make(map[string]bool)
 
 	for _, m := range newMsgs {
 		role, _ := m["role"].(string)
@@ -525,13 +541,19 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 			// orphaned on Gemini's side. That part needs a translator.go
 			// fix outside this file's scope; this fixes sanitizer.go's
 			// own copy of the same blind spot.
+			//
+			// A follow-up audit caught a sibling map, toolResultsSeen,
+			// was written here but never read anywhere — the actual
+			// abandoned/orphaned-tool_use handling below computes its own
+			// more precise PER-TURN nextTurnResultIDs map (checking the
+			// immediately following turn specifically, as Gemini's
+			// functionCall/functionResponse pairing actually requires),
+			// making this global "seen anywhere in history" map genuinely
+			// vestigial. Removed rather than wired up to avoid duplicating
+			// (and potentially disagreeing with) that more precise check.
 			if bType == "tool_use" && role == "assistant" {
 				if id, ok := b["id"].(string); ok && id != "" {
 					toolUsesSeen[id] = true
-				}
-			} else if bType == "tool_result" {
-				if tid, ok := b["tool_use_id"].(string); ok && tid != "" {
-					toolResultsSeen[tid] = true
 				}
 			}
 		}

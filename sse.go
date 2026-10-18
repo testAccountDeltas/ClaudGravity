@@ -306,12 +306,18 @@ func (s *SSEStreamer) EnsureMessageStart() error {
 	// estimate and then ADDS message_delta's cache_creation on top,
 	// double-counting a turn-1 cache write by up to the full size of the
 	// cached prefix. Pre-simulate the same split here using the
-	// pre-stream estimate when this isn't already a cache-read turn
-	// (those two don't happen on the same turn), so a client that only
-	// reads message_start still gets numbers in the right ballpark
-	// instead of needing message_delta's correction at all.
+	// pre-stream estimate, so a client that only reads message_start
+	// still gets numbers in the right ballpark instead of needing
+	// message_delta's correction at all.
+	//
+	// A follow-up audit caught that this originally only applied when
+	// cachedEstimate was 0, on the assumption a cache-read turn and a
+	// cache-write turn are mutually exclusive — they aren't (a breakpoint
+	// from a prior turn can be read while a NEW breakpoint further into
+	// this turn's own fresh content also gets written), same fix already
+	// applied to the real (not just estimated) split in FinishStream.
 	cacheCreationEstimate := int64(0)
-	if cachedEstimate == 0 && s.cachePrefixFrac > 0 && uncachedEstimate > cacheCreationThreshold(s.model) {
+	if s.cachePrefixFrac > 0 && uncachedEstimate > cacheCreationThreshold(s.model) {
 		cacheCreationEstimate = int64(float64(uncachedEstimate) * s.cachePrefixFrac)
 		uncachedEstimate -= cacheCreationEstimate
 		if uncachedEstimate < 0 {
@@ -787,7 +793,15 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	// the prefix up to the breakpoint is actually written to cache, and
 	// the current turn's own new content after it should stay counted as
 	// plain input_tokens. s.cachePrefixFrac approximates that split.
-	if s.cacheTokens == 0 && uncachedInputTokens > cacheCreationThreshold(s.model) && s.cachePrefixFrac > 0 {
+	// A third audit caught that gating this strictly on s.cacheTokens ==
+	// 0 (same bug already fixed in server.go's non-streaming equivalent)
+	// blocked ANY cache-creation simulation on a turn that ALSO read
+	// from an existing cache breakpoint — reading an early breakpoint
+	// and writing a new one for additional fresh content later in the
+	// SAME turn are not mutually exclusive (e.g. a long tool-use loop
+	// where the system prompt is already cached and the turn also
+	// crosses a new breakpoint further into its own new content).
+	if uncachedInputTokens > cacheCreationThreshold(s.model) && s.cachePrefixFrac > 0 {
 		cacheCreationTokens = int64(float64(uncachedInputTokens) * s.cachePrefixFrac)
 		// In Anthropic's formula: Total prompt tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens.
 		// Tokens that created cache must NOT be counted in input_tokens as well, or SDKs double-count every token.

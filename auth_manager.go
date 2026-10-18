@@ -277,6 +277,21 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 		// "unsupported_grant_type"/"invalid_scope" (a bug in OUR request
 		// shape, not something retrying — or cooling down — this
 		// particular account fixes).
+		// An audit caught that an HTTP 429 from Google's OWN token
+		// endpoint (rate-limited, not this account's fault — no OAuth
+		// error body matches any of the strings below) fell straight
+		// through to the generic error return with no cooldown set at
+		// all, so the very next request routed to this account
+		// immediately retried the same refresh and likely hit another
+		// 429 right away. Same short negative cache as the network-error
+		// case above — long enough to stop hammering Google's rate
+		// limit, short enough not to meaningfully delay recovery.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			deadRefreshTokensMu.Lock()
+			deadRefreshTokens[email] = time.Now().Add(10 * time.Second)
+			deadRefreshTokensMu.Unlock()
+			return "", fmt.Errorf("refresh rate-limited (429): %s", string(bodyBytes))
+		}
 		oauthErr := gjson.GetBytes(bodyBytes, "error").String()
 		if oauthErr == "invalid_grant" || oauthErr == "invalid_request" || oauthErr == "unauthorized_client" || oauthErr == "invalid_client" {
 			deadRefreshTokensMu.Lock()
@@ -880,26 +895,39 @@ func (am *AccountManager) FetchAvailableModels(forceRefresh bool) ([]AvailableMo
 	}
 	globalModelCatalog.mu.RUnlock()
 
-	// Find any active account with a valid token
+	// An audit caught this used to pick only the FIRST eligible account
+	// and `break`, so a token-refresh failure for that one specific
+	// account (expired refresh token, a transient Google-side error)
+	// returned an error for the WHOLE model catalog even when other
+	// accounts in the pool had perfectly valid, refreshable tokens — a
+	// single bad account was a single point of failure for every
+	// caller's model list. Try each eligible account in turn instead.
 	accounts := am.GetAccounts()
 	var activeAcc *AccountRecord
+	var accToken string
+	var lastErr error
 	for _, a := range accounts {
-		if !a.Disabled && a.RefreshToken != "" {
-			activeAcc = a
-			break
+		if a.Disabled || a.RefreshToken == "" {
+			continue
 		}
+		tok := a.AccessToken
+		if tok == "" || time.Now().After(a.ExpiresAt) {
+			refreshed, err := am.RefreshAccessToken(a.Email)
+			if err != nil {
+				lastErr = fmt.Errorf("refresh token for %s: %w", a.Email, err)
+				continue
+			}
+			tok = refreshed
+		}
+		activeAcc = a
+		accToken = tok
+		break
 	}
 	if activeAcc == nil {
-		return nil, fmt.Errorf("no active Antigravity account available")
-	}
-
-	accToken := activeAcc.AccessToken
-	if accToken == "" || time.Now().After(activeAcc.ExpiresAt) {
-		tok, err := am.RefreshAccessToken(activeAcc.Email)
-		if err != nil {
-			return nil, fmt.Errorf("refresh token for %s: %w", activeAcc.Email, err)
+		if lastErr != nil {
+			return nil, lastErr
 		}
-		accToken = tok
+		return nil, fmt.Errorf("no active Antigravity account available")
 	}
 
 	req, err := http.NewRequest("POST", CloudCodeModelsEndpoint, bytes.NewReader([]byte("{}")))

@@ -217,6 +217,19 @@ func blockTokenEstimate(bMap map[string]interface{}, isLastAssistant bool) int {
 						}
 						return est
 					}
+					// An audit caught that a "document" block whose
+					// media_type is an image mimetype (image/png,
+					// image/jpeg, ...) fell into the branch below meant for
+					// base64 TEXT documents (code/logs/CSV) — the binary
+					// base64 payload got priced via decoded-text density
+					// instead of real pixel dimensions, inflating a 2MB
+					// image to ~750,000 "tokens" instead of ~1600 and
+					// triggering unnecessary aggressive history eviction.
+					// image/svg+xml is excluded since it's real XML text,
+					// not binary — translator.go sends it as text too.
+					if strings.HasPrefix(mediaType, "image/") && mediaType != "image/svg+xml" {
+						return estimateImageTokens(dataStr)
+					}
 					// For base64-encoded text documents (code, logs, CSVs), decode to raw text density:
 					decodedBytes := len(dataStr) * 3 / 4
 					est := decodedBytes / 2

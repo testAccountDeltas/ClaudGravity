@@ -157,15 +157,29 @@ func walkSchemaForNumericEnums(props gjson.Result, prefix string, fields map[str
 		}
 		t := val.Get("type").String()
 		if t == "" && val.Get("enum").IsArray() {
-			first := val.Get("enum.0")
-			if first.Type == gjson.Number {
-				if strings.Contains(first.Raw, ".") {
-					t = "number"
-				} else {
-					t = "integer"
+			// A follow-up audit caught this only ever looked at enum[0] —
+			// a nullable numeric/boolean enum written as [null, 1, 2]
+			// (null listed first, a common authoring style for "optional,
+			// defaults unset") saw a Null-typed first element, matched
+			// neither branch, and left this enum's scalar type
+			// undetected — Gemini stringifies it anyway, but the later
+			// round-trip coercion back to a real int/bool never fires for
+			// a field this scan never recorded, breaking Claude Code's
+			// own schema validation on the returned value. Scan for the
+			// first NON-null element instead of assuming it's first.
+			for _, ev := range val.Get("enum").Array() {
+				if ev.Type == gjson.Number {
+					if strings.Contains(ev.Raw, ".") {
+						t = "number"
+					} else {
+						t = "integer"
+					}
+					break
 				}
-			} else if first.Type == gjson.True || first.Type == gjson.False {
-				t = "boolean"
+				if ev.Type == gjson.True || ev.Type == gjson.False {
+					t = "boolean"
+					break
+				}
 			}
 		}
 		if val.Get("enum").IsArray() && (t == "integer" || t == "number" || t == "boolean") {
@@ -183,15 +197,22 @@ func walkSchemaForNumericEnums(props gjson.Result, prefix string, fields map[str
 			items := val.Get("items")
 			itemType := items.Get("type").String()
 			if itemType == "" && items.Get("enum").IsArray() {
-				first := items.Get("enum.0")
-				if first.Type == gjson.Number {
-					if strings.Contains(first.Raw, ".") {
-						itemType = "number"
-					} else {
-						itemType = "integer"
+				// Same leading-null fix as the scalar-field case below —
+				// scan for the first NON-null element instead of
+				// assuming enum[0] is representative.
+				for _, ev := range items.Get("enum").Array() {
+					if ev.Type == gjson.Number {
+						if strings.Contains(ev.Raw, ".") {
+							itemType = "number"
+						} else {
+							itemType = "integer"
+						}
+						break
 					}
-				} else if first.Type == gjson.True || first.Type == gjson.False {
-					itemType = "boolean"
+					if ev.Type == gjson.True || ev.Type == gjson.False {
+						itemType = "boolean"
+						break
+					}
 				}
 			}
 			if items.Get("enum").IsArray() && (itemType == "integer" || itemType == "number" || itemType == "boolean") {
@@ -213,15 +234,21 @@ func walkSchemaForNumericEnums(props gjson.Result, prefix string, fields map[str
 				items.Get("properties").ForEach(func(subKey, subVal gjson.Result) bool {
 					subT := subVal.Get("type").String()
 					if subT == "" && subVal.Get("enum").IsArray() {
-						first := subVal.Get("enum.0")
-						if first.Type == gjson.Number {
-							if strings.Contains(first.Raw, ".") {
-								subT = "number"
-							} else {
-								subT = "integer"
+						// Same leading-null fix as the other two enum
+						// type-sniffing sites in this file.
+						for _, ev := range subVal.Get("enum").Array() {
+							if ev.Type == gjson.Number {
+								if strings.Contains(ev.Raw, ".") {
+									subT = "number"
+								} else {
+									subT = "integer"
+								}
+								break
 							}
-						} else if first.Type == gjson.True || first.Type == gjson.False {
-							subT = "boolean"
+							if ev.Type == gjson.True || ev.Type == gjson.False {
+								subT = "boolean"
+								break
+							}
 						}
 					}
 					if subVal.Get("enum").IsArray() && (subT == "integer" || subT == "number" || subT == "boolean") {
@@ -424,8 +451,18 @@ func cleanJSONSchema(toolName, jsonStr string, addPlaceholder bool) (string, []s
 	// Phase 3: Cleanup
 	jsonStr = removeUnsupportedKeywords(jsonStr)
 	if !addPlaceholder {
-		// Gemini schema cleanup: remove nullable/title and placeholder-only fields.
-		jsonStr = removeKeywords(jsonStr, []string{"nullable"})
+		// An audit caught that "nullable" was being stripped here —
+		// Gemini's own generationConfig.responseSchema protobuf
+		// (openapi_go_proto.Schema) explicitly supports `nullable` as
+		// field 6, and this specific path (addPlaceholder == false) is
+		// ONLY ever reached from Structured Outputs' responseSchema
+		// translation, never tool declarations (which keep addPlaceholder
+		// true, and already correctly preserve nullable). Removing it
+		// here meant a Structured Outputs schema with an optional/
+		// nullable field lost the one signal telling Gemini that field
+		// may legitimately be null, so the model either couldn't produce
+		// null for it or the client's own strict JSON Schema validation
+		// rejected a response that correctly included it.
 		jsonStr = removePlaceholderFields(jsonStr)
 	}
 	jsonStr = cleanupRequiredFields(jsonStr)
@@ -756,8 +793,21 @@ func addEnumHints(jsonStr string) string {
 
 func addAdditionalPropertiesHints(jsonStr string) string {
 	for _, p := range findPaths(jsonStr, "additionalProperties") {
-		if gjson.Get(jsonStr, p).Type == gjson.False {
+		v := gjson.Get(jsonStr, p)
+		if v.Type == gjson.False {
 			jsonStr = appendHint(jsonStr, trimSuffix(p, ".additionalProperties"), "No extra properties allowed")
+			continue
+		}
+		// A follow-up audit caught that additionalProperties being a
+		// genuine SCHEMA (free-dict value type, e.g.
+		// {"type":"string","description":"..."}) — as opposed to the
+		// bare "false" case just above — got no hint at all: its own
+		// "description" (the model's only clue about what values this
+		// free-form dict's VALUES are supposed to look like) was
+		// silently discarded when Phase 3 strips "additionalProperties"
+		// from the delete list, with nothing left behind.
+		if desc := v.Get("description").String(); desc != "" {
+			jsonStr = appendHint(jsonStr, trimSuffix(p, ".additionalProperties"), "Values: "+desc)
 		}
 	}
 	return jsonStr
@@ -838,7 +888,24 @@ func moveConstraintsToDescription(jsonStr string) string {
 // destPath+".properties" already existed and silently dropped "b" entirely
 // instead of merging it alongside "a". Recursing into "properties" instead
 // of treating it as an opaque atomic value fixes this at any nesting depth.
-func mergeAllOfPropertiesInto(jsonStr, propsDestPath string, props gjson.Result) string {
+// mergeAllOfPropertiesInto merges props into propsDestPath, combining a
+// colliding nested object's own "required" list either by UNION
+// (unionRequired=true — correct for a genuine JSON Schema allOf, where every
+// branch's constraints apply SIMULTANEOUSLY, so a field required by any
+// branch really is required) or by INTERSECTION (unionRequired=false —
+// correct when the caller is really resolving a discriminated oneOf/anyOf
+// collision reusing this same merge logic one level down, where branches
+// are MUTUALLY EXCLUSIVE alternatives and only a field required by ALL of
+// them is genuinely always required). An audit caught that mergeObjectBranches
+// calling this for a shared nested property (e.g. two oneOf branches each
+// declaring their own "config" sub-object) always got UNION regardless —
+// correct for mergeAllOf's own real allOf use, but wrong for this reused
+// oneOf/anyOf case, so a nested "config.details" colliding two levels deep
+// ended up requiring every branch's fields simultaneously (branch "create"'s
+// config.details.name AND branch "delete"'s config.details.id both
+// mandatory), the exact bug the one-level-shallower fix already solved for
+// "config" itself.
+func mergeAllOfPropertiesInto(jsonStr, propsDestPath string, props gjson.Result, unionRequired bool) string {
 	props.ForEach(func(key, value gjson.Result) bool {
 		destPath := joinPath(propsDestPath, escapeGJSONPathKey(key.String()))
 		if !gjson.Get(jsonStr, destPath).Exists() {
@@ -862,7 +929,7 @@ func mergeAllOfPropertiesInto(jsonStr, propsDestPath string, props gjson.Result)
 				return true
 			}
 			if k == "properties" && attrVal.IsObject() {
-				jsonStr = mergeAllOfPropertiesInto(jsonStr, destPath+".properties", attrVal)
+				jsonStr = mergeAllOfPropertiesInto(jsonStr, destPath+".properties", attrVal, unionRequired)
 				return true
 			}
 			if k == "items" && attrVal.IsObject() {
@@ -880,7 +947,7 @@ func mergeAllOfPropertiesInto(jsonStr, propsDestPath string, props gjson.Result)
 					return true
 				}
 				if itemsProps := attrVal.Get("properties"); itemsProps.IsObject() {
-					jsonStr = mergeAllOfPropertiesInto(jsonStr, itemsDestPath+".properties", itemsProps)
+					jsonStr = mergeAllOfPropertiesInto(jsonStr, itemsDestPath+".properties", itemsProps, unionRequired)
 				}
 				if itemsReq := attrVal.Get("required"); itemsReq.IsArray() {
 					reqPath := itemsDestPath + ".required"
@@ -913,25 +980,59 @@ func mergeAllOfPropertiesInto(jsonStr, propsDestPath string, props gjson.Result)
 				// "name", branch 2 requires "email"), branch 2's required
 				// array was silently dropped entirely instead of unioned,
 				// since branch 1's array already existed at destPath.
+				//
+				// A follow-up audit caught that UNION is only correct for
+				// a genuine allOf (see unionRequired's doc comment) —
+				// when this same recursive merge is reused one level down
+				// for a oneOf/anyOf-originated collision, intersection is
+				// the correct semantics instead, matching the one-level-
+				// shallower fix already made for exactly this reason.
 				reqPath := destPath + ".required"
 				existing := gjson.Get(jsonStr, reqPath)
-				seen := make(map[string]bool)
 				var merged []string
-				if existing.IsArray() {
+				if !existing.IsArray() {
+					// Nothing to combine against yet (the first branch to
+					// declare this nested object) — take this branch's
+					// required list as-is, same under either semantics.
+					for _, r := range attrVal.Array() {
+						merged = append(merged, r.String())
+					}
+				} else if unionRequired {
+					seen := make(map[string]bool)
 					for _, r := range existing.Array() {
 						if !seen[r.String()] {
 							seen[r.String()] = true
 							merged = append(merged, r.String())
 						}
 					}
-				}
-				for _, r := range attrVal.Array() {
-					if !seen[r.String()] {
-						seen[r.String()] = true
-						merged = append(merged, r.String())
+					for _, r := range attrVal.Array() {
+						if !seen[r.String()] {
+							seen[r.String()] = true
+							merged = append(merged, r.String())
+						}
+					}
+				} else {
+					existingSet := make(map[string]bool)
+					for _, r := range existing.Array() {
+						existingSet[r.String()] = true
+					}
+					for _, r := range attrVal.Array() {
+						if existingSet[r.String()] {
+							merged = append(merged, r.String())
+						}
 					}
 				}
-				jsonStr, _ = sjson.Set(jsonStr, reqPath, merged)
+				if len(merged) == 0 {
+					// An empty intersection (nothing required by EVERY
+					// branch) must delete the key outright, not leave a
+					// literal JSON null behind — cleanupRequiredFields
+					// only ever processes paths where "required" IS an
+					// array, so a null here would survive untouched into
+					// the final schema sent to Gemini.
+					jsonStr, _ = sjson.Delete(jsonStr, reqPath)
+				} else {
+					jsonStr, _ = sjson.Set(jsonStr, reqPath, merged)
+				}
 				return true
 			}
 			if !gjson.Get(jsonStr, destPath+"."+k).Exists() {
@@ -960,7 +1061,7 @@ func mergeAllOf(jsonStr string) string {
 				if !gjson.Get(jsonStr, joinPath(parentPath, "type")).Exists() {
 					jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "type"), "object")
 				}
-				jsonStr = mergeAllOfPropertiesInto(jsonStr, joinPath(parentPath, "properties"), props)
+				jsonStr = mergeAllOfPropertiesInto(jsonStr, joinPath(parentPath, "properties"), props, true)
 			}
 			if req := item.Get("required"); req.IsArray() {
 				reqPath := joinPath(parentPath, "required")
@@ -980,7 +1081,17 @@ func mergeAllOf(jsonStr string) string {
 			// deleted the WHOLE allOf array, variants and all, before
 			// flattenAnyOfOneOf (which runs immediately after mergeAllOf)
 			// ever got a chance to see them.
-			for _, kw := range []string{"type", "enum", "format", "description", "items", "nullable", "anyOf", "oneOf"} {
+			// A follow-up audit caught this list never included any of
+			// the constraint keywords (minLength/pattern/minimum/etc.) —
+			// an allOf branch carrying one of these DIRECTLY (not nested
+			// under "properties", e.g. {allOf: [{type:"string"},
+			// {minLength:5}]}) never got copied to the parent before the
+			// allOf array itself was deleted below, losing the
+			// constraint with no trace at all instead of degrading to a
+			// description hint like moveConstraintsToDescription (which
+			// runs right after this) does for every OTHER unsupported
+			// keyword already present on a schema node directly.
+			for _, kw := range append([]string{"type", "enum", "format", "description", "items", "nullable", "anyOf", "oneOf"}, unsupportedConstraints...) {
 				if v := item.Get(kw); v.Exists() && !gjson.Get(jsonStr, joinPath(parentPath, kw)).Exists() {
 					jsonStr, _ = sjson.SetRaw(jsonStr, joinPath(parentPath, kw), v.Raw)
 				}
@@ -1065,7 +1176,24 @@ func flattenAnyOfOneOf(jsonStr string) string {
 				}
 			}
 			if allStringEnums && len(allEnums) > 0 {
-				enumBytes, _ := json.Marshal(allEnums)
+				// A follow-up audit caught this never deduped — two
+				// branches sharing a value (e.g. a shared discriminator
+				// like "update" that both "create|update" and
+				// "update|delete" branches declare) produced a merged
+				// enum with that value repeated, violating OpenAPI 3.0's
+				// implicit uniqueness expectation for a reason beyond
+				// spec purity: a client-side strict validator re-checking
+				// Gemini's own declared schema against the model's actual
+				// response could reject a duplicate as malformed.
+				seenEnum := make(map[string]bool, len(allEnums))
+				dedupedEnums := make([]string, 0, len(allEnums))
+				for _, v := range allEnums {
+					if !seenEnum[v] {
+						seenEnum[v] = true
+						dedupedEnums = append(dedupedEnums, v)
+					}
+				}
+				enumBytes, _ := json.Marshal(dedupedEnums)
 				selected, _ = sjson.SetRaw(selected, "enum", string(enumBytes))
 			}
 
@@ -1309,7 +1437,7 @@ func mergeObjectBranches(branches []gjson.Result) string {
 					// sub-properties for it. Recursively merge, the same
 					// way mergeAllOfPropertiesInto already does for allOf
 					// collisions.
-					entry.raw = mergeAllOfPropertiesInto(entry.raw, "properties", pv.Get("properties"))
+					entry.raw = mergeAllOfPropertiesInto(entry.raw, "properties", pv.Get("properties"), false)
 				}
 				// Record EVERY branch's own nested required list for this
 				// property (not just the merge case) — an audit caught the
@@ -1458,14 +1586,27 @@ func selectBest(items []gjson.Result) (bestIdx int, types []string) {
 			// into an optional, falsely-nullable one. Infer the type from
 			// the enum's own first value instead, the same way
 			// convertConstToEnum already infers a type for "const".
-			switch item.Get("enum.0").Type {
-			case gjson.Number:
-				score, t = 1, "number"
-			case gjson.True, gjson.False:
-				score, t = 1, "boolean"
-			default:
-				score, t = 1, "string"
+			// A follow-up audit caught this only ever looked at enum[0] —
+			// a nullable enum written as [null, 1, 2] (null listed
+			// first) saw a Null-typed first element, fell to the
+			// default: "string" case, and wrongly typed a numeric/
+			// boolean enum as a string. Scan for the first non-null
+			// element instead.
+			t = "string"
+			for _, ev := range item.Get("enum").Array() {
+				if ev.Type == gjson.Number {
+					t = "number"
+					break
+				}
+				if ev.Type == gjson.True || ev.Type == gjson.False {
+					t = "boolean"
+					break
+				}
+				if ev.Type != gjson.Null {
+					break // some other non-null scalar (string) — "string" stands
+				}
 			}
+			score = 1
 		default:
 			// An audit caught that a branch with NO type signal at all —
 			// not even an enum, e.g. just {"description": "any valid
@@ -2148,9 +2289,20 @@ func addMissingPropertyTypes(jsonStr string) string {
 			v.Get("anyOf").Exists() || v.Get("oneOf").Exists() || v.Get("allOf").Exists() {
 			continue
 		}
-		if v.Get("properties").Exists() {
+		switch {
+		case v.Get("properties").Exists():
 			jsonStr, _ = sjson.Set(jsonStr, joinPath(p, "type"), "object")
-		} else {
+		case v.Get("items").Exists():
+			// A follow-up audit caught this loop never checked for a
+			// NESTED "items" the way the sibling property-scan loop
+			// above already does — a 2D array's outer items (describing
+			// each row, itself an array: items.items) fell to the
+			// "string" default below, producing the invalid
+			// {"type":"string","items":{...}} Gemini's protobuf schema
+			// validator rejects (a string type can't carry its own
+			// "items" field at all).
+			jsonStr, _ = sjson.Set(jsonStr, joinPath(p, "type"), "array")
+		default:
 			jsonStr, _ = sjson.Set(jsonStr, joinPath(p, "type"), "string")
 		}
 	}

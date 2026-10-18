@@ -148,7 +148,19 @@ const (
 // invisible to this guard. `cat`/`more`/`less`/`pr` already match bare
 // with no such requirement; head/tail now do too, dropping the dangling
 // \s+(...) group entirely.
-var readEquivalentBashPattern = regexp.MustCompile(`(?i)\b(sed\s+-n|head|tail|cat|more|less|pr\b|seq\b|dd\s+bs=|cut\s+-[df]|fold\b|nl\s+-)\b`)
+// An audit caught this had NO command-position anchor at all (unlike
+// grepInvocationPattern/awkInvocationPattern below, which already require
+// `(^|[\s;&|])` before the command name) — a bare `\b` matches the word
+// ANYWHERE, so "git diff HEAD~1" matched "head" inside the git ref
+// argument, and "gh pr list" matched "pr" as its own second argument,
+// both getting misclassified as a read-equivalent command they aren't.
+// Anchoring to actual command-start position (string start, or right
+// after a real shell separator — NOT bare whitespace, which is just as
+// likely to be an argument separator within the SAME command) fixes both:
+// "HEAD" and "pr" sit mid-command, never right after `;`/`&`/`|` or at
+// position 0, so neither matches; a real `head file.txt` or `ls && head
+// file.txt` still does.
+var readEquivalentBashPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*(sed\s+-n|head|tail|cat|more|less|pr|seq|dd\s+bs=|cut\s+-[df]|fold|nl\s+-)\b`)
 var awkNRPattern = regexp.MustCompile(`(?i)\bNR\s*[<>=!]`)
 
 // awkInvocationPattern requires "awk" to appear as an actual command
@@ -158,7 +170,16 @@ var awkNRPattern = regexp.MustCompile(`(?i)\bNR\s*[<>=!]`)
 // argument happened to contain "awk", such as reading a file at
 // internal/hawk/auth.go or scripts/awk_report.sh, silently excluding that
 // read from the loop counter entirely even though no awk was ever invoked.
-var awkInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])awk\b`)
+// A follow-up audit caught that `[\s;&|]` treats bare WHITESPACE as
+// equally valid to a real command separator — but a plain space is just
+// as likely to be an ordinary argument separator WITHIN the same command
+// (`cat awk_report.sh` has "awk" preceded by a space too), so this never
+// actually enforced "right after a pipe/semicolon," only "preceded by any
+// whitespace at all" — true for nearly every word in a command line.
+// RE2 has no lookbehind, so the fix is structural: require the anchor
+// character itself to be a real separator immediately before any
+// whitespace, not whitespace standing in for one.
+var awkInvocationPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*awk\b`)
 
 // catIsWritePattern matches `cat` used to WRITE a file (heredoc into a
 // redirect, e.g. `cat << 'EOF' > file.go`, or `cat file1 file2 > out`) —
@@ -171,7 +192,13 @@ var awkInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])awk\b`)
 // match readEquivalentBashPattern as read-equivalent tools, same as cat),
 // but only "cat" itself was ever checked here — head/tail/sed-based
 // writes still counted as unproductive reads.
-var catIsWritePattern = regexp.MustCompile(`(?i)\b(cat|head|tail|sed)\b[^|]*>`)
+// A follow-up audit caught several more genuine-write shapes this missed
+// entirely: `echo "..." > file` (redirect, same shape as cat/head/tail/sed
+// — added to the same alternation); `sed -i '...' file` (in-place edit,
+// no `>` at all — matched separately, no trailing-redirect requirement);
+// `tee file` and `touch file` (write via the command's own mere
+// invocation, no redirect needed at all either).
+var catIsWritePattern = regexp.MustCompile(`(?i)\b(cat|head|tail|sed|echo)\b[^|]*>|\bsed\s+-i\b|\btee\b|\btouch\b`)
 
 // stderrRedirectPattern matches a file-descriptor-specific redirect used to
 // suppress error output — `2>/dev/null`, `2>&1`, `2>$null` (PowerShell) —
@@ -197,13 +224,19 @@ func stripStderrRedirects(command string) string {
 // `cat cmd/grep/main.go` or `less grep_test.go`, wrongly treating an
 // ordinary file read as "used search" and skipping it from the read-loop
 // counter entirely — the exact opposite of what a loop-nudge guard is for.
-var grepInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])(grep|rg)\b`)
+// A follow-up audit caught that `cat grep.txt` (a top-level, space-
+// separated argument — not embedded in a path like cmd/grep/main.go,
+// which the boundary check already handled) still matched: the `\s`
+// branch treated the ordinary space between "cat" and "grep.txt" as if
+// it were a real command separator. Same structural fix as
+// awkInvocationPattern above.
+var grepInvocationPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*(grep|rg)\b`)
 
 // jqInvocationPattern recognizes jq as an actual command invocation (not
 // a path substring), same boundary convention as awk/grep above — jq
 // reads and filters a file's content to stdout, the same read-loop shape
 // as sed -n/head/tail, but under a tool name those patterns never match.
-var jqInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])jq\b`)
+var jqInvocationPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*jq\b`)
 
 // psSearchInvocationPattern is grepInvocationPattern's PowerShell
 // counterpart, covering findstr/grep/rg the same way — select-string is
@@ -219,7 +252,11 @@ var jqInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])jq\b`)
 // enough to plausibly appear as a substring of something else (e.g. a
 // Serverless Framework project directory literally named "sls"), so it
 // needs the real command-boundary check here, not a bare substring match.
-var psSearchInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])(findstr|grep|rg|sls)\b`)
+// Same structural anchor fix as grepInvocationPattern above — `Get-Content
+// sls.json` has "sls" preceded by an ordinary space (a top-level filename
+// argument), which the old `\s` branch wrongly treated as a real command
+// separator.
+var psSearchInvocationPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*(findstr|grep|rg|sls)\b`)
 
 func isReadEquivalentBashCommand(command string) bool {
 	lc := strings.ToLower(command)
@@ -236,8 +273,16 @@ func isReadEquivalentBashCommand(command string) bool {
 	// An audit caught bare .read() (not just .readlines()/.splitlines())
 	// and jq (reads/filters a file's content to stdout, same read-loop
 	// shape as grep/sed -n) were both missing from this set.
-	if strings.Contains(lc, "readlines") || strings.Contains(lc, "splitlines") ||
-		strings.Contains(lc, ".read(") || jqInvocationPattern.MatchString(command) {
+	//
+	// A follow-up audit caught this and isReadEquivalentPowerShellCommand's
+	// own one-liner check below had each accumulated a DIFFERENT subset
+	// of the same interpreter-invocation patterns (this one never had
+	// node's readFileSync/.NET's ReadAllLines/ReadAllText; the PowerShell
+	// one never had splitlines/.read()) — but `node -e "..."`/`python -c
+	// "..."` work identically regardless of which SHELL invokes them, so
+	// a pattern real from one shell is just as real from the other.
+	// Shared single list for both.
+	if oneLinerReadPattern.MatchString(lc) || jqInvocationPattern.MatchString(command) {
 		return true
 	}
 	if (strings.Contains(lc, "cat") || strings.Contains(lc, "head") || strings.Contains(lc, "tail") || strings.Contains(lc, "sed")) &&
@@ -294,13 +339,22 @@ func isReadEquivalentPowerShellCommand(command string) bool {
 	// Bash) had no PowerShell counterpart — on Windows the exact same
 	// dump-the-file one-liners are routinely invoked through `python -c
 	// "..."`, `node -e "..."`, or .NET's own [System.IO.File] static
-	// methods, all completely invisible to this guard without this.
-	if strings.Contains(lc, "readlines") || strings.Contains(lc, "readfilesync") ||
-		strings.Contains(lc, "readalllines") || strings.Contains(lc, "readalltext") {
+	// methods, all completely invisible to this guard without this. Same
+	// shared pattern as the Bash side now uses — see its own comment for
+	// why a single combined list, not two different subsets.
+	if oneLinerReadPattern.MatchString(lc) {
 		return true
 	}
 	return false
 }
+
+// oneLinerReadPattern recognizes an interpreter one-liner (Python/Perl/
+// Node/.NET) dumping or slicing a file's content, regardless of which
+// SHELL invoked it — `node -e "..."` or `python -c "..."` behave
+// identically whether launched from Bash or PowerShell, so both call
+// sites share this single list instead of each tracking its own
+// incomplete subset.
+var oneLinerReadPattern = regexp.MustCompile(`readlines|splitlines|\.read\(|readfilesync|readalllines|readalltext`)
 
 // isPlanModeRequest detects the same thing translator.go's own inline check
 // does (ExitPlanMode declared among the request's tools) from raw request
@@ -449,6 +503,34 @@ func (lg *LoopGuardManager) touchLocked(agentKey string) {
 	lg.lastSeen[agentKey] = time.Now()
 }
 
+// syncPlanModeLocked clears agentKey's read window on a Plan-Mode true→false
+// transition (lenient window=40 built while planning can't be fairly judged
+// against the strict window=10 used once real execution starts) and records
+// the new state. Caller must hold lg.mu. Idempotent: once lastPlanMode is
+// updated to isPlanMode, calling this again with the same value is a no-op.
+func (lg *LoopGuardManager) syncPlanModeLocked(agentKey string, isPlanMode bool) {
+	wasPlanMode, seen := lg.lastPlanMode[agentKey]
+	if seen && wasPlanMode && !isPlanMode {
+		delete(lg.readWindows, agentKey)
+	}
+	lg.lastPlanMode[agentKey] = isPlanMode
+}
+
+// SyncPlanMode is the public entry point translator.go calls BEFORE
+// CheckAndResetReadStreak's threshold check, on the same request that may be
+// the first to exit Plan Mode — see syncPlanModeLocked's doc comment for why
+// waiting for RecordReadTurnWithRealProgress (which only runs after this
+// SAME request's response comes back) was one request too late.
+func (lg *LoopGuardManager) SyncPlanMode(agentKey string, isPlanMode bool) {
+	if agentKey == "" || agentKey == "auxiliary" || strings.HasPrefix(agentKey, "auxiliary|") {
+		return
+	}
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
+	lg.touchLocked(agentKey)
+	lg.syncPlanModeLocked(agentKey, isPlanMode)
+}
+
 // RecordReadTurn appends this turn's Read-tool-call count to agentKey's
 // sliding window. madeProgress (a Write/Edit happened, or the turn carried a
 // substantial amount of actual explanatory text/thinking — not just "let me
@@ -480,20 +562,22 @@ func (lg *LoopGuardManager) RecordReadTurnWithRealProgress(agentKey string, read
 	defer lg.mu.Unlock()
 	lg.touchLocked(agentKey)
 
-	// An audit caught that exiting Plan Mode (lenient window=40/threshold=40,
-	// since Plan Mode is EXPECTED to read many files) dropped straight into
-	// the strict window=10/threshold=10 pair, but the window itself still
-	// held Plan-Mode-era entries — appending this turn's count and THEN
-	// truncating to the new, smaller size just kept the most RECENT of
-	// those stale entries instead of discarding them, so their sum could
-	// already meet or exceed the new threshold on literally the first
-	// real-execution turn, nudging an agent that hadn't looped on
-	// anything yet. Clear the window outright on a true→false transition.
-	wasPlanMode, seen := lg.lastPlanMode[agentKey]
-	if seen && wasPlanMode && !isPlanMode {
-		delete(lg.readWindows, agentKey)
-	}
-	lg.lastPlanMode[agentKey] = isPlanMode
+	// A follow-up audit caught that the Plan-Mode transition clear below
+	// used to be the ONLY place this ran, but this function is only ever
+	// called from server.go AFTER Gemini's response for the CURRENT
+	// request comes back — translator.go's CheckAndResetReadStreak, which
+	// decides whether to inject a nudge into the OUTGOING request, runs
+	// strictly BEFORE that, while translating the request. On the exact
+	// request that exits Plan Mode, the threshold check still read the
+	// stale, not-yet-cleared Plan-Mode-era window (because the clear
+	// hadn't happened yet for THIS request), nudging an agent that
+	// hadn't looped on anything in real-execution mode at all. Extracted
+	// into syncPlanModeLocked so translator.go can call the public
+	// SyncPlanMode wrapper before the threshold check, on the SAME
+	// request — idempotent, so this function calling it again after the
+	// response arrives is a harmless no-op once the transition's already
+	// been applied.
+	lg.syncPlanModeLocked(agentKey, isPlanMode)
 
 	if madeProgress {
 		delete(lg.readWindows, agentKey)
@@ -706,6 +790,20 @@ func InjectUserNudge(claudeReqJSON map[string]interface{}, text string) {
 						case string:
 							block["content"] = c + "\n\n[" + text + "]"
 						case []interface{}:
+							block["content"] = append(c, map[string]interface{}{
+								"type": "text",
+								"text": "\n\n[" + text + "]",
+							})
+						case []map[string]interface{}:
+							// A follow-up audit caught this exact same
+							// []map[string]interface{} gap one level
+							// deeper than the outer rawContent fix above —
+							// a tool_result's OWN "content" can itself be
+							// this concrete type (e.g. a tool returning
+							// multiple image/text blocks), and the old
+							// default: branch below overwrote it with a
+							// bare string, destroying the tool's actual
+							// output entirely in favor of just the nudge.
 							block["content"] = append(c, map[string]interface{}{
 								"type": "text",
 								"text": "\n\n[" + text + "]",

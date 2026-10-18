@@ -328,11 +328,26 @@ func checkSSEEventSequence(rec CaptureRecord) []Violation {
 	if len(eventsRaw) == 0 {
 		return nil
 	}
-	first := asString(asMap(eventsRaw[0])["event"])
+	// A follow-up audit caught that this rule's own check against this
+	// gateway's OWN legitimate traffic is directly falsifiable: the
+	// panic-watchdog early-200 path (server.go) sends HTTP 200 headers
+	// and a keepalive "event: ping" BEFORE message_start, specifically
+	// because the real Gemini response hasn't arrived yet — Anthropic's
+	// own documented SSE protocol permits periodic pings for exactly
+	// this purpose. Skip any leading ping events before checking what
+	// the stream's real first event is.
+	firstIdx := 0
+	for firstIdx < len(eventsRaw) && asString(asMap(eventsRaw[firstIdx])["event"]) == "ping" {
+		firstIdx++
+	}
+	first := "message_start"
+	if firstIdx < len(eventsRaw) {
+		first = asString(asMap(eventsRaw[firstIdx])["event"])
+	}
 	last := asString(asMap(eventsRaw[len(eventsRaw)-1])["event"])
 	var out []Violation
-	if first != "message_start" {
-		out = append(out, violation(rec, fmt.Sprintf("stream started with %q, expected message_start", first)))
+	if firstIdx < len(eventsRaw) && first != "message_start" {
+		out = append(out, violation(rec, fmt.Sprintf("stream started with %q (after %d leading ping event(s)), expected message_start", first, firstIdx)))
 	}
 	// An audit caught this flagged every stream that failed mid-generation
 	// as a protocol violation — Anthropic's own documented SSE protocol

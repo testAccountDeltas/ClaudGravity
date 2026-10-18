@@ -231,6 +231,30 @@ func stripDataURIPrefix(s string) string {
 	return s
 }
 
+// builtinAnthropicToolSchema returns the reference input_schema for one of
+// Anthropic's server-side built-in tools (bash, text_editor, computer use —
+// web_search is handled separately via native Gemini googleSearch grounding
+// and never reaches this path). Anthropic's own clients declare these with
+// only {"type": "<dated-version>", "name": "..."} and NO input_schema at
+// all — Anthropic's server fills in the real parameters itself — but this
+// gateway has no equivalent server-side knowledge, so without this, an
+// empty input_schema fell into the generic empty-object placeholder and
+// told Gemini the tool takes nothing but a synthetic "reason" string.
+// Matches by prefix since Anthropic dates each version (bash_20250124,
+// bash_20241022, ...); the parameter shapes have stayed stable across
+// dates for each tool family so one schema per family is sufficient.
+func builtinAnthropicToolSchema(toolType string) (string, bool) {
+	switch {
+	case strings.HasPrefix(toolType, "bash_"):
+		return `{"type":"object","properties":{"command":{"type":"string","description":"The bash command to run."},"restart":{"type":"boolean","description":"Set to true to restart the tool instead of running a command."}}}`, true
+	case strings.HasPrefix(toolType, "text_editor_"):
+		return `{"type":"object","properties":{"command":{"type":"string","enum":["view","create","str_replace","insert","undo_edit"],"description":"The editor command to run."},"path":{"type":"string","description":"Absolute path to the file or directory."},"file_text":{"type":"string","description":"Required for create: the full content of the new file."},"old_str":{"type":"string","description":"Required for str_replace: the exact text to replace."},"new_str":{"type":"string","description":"Replacement text for str_replace, or the text to insert for insert."},"insert_line":{"type":"integer","description":"Required for insert: the line number after which to insert."},"view_range":{"type":"array","items":{"type":"integer"},"description":"Optional for view: [start_line, end_line]."}},"required":["command","path"]}`, true
+	case strings.HasPrefix(toolType, "computer_"):
+		return `{"type":"object","properties":{"action":{"type":"string","enum":["key","hold_key","type","cursor_position","mouse_move","left_mouse_down","left_mouse_up","left_click","left_click_drag","right_click","middle_click","double_click","triple_click","scroll","wait","screenshot"],"description":"The computer-use action to perform."},"coordinate":{"type":"array","items":{"type":"integer"},"description":"[x, y] pixel coordinate for click/move/drag actions."},"text":{"type":"string","description":"Text for key/type actions."},"duration":{"type":"integer","description":"Seconds to hold a key or wait."},"scroll_direction":{"type":"string","enum":["up","down","left","right"]},"scroll_amount":{"type":"integer"}},"required":["action"]}`, true
+	}
+	return "", false
+}
+
 // sanitizeGeminiFunctionName rewrites a tool name to satisfy Gemini's
 // function-calling protobuf identifier regex (^[a-zA-Z_][a-zA-Z0-9_]*$, max
 // 63 chars) — Anthropic's own looser `^[a-zA-Z0-9_-]{1,64}$` permits hyphens
@@ -367,6 +391,15 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		hasModifyingTools = false
 	}
 	_, readThreshold := readLoopLimits(agentKey, hasModifyingTools)
+	// An audit caught that the Plan-Mode window-clear only ever ran inside
+	// RecordReadTurnWithRealProgress, called from server.go AFTER this
+	// same request's Gemini response comes back — one step too late for
+	// THIS check, which decides whether to nudge the OUTGOING request. On
+	// the exact request that exits Plan Mode, the threshold below still
+	// compared against the stale, un-cleared Plan-Mode-era window. Sync
+	// it here first; RecordReadTurnWithRealProgress calling it again
+	// later this same request is a harmless no-op.
+	globalLoopGuard.SyncPlanMode(loopKey, isPlanMode)
 	if level := globalLoopGuard.CheckAndResetReadStreak(loopKey, readThreshold); level > 0 {
 		nudgeText := NudgeReadLoop
 		if level >= 2 {
@@ -1210,8 +1243,42 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							// validator can degrade reasoning quality on long
 							// thinking chains.
 							sig := p.Get("signature").String()
-							if sig == "" {
-								sig = "skip_thought_signature_validator"
+							if sig == "" || sig == "skip_thought_signature_validator" {
+								// A follow-up audit caught a recoverable case:
+								// in a thought->text->functionCall sequence
+								// split across SSE chunks, the live stream
+								// (sse.go) closes the thinking block with the
+								// skip-validator placeholder before the
+								// LATER functionCall's real thoughtSignature
+								// ever arrives — but that real signature IS
+								// cached (setToolSignature, sse.go) against
+								// the functionCall's own tool_use id. On
+								// REPLAY (this history-translation path, a
+								// later turn), the sibling tool_use this
+								// same assistant message carries is right
+								// here in `content` — check it for a real
+								// cached signature before giving up and
+								// resending the same placeholder forever.
+								// Unlike buffering the live stream itself
+								// (assessed independently five times as too
+								// risky — delays TTFT for every response),
+								// this only runs once, on the next turn,
+								// with no latency cost at all.
+								if sig == "skip_thought_signature_validator" {
+									content.ForEach(func(_, sibling gjson.Result) bool {
+										if sibling.Get("type").String() != "tool_use" {
+											return true
+										}
+										if real := getToolSignature(sibling.Get("id").String()); real != "" {
+											sig = real
+											return false
+										}
+										return true
+									})
+								}
+								if sig == "" {
+									sig = "skip_thought_signature_validator"
+								}
 							}
 							part := `{"thought":true,"thoughtSignature":"","text":""}`
 							part, _ = sjson.Set(part, "thoughtSignature", sig)
@@ -1429,6 +1496,23 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				desc = strings.TrimRight(desc, "\n") + "\n\n" + readToolGuidance
 			}
 			rawSchema := t.Get("input_schema").Raw
+			// An audit caught that Anthropic's server-side built-in tools
+			// (bash_20250124, text_editor_20250728, computer_20250124, and
+			// their earlier dated variants) are declared by the client
+			// WITHOUT input_schema at all — Anthropic's own server already
+			// knows their parameters — but this gateway had no equivalent
+			// knowledge, so an empty input_schema fell straight into the
+			// generic "no params, needsPlaceholder" path below, telling
+			// Gemini the tool takes only a synthetic "reason" string. The
+			// model then called e.g. bash(reason="...") with no "command"
+			// at all, since that's the only parameter the schema we sent
+			// ever gave it. Inject the real reference schema by the
+			// declaration's own "type" field before falling through.
+			if strings.TrimSpace(rawSchema) == "" || rawSchema == "null" || rawSchema == "{}" {
+				if builtin, ok := builtinAnthropicToolSchema(t.Get("type").String()); ok {
+					rawSchema = builtin
+				}
+			}
 			schemaRaw := CleanJSONSchemaForAntigravity(name, rawSchema)
 			needsPlaceholder := strings.TrimSpace(schemaRaw) == "" || schemaRaw == "null"
 			if !needsPlaceholder {
@@ -1458,12 +1542,26 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				schemaRaw, _ = addEmptySchemaPlaceholder(`{"type":"object","properties":{}}`, nil)
 			}
 			// Remember which tools got our synthetic "reason" placeholder
-			// injected (the only way Gemini will accept an argument-less
-			// tool's schema) so the caller can strip that key back out of
-			// the model's actual function-call args before handing them to
-			// Claude Code — a strict MCP tool with additionalProperties:
-			// false rejects a "reason" field it never declared.
-			if strings.Contains(schemaRaw, placeholderReasonDescription) {
+			// injected at the TOP LEVEL (the only way Gemini will accept
+			// an argument-less tool's schema) so the caller can strip
+			// that key back out of the model's actual function-call args
+			// before handing them to Claude Code — a strict MCP tool
+			// with additionalProperties: false rejects a "reason" field
+			// it never declared.
+			//
+			// An audit caught that a blind substring search across the
+			// WHOLE schema string false-positived whenever the SAME
+			// placeholder text happened to appear anywhere else in the
+			// schema too — e.g. a nested free-dict field (like
+			// "metadata") that independently got its own synthetic
+			// reason injected for ITS OWN emptiness. That flagged the
+			// entire tool, and the caller unconditionally deletes the
+			// TOP-LEVEL "reason" key whenever flagged — destroying a
+			// genuinely real, user-declared top-level "reason" argument
+			// that tool also happened to have, unrelated to the nested
+			// placeholder. Check the exact top-level path instead of a
+			// substring search across the whole schema.
+			if gjson.Get(schemaRaw, "properties.reason.description").String() == placeholderReasonDescription {
 				syntheticReasonTools[name] = true
 			}
 

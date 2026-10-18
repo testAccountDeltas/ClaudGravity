@@ -43,11 +43,15 @@ func estimateImageTokens(b64Data string) int {
 	// prefix, silently falling to the flat floor regardless of the
 	// image's real size — translator.go already strips this same prefix
 	// before decoding for the actual translation path.
-	raw, err := base64.StdEncoding.DecodeString(stripBase64Whitespace(stripDataURIPrefix(b64Data)))
-	if err != nil || len(raw) == 0 {
-		return anthropicImageTokenFloor
-	}
-	cfg, _, err := image.DecodeConfig(strings.NewReader(string(raw)))
+	// An audit caught that decoding the ENTIRE image into a []byte just to
+	// read its header dimensions allocated the full binary payload in
+	// heap memory for no reason — image.DecodeConfig only ever reads as
+	// many bytes as the format's header actually needs (a PNG's IHDR
+	// chunk, a JPEG's SOF marker) and stops there on its own; feeding it
+	// a streaming base64 decoder avoids materializing the rest of a
+	// large image (a multi-MB screenshot) at all.
+	cleaned := stripBase64Whitespace(stripDataURIPrefix(b64Data))
+	cfg, _, err := image.DecodeConfig(base64.NewDecoder(base64.StdEncoding, strings.NewReader(cleaned)))
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
 		return anthropicImageTokenFloor
 	}
@@ -90,7 +94,15 @@ const geminiPDFTokensPerPage = 258
 // count is found in the raw bytes, letting the caller fall back to its
 // own density-based estimate.
 func estimatePDFTokensFromPageCount(b64Data string) (int, bool) {
-	raw, err := base64.StdEncoding.DecodeString(stripBase64Whitespace(b64Data))
+	// An audit caught that a client sending a full data: URI (e.g.
+	// "data:application/pdf;base64,...") instead of raw base64 — some
+	// browser-based clients do this even though Anthropic's own spec
+	// expects raw base64 — made base64.StdEncoding.DecodeString fail
+	// outright (":" "/" ";" "," aren't valid base64 characters), silently
+	// losing the chance at a real page count and falling back to the
+	// less accurate density estimate instead. stripDataURIPrefix already
+	// exists for this exact reason elsewhere in the package.
+	raw, err := base64.StdEncoding.DecodeString(stripBase64Whitespace(stripDataURIPrefix(b64Data)))
 	if err != nil || len(raw) == 0 {
 		return 0, false
 	}
@@ -256,7 +268,24 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 
 	// 2. Messages History
 	if msgs := root.Get("messages"); msgs.IsArray() {
-		msgs.ForEach(func(_, m gjson.Result) bool {
+		// An audit caught that commit 40b25b9's fix (context_window.go's
+		// conservativeTokenEstimate pricing old thinking blocks at 0,
+		// since translator.go guarantees they're stripped before ever
+		// reaching Gemini) was never mirrored here — this SEPARATE
+		// estimator feeds message_start's reported input_tokens and
+		// count_tokens, and kept summing every historical thinking
+		// block's real size, over-reporting by 50-100k tokens on a long
+		// agentic session for phantom tokens that were never sent.
+		msgArr := msgs.Array()
+		lastAssistantIdx := -1
+		for i := len(msgArr) - 1; i >= 0; i-- {
+			if msgArr[i].Get("role").String() == "assistant" {
+				lastAssistantIdx = i
+				break
+			}
+		}
+		msgs.ForEach(func(idxResult, m gjson.Result) bool {
+			isLastAssistant := m.Get("role").String() == "assistant" && int(idxResult.Int()) == lastAssistantIdx
 			// Per-message framing overhead (~3 tokens)
 			total += 3
 
@@ -270,7 +299,9 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 					case "text":
 						total += estimateApproxTokens(part.Get("text").String())
 					case "thinking":
-						total += estimateApproxTokens(part.Get("thinking").String())
+						if isLastAssistant {
+							total += estimateApproxTokens(part.Get("thinking").String())
+						}
 					case "tool_use":
 						total += estimateApproxTokens(part.Get("name").String())
 						total += estimateApproxTokens(part.Get("input").Raw)
@@ -302,6 +333,13 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 											if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok && pageEst > est {
 												est = pageEst
 											}
+										} else if strings.HasPrefix(mediaType, "image/") && mediaType != "image/svg+xml" {
+											// An audit caught a "document" block whose
+											// media_type is an image mimetype fell into the
+											// text-density branch below, pricing binary base64
+											// bytes as if decoded text — a 2MB image inflated to
+											// ~750,000 "tokens" instead of the real ~1600.
+											est = estimateImageTokens(dataStr)
 										} else {
 											// A base64 text document (code, logs, CSV) has none
 											// of a PDF's image-heavy byte density — decode to raw
@@ -365,6 +403,10 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 								if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok && pageEst > est {
 									est = pageEst
 								}
+							} else if strings.HasPrefix(mediaType, "image/") && mediaType != "image/svg+xml" {
+								// Same image-mispriced-as-text fix as the
+								// tool_result document case above.
+								est = estimateImageTokens(dataStr)
 							} else {
 								decodedBytes := len(dataStr) * 3 / 4
 								est = decodedBytes / 2
@@ -385,7 +427,9 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 							total += estimateApproxTokens(src.Get("data").String())
 						}
 					case "redacted_thinking":
-						total += estimateApproxTokens(part.Get("data").String())
+						if isLastAssistant {
+							total += estimateApproxTokens(part.Get("data").String())
+						}
 					}
 					return true
 				})

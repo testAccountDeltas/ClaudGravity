@@ -140,6 +140,14 @@ func commonAPIMiddleware(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE, PUT")
+		// An audit caught that the many small CLI control-endpoint
+		// handlers (settings, metrics_enabled, telemetry, bootstrap,
+		// policy_limits, ...) never set anthropic-organization-id the
+		// way the main /v1/messages response path does. Set it here once
+		// for every response that goes through this shared middleware
+		// (all interceptedMux/MITM-routed registrations) instead of
+		// repeating it in each individual handler closure.
+		h.Set("anthropic-organization-id", fakeOrgID)
 		// An audit caught anthropic-dangerous-direct-browser-access missing
 		// here — the official Anthropic SDKs send this REQUEST header
 		// specifically to opt into being called directly from a browser
@@ -217,6 +225,13 @@ func anthropicErrorTypeForStatus(status int) string {
 		return "not_found_error"
 	case http.StatusRequestEntityTooLarge:
 		return "request_too_large"
+	case http.StatusPaymentRequired:
+		// Anthropic's documented error type for exceeding an account's
+		// spend/billing limit — was falling through to the generic 4xx
+		// default (invalid_request_error) below, giving a client no way
+		// to distinguish "your request is malformed" from "you're out
+		// of credit."
+		return "billing_error"
 	case 529:
 		return "overloaded_error"
 	default:
@@ -388,6 +403,29 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 			w.Header().Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", time.Now().Add(30*time.Second).Unix()))
 			w.Header().Set("anthropic-ratelimit-unified-status", "rejected")
 		}
+		// A follow-up audit caught that 529 never got the same *-limit/
+		// *-remaining/*-reset headers the 429 branch above already has —
+		// same reasoning applies here too (a telemetry hook computing
+		// utilization, or a generic SDK reading the standard reset
+		// headers instead of the Claude-Code-specific unified one), just
+		// with the shorter 30s window matching this transient-overload
+		// Retry-After instead of 429's 15-minute real-quota-exhaustion one.
+		if w.Header().Get("anthropic-ratelimit-requests-limit") == "" {
+			w.Header().Set("anthropic-ratelimit-requests-limit", "1000")
+		}
+		if w.Header().Get("anthropic-ratelimit-tokens-limit") == "" {
+			w.Header().Set("anthropic-ratelimit-tokens-limit", "1000000")
+			setSplitTokenRateLimitHeaders(w.Header(), 1000000, 0, time.Now().Add(30*time.Second))
+		}
+		w.Header().Set("anthropic-ratelimit-requests-remaining", "0")
+		w.Header().Set("anthropic-ratelimit-tokens-remaining", "0")
+		resetAt529 := time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339)
+		if w.Header().Get("anthropic-ratelimit-requests-reset") == "" {
+			w.Header().Set("anthropic-ratelimit-requests-reset", resetAt529)
+		}
+		if w.Header().Get("anthropic-ratelimit-tokens-reset") == "" {
+			w.Header().Set("anthropic-ratelimit-tokens-reset", resetAt529)
+		}
 	}
 	w.WriteHeader(wireStatus)
 	body, _ := json.Marshal(map[string]interface{}{
@@ -501,6 +539,11 @@ func main() {
 	mux.HandleFunc("/api/claude_cli/bootstrap", func(w http.ResponseWriter, r *http.Request) {
 		HandleBootstrapSpoof(w, r)
 	})
+	// An audit caught only the "claude_cli" spelling was registered — some
+	// CLI versions/clients call the "claude_code" spelling instead.
+	mux.HandleFunc("/api/claude_code/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+		HandleBootstrapSpoof(w, r)
+	})
 	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
 		handleEmbeddings(cfgMgr, w, r)
 	})
@@ -549,16 +592,24 @@ func main() {
 		// referencing the SAME two distinct underlying entities now.
 		_, _ = w.Write([]byte(`{"valid":true,"account_uuid":"` + fakeAccountID + `","organization_uuid":"` + fakeOrgID + `"}`))
 	}
+	// An audit caught these minor CLI control-endpoint handlers never set
+	// anthropic-organization-id the way the main /v1/messages response
+	// does — commonAPIMiddleware now sets it for the interceptedMux/MITM
+	// side; each closure below sets it too for the plain mux (direct
+	// HTTP) side, which goes through no shared wrapper.
 	handleMetricsJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{"metrics_logging_enabled":false}`))
 	}
 	handleSettingsJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{"uuid":"` + fakeAccountID + `","checksum":"none","settings":{}}`))
 	}
 	handleTelemetryJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{}`))
 	}
 	// An audit caught these CLI management/telemetry endpoints were
@@ -569,10 +620,23 @@ func main() {
 	// timeout. Same spirit as handleProfileJSON/handleValidateJSON above.
 	handleOrganizationsCurrentJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{"uuid":"` + fakeOrgID + `","name":"ClaudGravity Workspace","organization_type":"enterprise","rate_limit_tier":"tier_4"}`))
+	}
+	// An audit caught that Go 1.22+'s ServeMux pattern "/api/organizations/{id}"
+	// requires a non-empty segment there — a request for the bare
+	// COLLECTION endpoint "GET /api/organizations" (no id at all) never
+	// matches it, and had no other registered route to fall back to
+	// either, so it fell through to the dashboard's 401 Basic Auth
+	// challenge (direct mode) or PassthroughToReal (MITM mode).
+	handleOrganizationsListJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
+		_, _ = w.Write([]byte(`{"data":[{"uuid":"` + fakeOrgID + `","name":"ClaudGravity Workspace","organization_type":"enterprise","rate_limit_tier":"tier_4"}],"has_more":false,"first_id":"` + fakeOrgID + `","last_id":"` + fakeOrgID + `"}`))
 	}
 	handleAuthCurrentUserJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		// An audit caught the real Anthropic endpoint also returns a
 		// "memberships" array ({"organization":...,"role":"admin"}), not
 		// just "organizations" — a strict client reading memberships to
@@ -582,6 +646,7 @@ func main() {
 	}
 	handleBillingJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{"tier":"tier_4","status":"active","has_payment_method":true,"currency":"usd"}`))
 	}
 	// An audit caught these two were unhandled, same failure mode as the
@@ -592,10 +657,12 @@ func main() {
 	// onboarding.
 	handlePolicyLimitsJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{"restrictions":{},"compliance_taints":[]}`))
 	}
 	handleFirstTokenDateJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{"first_token_date":null}`))
 	}
 	// An audit flagged these as unregistered (independent of its own
@@ -606,14 +673,17 @@ func main() {
 	// locally or a PassthroughToReal leak to the real api.anthropic.com.
 	handleNotificationPreferencesJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{"account_id":"` + fakeAccountID + `","organization_id":"` + fakeOrgID + `","preferences":{"feature_preference":{"bogosort":{"enable_push":true}}},"push_reachability":{"has_active_channel":true,"platforms":["cli"]}}`))
 	}
 	handleOAuthAccountSettingsJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{}`))
 	}
 	handleGroveNoticeViewedJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{"viewed":true}`))
 	}
 	// Background cache-keepalive ping — CLI permanently disables this
@@ -622,14 +692,17 @@ func main() {
 	// permanently degraded prefix cache for the rest of the session.
 	handleCacheTouchJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{"status":"ok","touched":true}`))
 	}
 	handleModelSelectorJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{}`))
 	}
 	handleResetRateLimitsJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-organization-id", fakeOrgID)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}
 
@@ -652,6 +725,8 @@ func main() {
 	// just above, reusing the same handler.
 	mux.HandleFunc("/api/claude_code/telemetry", handleTelemetryJSON)
 	mux.HandleFunc("/api/claude_code/crash_reports", handleTelemetryJSON)
+	mux.HandleFunc("/api/organizations", handleOrganizationsListJSON)
+	mux.HandleFunc("/api/organizations/", handleOrganizationsListJSON)
 	mux.HandleFunc("/api/organizations/current", handleOrganizationsCurrentJSON)
 	mux.HandleFunc("/api/auth/current_user", handleAuthCurrentUserJSON)
 	mux.HandleFunc("/api/organizations/current/billing", handleBillingJSON)
@@ -675,6 +750,9 @@ func main() {
 	mux.HandleFunc("/api/oauth/account/grove_notice_viewed", handleGroveNoticeViewedJSON)
 	mux.HandleFunc("/v1/messages/cache_touch", handleCacheTouchJSON)
 	mux.HandleFunc("/api/organizations/{id}/model_selector/{surface}", handleModelSelectorJSON)
+	// An audit caught only the surface-qualified path was registered —
+	// some clients call the bare collection path with no surface segment.
+	mux.HandleFunc("/api/organizations/{id}/model_selector", handleModelSelectorJSON)
 	mux.HandleFunc("/api/organizations/{id}/reset_rate_limits", handleResetRateLimitsJSON)
 
 	// Separate mux for TLS-intercepted anthropic.com/claude.ai traffic (see
@@ -696,6 +774,9 @@ func main() {
 		handleOAuthUsage(cfgMgr, w, r)
 	})))
 	interceptedMux.Handle("/api/claude_cli/bootstrap", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		HandleBootstrapSpoof(w, r)
+	})))
+	interceptedMux.Handle("/api/claude_code/bootstrap", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		HandleBootstrapSpoof(w, r)
 	})))
 	// A client set up with only HTTPS_PROXY (no ANTHROPIC_BASE_URL override)
@@ -755,6 +836,8 @@ func main() {
 	interceptedMux.Handle("/api/telemetry/", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
 	interceptedMux.Handle("/api/claude_code/telemetry", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
 	interceptedMux.Handle("/api/claude_code/crash_reports", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
+	interceptedMux.Handle("/api/organizations", commonAPIMiddleware(http.HandlerFunc(handleOrganizationsListJSON)))
+	interceptedMux.Handle("/api/organizations/", commonAPIMiddleware(http.HandlerFunc(handleOrganizationsListJSON)))
 	interceptedMux.Handle("/api/organizations/current", commonAPIMiddleware(http.HandlerFunc(handleOrganizationsCurrentJSON)))
 	interceptedMux.Handle("/api/auth/current_user", commonAPIMiddleware(http.HandlerFunc(handleAuthCurrentUserJSON)))
 	interceptedMux.Handle("/api/organizations/current/billing", commonAPIMiddleware(http.HandlerFunc(handleBillingJSON)))
@@ -774,6 +857,7 @@ func main() {
 	interceptedMux.Handle("/api/oauth/account/grove_notice_viewed", commonAPIMiddleware(http.HandlerFunc(handleGroveNoticeViewedJSON)))
 	interceptedMux.Handle("/v1/messages/cache_touch", commonAPIMiddleware(http.HandlerFunc(handleCacheTouchJSON)))
 	interceptedMux.Handle("/api/organizations/{id}/model_selector/{surface}", commonAPIMiddleware(http.HandlerFunc(handleModelSelectorJSON)))
+	interceptedMux.Handle("/api/organizations/{id}/model_selector", commonAPIMiddleware(http.HandlerFunc(handleModelSelectorJSON)))
 	interceptedMux.Handle("/api/organizations/{id}/reset_rate_limits", commonAPIMiddleware(http.HandlerFunc(handleResetRateLimitsJSON)))
 	interceptedMux.Handle("/v1/embeddings", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleEmbeddings(cfgMgr, w, r)
@@ -2347,15 +2431,18 @@ func executeNonStreaming(
 		}
 	}
 
+	// A follow-up audit caught that these two fields were omitted
+	// entirely from a successful 200 OK's usage object whenever they
+	// were zero, instead of present with an explicit 0 — the same
+	// incomplete-usage-shape issue already fixed for message_delta's
+	// streaming usage and the promptFeedback-refusal usage object in
+	// earlier rounds. A strict SDK client expecting the full 4-field
+	// usage shape on every response saw it silently incomplete here too.
 	usageMap := map[string]interface{}{
-		"input_tokens":  uncachedInTok,
-		"output_tokens": outTok,
-	}
-	if cacheCreationTok > 0 {
-		usageMap["cache_creation_input_tokens"] = cacheCreationTok
-	}
-	if cacheTok > 0 {
-		usageMap["cache_read_input_tokens"] = cacheTok
+		"input_tokens":                uncachedInTok,
+		"output_tokens":               outTok,
+		"cache_creation_input_tokens": cacheCreationTok,
+		"cache_read_input_tokens":     cacheTok,
 	}
 
 	// Previously always "end_turn" — a response that hit the output-token
@@ -2392,9 +2479,13 @@ func executeNonStreaming(
 		"usage":         usageMap,
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
-	}
-	if stopDetails != nil {
-		claudeResp["stop_details"] = stopDetails
+		// A follow-up audit caught this was omitted entirely on a normal
+		// successful response instead of present as an explicit null —
+		// inconsistent with "stop_sequence" right above it, which is
+		// always present even when nil. A strict client expecting the
+		// key to exist (even if null) on every response saw it silently
+		// missing instead.
+		"stop_details": stopDetails,
 	}
 
 	var toolsCalled []string
@@ -2499,7 +2590,17 @@ func executeNonStreaming(
 						"text": t,
 					})
 					textChars += len(t)
-					lastText = t
+					// A follow-up audit caught this OVERWROTE lastText
+					// instead of accumulating — Gemini can split one
+					// candidate's response across multiple "text" parts,
+					// and both of lastText's own consumers need the FULL
+					// text: stop_sequence detection (strings.HasSuffix)
+					// needs the real end of the whole response, not just
+					// whatever the LAST part happened to contain, and
+					// hasIgnoreTag's substring search for
+					// "[ignoring loop detection]" misses it entirely if
+					// the tag landed in an earlier part.
+					lastText += t
 				} else if fc := p.Get("functionCall"); fc.Exists() {
 					if len(toolsCalled) > 0 && wantsSingleToolUse(claudeBodyBytes) {
 						// Client asked for at most one tool call per turn
@@ -3248,6 +3349,29 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 
 	fiveHourBucket, weeklyBucket := pickFiveHourAndWeekly(acc, modelName)
 	if fiveHourBucket == nil && weeklyBucket == nil {
+		// A follow-up audit caught that this early return left the
+		// response with ZERO anthropic-ratelimit-* headers at all (only
+		// org/workspace-id from the fix just above) — the exact same
+		// "headers absent" problem the acc == nil branch above already
+		// has a synthetic-default answer for (a real account whose
+		// quota just hasn't loaded yet, e.g. right after a restart
+		// before the async warmup completes, looks no different to the
+		// client than one with no account at all; same fix applies).
+		now := time.Now()
+		header.Set("anthropic-ratelimit-unified-5h-status", "allowed")
+		header.Set("anthropic-ratelimit-unified-5h-utilization", "0.05")
+		header.Set("anthropic-ratelimit-unified-5h-reset", fmt.Sprintf("%d", now.Add(5*time.Hour).Unix()))
+		header.Set("anthropic-ratelimit-unified-status", "allowed")
+		header.Set("anthropic-ratelimit-unified-representative-claim", "five_hour")
+		header.Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", now.Add(5*time.Hour).Unix()))
+		const reqLimit, tokLimit = 1000, 1000000
+		header.Set("anthropic-ratelimit-requests-limit", fmt.Sprintf("%d", reqLimit))
+		header.Set("anthropic-ratelimit-requests-remaining", fmt.Sprintf("%d", int(float64(reqLimit)*0.95)))
+		header.Set("anthropic-ratelimit-requests-reset", now.Add(5*time.Hour).UTC().Format(time.RFC3339))
+		header.Set("anthropic-ratelimit-tokens-limit", fmt.Sprintf("%d", tokLimit))
+		header.Set("anthropic-ratelimit-tokens-remaining", fmt.Sprintf("%d", int(float64(tokLimit)*0.95)))
+		header.Set("anthropic-ratelimit-tokens-reset", now.Add(5*time.Hour).UTC().Format(time.RFC3339))
+		setSplitTokenRateLimitHeaders(header, tokLimit, 0.95, now.Add(5*time.Hour))
 		return
 	}
 
@@ -3350,6 +3474,19 @@ func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) 
 	tenant, _ := cfgMgr.GetTenant(clientKey)
 
 	convAnchor := r.URL.Query().Get("conversation")
+	if convAnchor == "" {
+		// An audit caught this only ever looked at a "conversation" query
+		// parameter — Claude Code's own CLI identifies a session via the
+		// x-claude-code-session-id HEADER on /v1/messages (see
+		// DeriveConversationAnchor's real caller), not a query string on
+		// this GET /usage-style endpoint, so a usage query for a specific
+		// session fell straight through to the generic per-API-key sticky
+		// fallback below instead of resolving to that session's actual
+		// bound account, returning the WRONG account's quota data.
+		if headerSessionID := r.Header.Get("x-claude-code-session-id"); headerSessionID != "" {
+			convAnchor = DeriveConversationAnchor(nil, headerSessionID, "")
+		}
+	}
 	email := ""
 	if convAnchor != "" {
 		email = globalSelector.GetAffinityAccount(convAnchor)
@@ -3586,6 +3723,13 @@ func handleOAuthUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Requ
 	tenant, _ := cfgMgr.GetTenant(clientKey)
 
 	convAnchor := r.URL.Query().Get("conversation")
+	if convAnchor == "" {
+		// Same session-header fallback as handleUsage above — see its
+		// comment for the full explanation.
+		if headerSessionID := r.Header.Get("x-claude-code-session-id"); headerSessionID != "" {
+			convAnchor = DeriveConversationAnchor(nil, headerSessionID, "")
+		}
+	}
 	email := ""
 	if convAnchor != "" {
 		email = globalSelector.GetAffinityAccount(convAnchor)

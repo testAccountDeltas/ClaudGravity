@@ -47,10 +47,37 @@ func sweepStaleSessionCWD() {
 	}
 }
 
+// parentSessionKey strips a subagent's ":instanceID" suffix, returning the
+// bare parent session key it was derived from (see server.go's cwdKey/
+// fileSnapKey construction: "sessionID" for the main thread, "sessionID:
+// instanceID" for a subagent instance). Returns ("", false) for a key with
+// no such suffix (nothing to fall back to).
+func parentSessionKey(sessionID string) (string, bool) {
+	idx := strings.LastIndex(sessionID, ":")
+	if idx < 0 {
+		return "", false
+	}
+	return sessionID[:idx], true
+}
+
 func GetSessionCWD(sessionID string) string {
 	sessionCWDLock.RLock()
 	defer sessionCWDLock.RUnlock()
-	return sessionCWDMap[sessionID]
+	if cwd := sessionCWDMap[sessionID]; cwd != "" {
+		return cwd
+	}
+	// An audit caught that a subagent's OWN first-ever edit call, before
+	// it has recorded any CWD of its own, had no fallback at all — the
+	// main thread's (or the subagent's own earlier-created parent
+	// session's) already-known CWD, recorded under the bare key this
+	// subagent's own composite key was literally derived FROM, went
+	// completely unused. Safe to fall back to: the parent/child
+	// relationship is established by this key's own naming convention,
+	// not a cross-tenant guess.
+	if parent, ok := parentSessionKey(sessionID); ok {
+		return sessionCWDMap[parent]
+	}
+	return ""
 }
 
 func isAbsPath(p string) bool {
@@ -177,18 +204,40 @@ func canonicalSnapshotKey(path string) string {
 	// searched for "src/utils/parser.go", so every snapshot silently
 	// stopped being found on the remote instance. Strip backslashes
 	// explicitly, independent of which OS this binary itself targets.
-	return filepath.Clean(strings.ReplaceAll(strings.TrimSpace(path), "\\", "/"))
+	p := strings.ReplaceAll(strings.TrimSpace(path), "\\", "/")
+	// A follow-up audit caught the Windows drive letter itself wasn't
+	// normalized either: "H:\..." and "h:\..." are the same real path on
+	// Windows (drive letters are case-insensitive) but produced two
+	// different cache keys — a snapshot recorded via one casing silently
+	// stopped being found by a lookup using the other. Only the drive
+	// letter gets lowercased; the rest of the path is left alone since
+	// Linux/macOS paths genuinely are case-sensitive.
+	if len(p) >= 2 && p[1] == ':' && p[0] >= 'A' && p[0] <= 'Z' {
+		p = strings.ToLower(p[:1]) + p[1:]
+	}
+	return filepath.Clean(p)
 }
 
 func getSessionSnapshot(sessionID, path string) (string, bool) {
 	sessionSnapLock.RLock()
 	defer sessionSnapLock.RUnlock()
-	m := sessionSnapMap[sessionID]
-	if m == nil {
-		return "", false
+	key := canonicalSnapshotKey(path)
+	if m := sessionSnapMap[sessionID]; m != nil {
+		if v, ok := m[key]; ok {
+			return v, true
+		}
 	}
-	v, ok := m[canonicalSnapshotKey(path)]
-	return v, ok
+	// Same parent-session fallback as GetSessionCWD, for the same reason:
+	// a subagent's own first edit call has no snapshots of its own yet,
+	// but the parent session it was spawned from (and read the same file
+	// in) already does.
+	if parent, ok := parentSessionKey(sessionID); ok {
+		if m := sessionSnapMap[parent]; m != nil {
+			v, ok := m[key]
+			return v, ok
+		}
+	}
+	return "", false
 }
 
 // isSessionSnapshotFull reports whether the currently stored snapshot for
@@ -570,7 +619,16 @@ func normalizeEditToolCallKeys(toolName string, argsRaw string) (string, bool) {
 	// renaming its genuinely-correct "notebook_path" to "file_path" would
 	// break it, not fix it.
 	nameLower := strings.ToLower(toolName)
-	if nameLower != "edit" && nameLower != "str_replace_editor" && nameLower != "update" {
+	isEditLike := nameLower == "edit" || nameLower == "str_replace_editor" || nameLower == "update"
+	// A follow-up audit caught that Write and Read — real Claude Code
+	// tools needing the exact same file_path key, just with no old_string/
+	// new_string concept at all — got NO alias normalization whatsoever,
+	// the same "path" confusion already fixed for Edit. (Read has no
+	// "content" input parameter to alias at all — the audit's claimed
+	// "text -> content for Read" doesn't correspond to a real field —
+	// so only file_path is normalized for it, same as Write.)
+	isWriteOrRead := nameLower == "write" || nameLower == "read"
+	if !isEditLike && !isWriteOrRead {
 		return argsRaw, false
 	}
 	parsed := gjson.Parse(argsRaw)
@@ -592,8 +650,16 @@ func normalizeEditToolCallKeys(toolName string, argsRaw string) (string, bool) {
 		}
 	}
 	rename("file_path", []string{"path", "notebook_path", "target_file"})
-	rename("old_string", []string{"old_str", "old_text", "pattern"})
-	rename("new_string", []string{"new_str", "new_text"})
+	if isEditLike {
+		rename("old_string", []string{"old_str", "old_text", "pattern"})
+		rename("new_string", []string{"new_str", "new_text"})
+	}
+	if nameLower == "write" {
+		// Write's real "content" field is plausibly confused with "text",
+		// the same way models confuse "content"/"text" for tool_result
+		// bodies elsewhere in this gateway's own translation layer.
+		rename("content", []string{"text"})
+	}
 	return argsRaw, renamed
 }
 
@@ -643,8 +709,20 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 	// not digit+tab prefixes). Clean it the same way, before any
 	// matching attempt below; a no-op for the overwhelmingly common case
 	// of a real old_string with no such prefixes.
+	// An audit caught that every early return below this point used a
+	// bare "false" regardless of whether the cat-n strip just above
+	// actually changed anything — both call sites of RepairEditToolCall
+	// only adopt the returned argsRaw when the bool is true, discarding
+	// it (and the cleanup baked into it) on false. A model-copied old_string
+	// that, once cleaned, turned out to already match the file exactly
+	// (the single most common outcome of this exact cleanup) silently
+	// sent the ORIGINAL, still-line-number-polluted old_string to the
+	// client instead of the cleaned one — it had already lost its one
+	// chance to ever get cleaned.
+	catNCleaned := false
 	if cleaned := stripCatNPrefix(oldStr); cleaned != oldStr {
 		oldStr = cleaned
+		catNCleaned = true
 		if withClean, err := sjson.Set(argsRaw, oldStrKey, oldStr); err == nil {
 			argsRaw = withClean
 		}
@@ -691,14 +769,15 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 			snap, ok = getSessionSnapshot(sessionID, cwdCandidate)
 		}
 		if !ok {
-			return argsRaw, false
+			return argsRaw, catNCleaned
 		}
 		fileContent = snap
 	}
 
-	// Direct byte-for-byte match already exists! No repair needed.
+	// Direct byte-for-byte match already exists! No repair needed (beyond
+	// the cat-n cleanup already baked into argsRaw above, if any).
 	if strings.Contains(fileContent, oldStr) {
-		return argsRaw, false
+		return argsRaw, catNCleaned
 	}
 
 	// Locate new_string's key too (same naming pairs as old_string, minus
@@ -801,7 +880,7 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 		}
 	}
 
-	return argsRaw, false
+	return argsRaw, catNCleaned
 }
 
 // reapplyLineIndents prepends lineIndents[j] onto newStr's line j, for every
