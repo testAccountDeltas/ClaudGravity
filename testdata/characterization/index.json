@@ -1,0 +1,550 @@
+[
+  {
+    "file": "001_rid1.json",
+    "source_ndjson": "local-2026-10-17.ndjson",
+    "rid": "1",
+    "tags": [
+      "nonstreaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "002_rid2.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "2",
+    "tags": [
+      "streaming",
+      "thinking"
+    ]
+  },
+  {
+    "file": "003_rid24.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "24",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "004_rid23.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "23",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "005_rid22.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "22",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "006_rid21.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "21",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "007_rid20.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "20",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "008_rid19.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "19",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "009_rid18.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "18",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "010_rid17.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "17",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "011_rid16.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "16",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "012_rid15.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "15",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "013_rid14.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "14",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "014_rid13.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "13",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "015_rid12.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "12",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "016_rid11.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "11",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "017_rid10.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "10",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "018_rid9.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "9",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "019_rid8.json",
+    "source_ndjson": "remote-2026-10-18-tail.ndjson",
+    "rid": "8",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "020_rid89.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "89",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "021_rid88.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "88",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "022_rid87.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "87",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "023_rid86.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "86",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "024_rid85.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "85",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "025_rid84.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "84",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "026_rid83.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "83",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "027_rid82.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "82",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "028_rid81.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "81",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "029_rid80.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "80",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "030_rid79.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "79",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "031_rid78.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "78",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "032_rid77.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "77",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "033_rid76.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "76",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "034_rid75.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "75",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "035_rid74.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "74",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "036_rid73.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "73",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "037_rid72.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "72",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "038_rid71.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "71",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "039_rid70.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "70",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "040_rid69.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "69",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "041_rid68.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "68",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "042_rid67.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "67",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "043_rid66.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "66",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "044_rid65.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "65",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "045_rid64.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "64",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "046_rid63.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "63",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "047_rid62.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "62",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "048_rid61.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "61",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "049_rid60.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "60",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  },
+  {
+    "file": "050_rid59.json",
+    "source_ndjson": "remote-2026-10-17.ndjson",
+    "rid": "59",
+    "tags": [
+      "streaming",
+      "thinking",
+      "tool_result",
+      "tool_use"
+    ]
+  }
+]

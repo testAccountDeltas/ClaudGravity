@@ -1,0 +1,293 @@
+{
+  "claude_request": {
+    "body": {
+      "max_tokens": 1024,
+      "messages": [
+        {
+          "content": [
+            {
+              "text": "\u003credacted text:582 chars\u003e",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "content": [
+            {
+              "text": "Сейчас прочитаю CLAUDE.md для контекста.",
+              "type": "text"
+            },
+            {
+              "id": "toolu_NORMALIZED",
+              "input": {
+                "file_path": "CLAUDE.md"
+              },
+              "name": "Read",
+              "type": "tool_use"
+            }
+          ],
+          "role": "assistant"
+        },
+        {
+          "content": [
+            {
+              "content": "# ClaudGravity entry point\nSee AGENT_HANDOFF_NOTES.md before touching code.",
+              "tool_use_id": "toolu_NORMALIZED",
+              "type": "tool_result"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-4-5",
+      "stream": false,
+      "system": [
+        {
+          "text": "You are Claude Code, an AI coding assistant.",
+          "type": "text"
+        }
+      ],
+      "tools": [
+        {
+          "description": "Read a file",
+          "input_schema": {
+            "properties": {
+              "file_path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "file_path"
+            ],
+            "type": "object"
+          },
+          "name": "Read"
+        }
+      ]
+    },
+    "headers": {
+      "Accept": "*/*",
+      "Anthropic-Version": "2023-06-01",
+      "Content-Length": "1328",
+      "Content-Type": "application/json",
+      "User-Agent": "curl/8.18.0",
+      "X-Api-Key": "\u003cpresent, 50 chars\u003e"
+    }
+  },
+  "claude_response": {
+    "body": {
+      "content": [
+        {
+          "signature": "skip_thought_signature_validator",
+          "thinking": "\u003credacted text:1442 chars\u003e",
+          "type": "thinking"
+        },
+        {
+          "id": "toolu_NORMALIZED",
+          "input": {
+            "file_path": "AGENT_HANDOFF_NOTES.md"
+          },
+          "name": "Read",
+          "type": "tool_use"
+        }
+      ],
+      "id": "msg_NORMALIZED",
+      "model": "claude-opus-4-5",
+      "role": "assistant",
+      "stop_reason": "tool_use",
+      "stop_sequence": null,
+      "type": "message",
+      "usage": {
+        "input_tokens": 209,
+        "output_tokens": 23
+      }
+    },
+    "headers": {
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, x-claude-code-request-class, x-claude-code-agent-type, x-claude-code-agent-id, x-claude-code-prompt-id, x-session-id, x-claude-code-session-id",
+      "Access-Control-Allow-Methods": "POST, GET, OPTIONS, DELETE, PUT",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "anthropic-version, request-id, retry-after, anthropic-organization-id, anthropic-workspace-id, anthropic-ratelimit-requests-limit, anthropic-ratelimit-requests-remaining, anthropic-ratelimit-requests-reset, anthropic-ratelimit-tokens-limit, anthropic-ratelimit-tokens-remaining, anthropic-ratelimit-tokens-reset, anthropic-ratelimit-unified-5h-status, anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, anthropic-ratelimit-unified-7d-status, anthropic-ratelimit-unified-7d-utilization, anthropic-ratelimit-unified-7d-reset, anthropic-ratelimit-unified-status, anthropic-ratelimit-unified-representative-claim, anthropic-ratelimit-unified-reset",
+      "Anthropic-Organization-Id": "0bad747f-0000-4000-a000-000000000000",
+      "Anthropic-Ratelimit-Requests-Limit": "1000",
+      "Anthropic-Ratelimit-Requests-Remaining": "1000",
+      "Anthropic-Ratelimit-Requests-Reset": "2026-10-18T03:14:44Z",
+      "Anthropic-Ratelimit-Tokens-Limit": "\u003cpresent, 7 chars\u003e",
+      "Anthropic-Ratelimit-Tokens-Remaining": "\u003cpresent, 7 chars\u003e",
+      "Anthropic-Ratelimit-Tokens-Reset": "\u003cpresent, 20 chars\u003e",
+      "Anthropic-Ratelimit-Unified-5h-Reset": "1792293284",
+      "Anthropic-Ratelimit-Unified-5h-Status": "allowed",
+      "Anthropic-Ratelimit-Unified-5h-Utilization": "0.00",
+      "Anthropic-Ratelimit-Unified-7d-Reset": "1792328281",
+      "Anthropic-Ratelimit-Unified-7d-Status": "allowed",
+      "Anthropic-Ratelimit-Unified-7d-Utilization": "0.43",
+      "Anthropic-Ratelimit-Unified-Overage-Disabled-Reason": "org_level_disabled",
+      "Anthropic-Ratelimit-Unified-Overage-Status": "rejected",
+      "Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day",
+      "Anthropic-Ratelimit-Unified-Reset": "1792328281",
+      "Anthropic-Ratelimit-Unified-Status": "allowed",
+      "Anthropic-Version": "2023-06-01",
+      "Anthropic-Workspace-Id": "wrkspc_0000000000000000000000000",
+      "Content-Type": "application/json",
+      "Request-Id": "\u003cnormalized:request-id\u003e"
+    }
+  },
+  "gemini_request": {
+    "body": {
+      "contents": [
+        {
+          "parts": [
+            {
+              "text": "\u003credacted text:582 chars\u003e"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "parts": [
+            {
+              "text": "Сейчас прочитаю CLAUDE.md для контекста."
+            },
+            {
+              "functionCall": {
+                "args": {
+                  "file_path": "CLAUDE.md"
+                },
+                "id": "toolu_NORMALIZED",
+                "name": "Read"
+              },
+              "thoughtSignature": "\u003cnormalized:thoughtsignature\u003e"
+            }
+          ],
+          "role": "model"
+        },
+        {
+          "parts": [
+            {
+              "functionResponse": {
+                "id": "toolu_NORMALIZED",
+                "name": "Read",
+                "response": {
+                  "result": "# ClaudGravity entry point\nSee AGENT_HANDOFF_NOTES.md before touching code."
+                }
+              }
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "generationConfig": {
+        "maxOutputTokens": 65536,
+        "thinkingConfig": {
+          "includeThoughts": true,
+          "thinkingBudget": -1
+        }
+      },
+      "safetySettings": [
+        {
+          "category": "HARM_CATEGORY_HARASSMENT",
+          "threshold": "OFF"
+        },
+        {
+          "category": "HARM_CATEGORY_HATE_SPEECH",
+          "threshold": "OFF"
+        },
+        {
+          "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+          "threshold": "OFF"
+        },
+        {
+          "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+          "threshold": "OFF"
+        },
+        {
+          "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
+          "threshold": "BLOCK_NONE"
+        }
+      ],
+      "system_instruction": {
+        "parts": [
+          {
+            "text": "You are Claude Code, an AI coding assistant."
+          }
+        ]
+      },
+      "tools": [
+        {
+          "functionDeclarations": [
+            {
+              "description": "Read a file",
+              "name": "Read",
+              "parameters": {
+                "properties": {
+                  "file_path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file_path"
+                ],
+                "type": "object"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "gemini_response": {
+    "body": {
+      "metadata": {},
+      "response": {
+        "candidates": [
+          {
+            "content": {
+              "parts": [
+                {
+                  "text": "\u003credacted text:1442 chars\u003e",
+                  "thought": true
+                },
+                {
+                  "functionCall": {
+                    "args": {
+                      "file_path": "AGENT_HANDOFF_NOTES.md"
+                    },
+                    "id": "call_4293740",
+                    "name": "Read"
+                  },
+                  "thoughtSignature": "\u003cnormalized:thoughtsignature\u003e"
+                }
+              ],
+              "role": "model"
+            },
+            "finishMessage": "Model generated function call(s).",
+            "finishReason": "STOP"
+          }
+        ],
+        "modelVersion": "gemini-3.8-flash-tiered",
+        "responseId": "T_PTapicLv_sxs0Pipa3gQE",
+        "usageMetadata": {
+          "candidatesTokenCount": 23,
+          "promptTokenCount": 209,
+          "thoughtsTokenCount": 259,
+          "totalTokenCount": 491
+        }
+      },
+      "traceId": "d36cf76f550840ab"
+    },
+    "headers": {
+      "Alt-Svc": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000",
+      "Content-Type": "application/json; charset=UTF-8",
+      "Date": "Sat, 17 Oct 2026 22:14:44 GMT",
+      "Server": "ESF",
+      "Server-Timing": "gfet4t7; dur=5013",
+      "Vary": "Origin, X-Origin, Referer",
+      "X-Cloudaicompanion-Trace-Id": "d36cf76f550840ab",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "SAMEORIGIN",
+      "X-Xss-Protection": "0"
+    }
+  },
+  "rid": 1,
+  "timestamp": "\u003cnormalized:timestamp\u003e"
+}

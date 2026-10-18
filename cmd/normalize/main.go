@@ -39,6 +39,26 @@ import (
 // mattering.
 var idPattern = regexp.MustCompile(`^(msg|toolu)_[A-Za-z0-9_-]+$`)
 
+// winUserPathPattern/winAgyPathPattern mask the developer machine's
+// identity out of real captured traffic before it becomes a public-repo
+// fixture: speccapture.go's >200-char redaction threshold deliberately
+// leaves short strings alone (that's the structure this tool needs), but a
+// short Bash command or file_path argument can still embed the literal
+// local username (C:\Users\<name>) or workspace path (<drive>:\agy\<repo>).
+// These match a path PREFIX and leave the rest of the path after it
+// intact, so "H:/agy/superrelay/translator.go" becomes
+// "/workspace/translator.go" rather than losing the useful relative part.
+var (
+	winUserPathPattern = regexp.MustCompile(`(?i)[A-Za-z]:[\\/]Users[\\/][^\\/"]+`)
+	winAgyPathPattern  = regexp.MustCompile(`(?i)[A-Za-z]:[\\/]agy[\\/][^\\/"]+`)
+)
+
+func maskLocalPaths(s string) string {
+	s = winUserPathPattern.ReplaceAllString(s, "/home/<user>")
+	s = winAgyPathPattern.ReplaceAllString(s, "/workspace")
+	return s
+}
+
 // maskedKeys are JSON object keys whose VALUE is masked unconditionally
 // wherever they appear, regardless of nesting — these are exactly the
 // four non-deterministic field classes named in Part 7.1 of the spec.
@@ -104,7 +124,7 @@ func normalize(v interface{}) interface{} {
 			prefix := strings.SplitN(t, "_", 2)[0]
 			return prefix + "_NORMALIZED"
 		}
-		return t
+		return maskLocalPaths(t)
 	default:
 		return v
 	}
