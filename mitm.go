@@ -234,6 +234,19 @@ func proxyAuthOK(r *http.Request, secret string) bool {
 // gateway intercepts, or a subdomain of one — not merely a string that
 // contains it anywhere.
 func isAnthropicHost(host string) bool {
+	// An audit caught that HandleConnectTunnel's own caller already
+	// splits off the port before calling this (net.SplitHostPort at its
+	// call site), but PassthroughToReal calls this directly on r.Host,
+	// which can still carry a port (e.g. "claude.ai:443") — neither the
+	// exact-match nor the suffix-match below ever accounts for one, so a
+	// host string with its port still attached silently fails to match
+	// at all, routing the request to the wrong destination
+	// (api.anthropic.com instead of claude.ai, or vice versa). Strip a
+	// port here unconditionally so every caller is correct regardless of
+	// whether it already split one off itself.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
 	host = strings.ToLower(host)
 	// A trailing "." (valid DNS syntax for "fully qualified") must not let
 	// a client dodge this match and fall through to the plain tunnel path
@@ -610,7 +623,32 @@ func PassthroughToReal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	// An audit caught that a plain io.Copy here never flushes:
+	// MitmResponseWriter.Write only appends to its internal buffer, and
+	// nothing reaches the actual TLS connection until Flush() or Close()
+	// runs — Close() only fires once the whole handler has returned, so a
+	// real long-lived streaming response passed straight through to
+	// claude.ai/api.anthropic.com (anything this gateway hasn't
+	// implemented itself) was fully buffered until it finished, instead
+	// of streaming to the client as it arrived. Copy manually and flush
+	// after every chunk, the same http.Flusher pattern already used for
+	// this gateway's own SSE responses (server.go, websearch.go).
+	flusher, hasFlusher := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				break
+			}
+			if hasFlusher {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
 }
 
 // An audit caught that http.Client's Timeout bounds the ENTIRE exchange —
@@ -746,6 +784,13 @@ func (w *MitmResponseWriter) sendHeaders(chunked bool) {
 	w.chunked = chunked
 	if chunked {
 		w.header.Set("Transfer-Encoding", "chunked")
+	} else if w.statusCode == http.StatusNoContent {
+		// An audit caught this unconditionally set Content-Length (to 0,
+		// since a 204 body is always empty) — RFC 7230 §3.3.2 says a
+		// server MUST NOT send Content-Length on a 204 response at all,
+		// not even a zero one; some strict HTTP/1.1 parsers (Node.js/Bun,
+		// which Claude Code's own CLI runs on) reject it outright.
+		w.header.Del("Content-Length")
 	} else if w.header.Get("Content-Length") == "" {
 		w.header.Set("Content-Length", strconv.Itoa(w.buf.Len()))
 	}

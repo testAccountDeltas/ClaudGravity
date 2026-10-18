@@ -146,7 +146,17 @@ func DeriveConversationAnchor(bodyBytes []byte, headerSessionID string, instance
 	}
 
 	h := sha256.Sum256([]byte(cleanFirst))
-	return "conv:" + hex.EncodeToString(h[:12])
+	anchor := "conv:" + hex.EncodeToString(h[:12])
+	// An audit caught this last-resort fallback had the same instanceID
+	// gap as the metadata.session_id branch above (already fixed in an
+	// earlier round) — when BOTH the header and metadata.session_id are
+	// absent, parallel subagents sharing an identical (or near-identical,
+	// truncated-to-500-chars) first user message collapse onto this same
+	// hash, and thus the same Google account.
+	if instanceID != "" {
+		return anchor + ":" + instanceID
+	}
+	return anchor
 }
 
 // SelectAccount chooses an account for a request based on tenant strategy,

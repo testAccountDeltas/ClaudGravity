@@ -509,13 +509,21 @@ func (s *SSEStreamer) HandleText(text string) error {
 // likely to collapse its args into.
 var toolPrimaryStringParam = map[string]string{
 	"bash":               "command",
+	"powershell":         "command",
+	"pwsh":               "command",
 	"read":               "file_path",
-	"write":              "file_path",
 	"edit":               "file_path",
 	"notebookedit":       "notebook_path",
 	"grep":               "pattern",
 	"glob":               "pattern",
 	"str_replace_editor": "path",
+	// "write" deliberately omitted: Write always requires BOTH file_path
+	// and content, so a bare string can never fully satisfy it either
+	// way. Mapping it onto "file_path" (the previous behavior) meant a
+	// bare string that was actually meant as the file's CONTENT got
+	// treated as its path instead — confusing and wrong in the common
+	// case. Falling through to {} (missing both params) is a clearer,
+	// more honest failure than a plausible-looking but incorrect guess.
 }
 
 func normalizeToolCallArgsToObject(name, argsRaw string) string {
@@ -935,8 +943,20 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 		if pt := um.Get("promptTokenCount").Int(); pt > 0 {
 			s.inputTokens = pt
 		}
-		if ct := um.Get("candidatesTokenCount").Int(); ct > 0 {
-			s.outputTokens = ct
+		// An audit caught that Anthropic's own extended-thinking spec
+		// bills thinking tokens as output tokens ("thinking tokens are
+		// billed as output tokens and included in usage.output_tokens"),
+		// but this only ever read candidatesTokenCount — a response with
+		// 1246 thought tokens and 59 visible text tokens reported
+		// output_tokens:59 instead of 1305, undercounting by >95% and
+		// corrupting /usage statistics and local quota tracking. Also
+		// widened the guard: a candidatesTokenCount of 0 with a non-zero
+		// thoughtsTokenCount (a turn that's pure thinking, e.g. right
+		// before a tool call) previously updated outputTokens at all.
+		ct := um.Get("candidatesTokenCount").Int()
+		tt := um.Get("thoughtsTokenCount").Int()
+		if ct > 0 || tt > 0 {
+			s.outputTokens = ct + tt
 		}
 		if cc := um.Get("cachedContentTokenCount").Int(); cc > 0 {
 			s.cacheTokens = cc

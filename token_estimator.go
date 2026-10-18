@@ -35,7 +35,13 @@ func estimateImageTokens(b64Data string) int {
 	if b64Data == "" {
 		return anthropicImageTokenFloor
 	}
-	raw, err := base64.StdEncoding.DecodeString(stripBase64Whitespace(b64Data))
+	// An audit caught that a client sending a full data URI
+	// ("data:image/png;base64,...") instead of bare base64 made
+	// DecodeString fail outright on the non-base64 "data:image/png;base64,"
+	// prefix, silently falling to the flat floor regardless of the
+	// image's real size — translator.go already strips this same prefix
+	// before decoding for the actual translation path.
+	raw, err := base64.StdEncoding.DecodeString(stripBase64Whitespace(stripDataURIPrefix(b64Data)))
 	if err != nil || len(raw) == 0 {
 		return anthropicImageTokenFloor
 	}

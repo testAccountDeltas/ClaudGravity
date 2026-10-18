@@ -334,8 +334,14 @@ func checkSSEEventSequence(rec CaptureRecord) []Violation {
 	if first != "message_start" {
 		out = append(out, violation(rec, fmt.Sprintf("stream started with %q, expected message_start", first)))
 	}
-	if last != "message_stop" {
-		out = append(out, violation(rec, fmt.Sprintf("stream ended with %q, expected message_stop", last)))
+	// An audit caught this flagged every stream that failed mid-generation
+	// as a protocol violation — Anthropic's own documented SSE protocol
+	// allows a stream to terminate with an "error" event instead of the
+	// normal message_delta -> message_stop pair when generation fails,
+	// and the server closes the connection right after; that's a
+	// legitimate terminal state, not a sequencing bug.
+	if last != "message_stop" && last != "error" {
+		out = append(out, violation(rec, fmt.Sprintf("stream ended with %q, expected message_stop (or error)", last)))
 	}
 	openBlocks := map[float64]bool{}
 	for _, e := range eventsRaw {

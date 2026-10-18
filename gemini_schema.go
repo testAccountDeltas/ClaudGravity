@@ -755,6 +755,13 @@ var unsupportedConstraints = []string{
 	"default", "example", "examples", // Claude rejects these in VALIDATED mode
 	"prefixItems", "uniqueItems", "contains", "minContains", "maxContains",
 	"dependencies", "dependentRequired", "dependentSchemas", "contentEncoding", "contentMediaType",
+	// An audit caught patternProperties was only ever in
+	// removeUnsupportedKeywords' DELETE list, never in this
+	// extract-to-description list — a free-dict schema validating its
+	// keys by regex (e.g. "^[A-Z_]+$": {...}) lost that constraint
+	// completely with no trace, instead of degrading to a description
+	// hint like every other unsupported keyword here.
+	"patternProperties",
 	"readOnly", "writeOnly", "deprecated",
 	"unevaluatedProperties", "unevaluatedItems", "$comment",
 	"if", "then", "else", "not",
@@ -1199,6 +1206,18 @@ func mergeObjectBranches(branches []gjson.Result) string {
 		raw          string
 		constValues  []string
 		isConstField bool
+		// An audit caught that merging a shared nested object property's
+		// own "required" list (right below) took the UNION of every
+		// branch's nested required fields, unlike the top-level required
+		// merge further down (which correctly takes the INTERSECTION via
+		// requiredSets) — a shared "config" sub-object where branch
+		// "create" needs config.create_token and branch "delete" needs
+		// config.delete_token ended up requiring BOTH simultaneously,
+		// making every call fail validation regardless of which action
+		// was chosen. Track each branch's own nested required list here
+		// so the intersection can be computed the same way as top-level,
+		// instead of blindly accumulating.
+		nestedRequiredSets [][]string
 	}
 	order := make([]string, 0)
 	props := make(map[string]*propEntry)
@@ -1232,25 +1251,23 @@ func mergeObjectBranches(branches []gjson.Result) string {
 					// way mergeAllOfPropertiesInto already does for allOf
 					// collisions.
 					entry.raw = mergeAllOfPropertiesInto(entry.raw, "properties", pv.Get("properties"))
+				}
+				// Record EVERY branch's own nested required list for this
+				// property (not just the merge case) — an audit caught the
+				// old code UNIONed these as it went, requiring a sub-field
+				// from EVERY branch simultaneously (e.g. config.create_token
+				// AND config.delete_token both mandatory) instead of only
+				// the sub-fields common to ALL branches that declare this
+				// property, mirroring the (correct) top-level
+				// requiredSets/intersection logic below.
+				if pv.Get("properties").IsObject() {
+					var nestedReq []string
 					if newReq := pv.Get("required"); newReq.IsArray() {
-						seen := make(map[string]bool)
-						var merged []string
-						if existingReq := gjson.Parse(entry.raw).Get("required"); existingReq.IsArray() {
-							for _, r := range existingReq.Array() {
-								if !seen[r.String()] {
-									seen[r.String()] = true
-									merged = append(merged, r.String())
-								}
-							}
-						}
 						for _, r := range newReq.Array() {
-							if !seen[r.String()] {
-								seen[r.String()] = true
-								merged = append(merged, r.String())
-							}
+							nestedReq = append(nestedReq, r.String())
 						}
-						entry.raw, _ = sjson.Set(entry.raw, "required", merged)
 					}
+					entry.nestedRequiredSets = append(entry.nestedRequiredSets, nestedReq)
 				}
 				if c := pv.Get("const"); c.Exists() {
 					entry.isConstField = true
@@ -1301,6 +1318,30 @@ func mergeObjectBranches(branches []gjson.Result) string {
 				if !gjson.Get(raw, "type").Exists() {
 					raw, _ = sjson.Set(raw, "type", "string")
 				}
+			}
+		}
+		if len(entry.nestedRequiredSets) > 0 {
+			nestedCounts := make(map[string]int)
+			for _, set := range entry.nestedRequiredSets {
+				seen := make(map[string]bool)
+				for _, f := range set {
+					if !seen[f] {
+						seen[f] = true
+						nestedCounts[f]++
+					}
+				}
+			}
+			var nestedMerged []string
+			for f, n := range nestedCounts {
+				if n == len(entry.nestedRequiredSets) {
+					nestedMerged = append(nestedMerged, f)
+				}
+			}
+			sort.Strings(nestedMerged)
+			if len(nestedMerged) > 0 {
+				raw, _ = sjson.Set(raw, "required", nestedMerged)
+			} else {
+				raw, _ = sjson.Delete(raw, "required")
 			}
 		}
 		mergedProps, _ = sjson.SetRaw(mergedProps, escapeGJSONPathKey(key), raw)

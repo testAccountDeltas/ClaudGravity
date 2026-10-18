@@ -212,7 +212,10 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 	deadRefreshTokensMu.Unlock()
 	if isDead {
 		if time.Now().Before(deadUntil) {
-			return "", fmt.Errorf("refresh token for %s is known invalid (invalid_grant), retry after cooldown", email)
+			// Generic wording now that this cache also covers a short-lived
+			// network-failure cooldown, not just a definitively invalid
+			// refresh token.
+			return "", fmt.Errorf("refresh for %s recently failed, retry after cooldown", email)
 		}
 		deadRefreshTokensMu.Lock()
 		delete(deadRefreshTokens, email)
@@ -237,6 +240,21 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		// An audit caught that a genuine network-level failure here
+		// (timeout, DNS failure, connection refused — this call has its
+		// own 15s ctx deadline above) was never cached at all, unlike an
+		// explicit OAuth error response. acc.refreshMu is held for this
+		// entire function, so N parallel callers for the same account
+		// (common for subagents) serialize one after another, each
+		// re-attempting and re-timing-out independently — N*15s of total
+		// blocking instead of one real attempt. A SHORT negative cache
+		// (far shorter than deadRefreshTokenCooldown's 5 minutes, which is
+		// reserved for a definitively broken account per the OAuth-error
+		// case below) lets concurrent waiters fail fast without
+		// meaningfully delaying recovery once the blip passes.
+		deadRefreshTokensMu.Lock()
+		deadRefreshTokens[email] = time.Now().Add(10 * time.Second)
+		deadRefreshTokensMu.Unlock()
 		return "", err
 	}
 	defer resp.Body.Close()

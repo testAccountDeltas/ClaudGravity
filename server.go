@@ -598,6 +598,40 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"first_token_date":null}`))
 	}
+	// An audit flagged these as unregistered (independent of its own
+	// unverifiable claude.exe decompile byte-offsets, which we don't rely
+	// on — the structural fact that these paths are absent from this
+	// file is checked directly): same failure mode as every other
+	// unhandled CLI control endpoint above, either a 401 Basic Auth
+	// locally or a PassthroughToReal leak to the real api.anthropic.com.
+	handleNotificationPreferencesJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"account_id":"` + fakeAccountID + `","organization_id":"` + fakeOrgID + `","preferences":{"feature_preference":{"bogosort":{"enable_push":true}}},"push_reachability":{"has_active_channel":true,"platforms":["cli"]}}`))
+	}
+	handleOAuthAccountSettingsJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}
+	handleGroveNoticeViewedJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"viewed":true}`))
+	}
+	// Background cache-keepalive ping — CLI permanently disables this
+	// background refresh for the session after 3 consecutive failures,
+	// so leaving it 404ing/401ing isn't just one warning, it's a
+	// permanently degraded prefix cache for the rest of the session.
+	handleCacheTouchJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","touched":true}`))
+	}
+	handleModelSelectorJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}
+	handleResetRateLimitsJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}
 
 	mux.HandleFunc("/api/claude_cli_profile", handleProfileJSON)
 	mux.HandleFunc("/api/oauth/profile", handleProfileJSON)
@@ -631,6 +665,12 @@ func main() {
 	// registered — some CLI versions request the plural
 	// "organizations" form instead.
 	mux.HandleFunc("/api/organizations/claude_code_first_token_date", handleFirstTokenDateJSON)
+	mux.HandleFunc("/api/claude_code/notification/preferences", handleNotificationPreferencesJSON)
+	mux.HandleFunc("/api/oauth/account/settings", handleOAuthAccountSettingsJSON)
+	mux.HandleFunc("/api/oauth/account/grove_notice_viewed", handleGroveNoticeViewedJSON)
+	mux.HandleFunc("/v1/messages/cache_touch", handleCacheTouchJSON)
+	mux.HandleFunc("/api/organizations/{id}/model_selector/{surface}", handleModelSelectorJSON)
+	mux.HandleFunc("/api/organizations/{id}/reset_rate_limits", handleResetRateLimitsJSON)
 
 	// Separate mux for TLS-intercepted anthropic.com/claude.ai traffic (see
 	// HandleConnectTunnel). This must NOT be the same mux as above: that one
@@ -722,6 +762,12 @@ func main() {
 	interceptedMux.Handle("/api/claude_code/policy_limits", commonAPIMiddleware(http.HandlerFunc(handlePolicyLimitsJSON)))
 	interceptedMux.Handle("/api/organization/claude_code_first_token_date", commonAPIMiddleware(http.HandlerFunc(handleFirstTokenDateJSON)))
 	interceptedMux.Handle("/api/organizations/claude_code_first_token_date", commonAPIMiddleware(http.HandlerFunc(handleFirstTokenDateJSON)))
+	interceptedMux.Handle("/api/claude_code/notification/preferences", commonAPIMiddleware(http.HandlerFunc(handleNotificationPreferencesJSON)))
+	interceptedMux.Handle("/api/oauth/account/settings", commonAPIMiddleware(http.HandlerFunc(handleOAuthAccountSettingsJSON)))
+	interceptedMux.Handle("/api/oauth/account/grove_notice_viewed", commonAPIMiddleware(http.HandlerFunc(handleGroveNoticeViewedJSON)))
+	interceptedMux.Handle("/v1/messages/cache_touch", commonAPIMiddleware(http.HandlerFunc(handleCacheTouchJSON)))
+	interceptedMux.Handle("/api/organizations/{id}/model_selector/{surface}", commonAPIMiddleware(http.HandlerFunc(handleModelSelectorJSON)))
+	interceptedMux.Handle("/api/organizations/{id}/reset_rate_limits", commonAPIMiddleware(http.HandlerFunc(handleResetRateLimitsJSON)))
 	interceptedMux.Handle("/v1/embeddings", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleEmbeddings(cfgMgr, w, r)
 	})))
@@ -844,11 +890,34 @@ func estimateInlineDataBytes(root gjson.Result) int {
 			return
 		}
 		blocks.ForEach(func(_, block gjson.Result) bool {
-			switch block.Get("type").String() {
+			ptype := block.Get("type").String()
+			switch ptype {
 			case "image", "document":
 				src := block.Get("source")
 				if src.Get("type").String() == "base64" {
-					total += len(src.Get("data").String())
+					// An audit caught this summed EVERY base64 image/document
+					// block's raw length toward the 20MB inlineData limit,
+					// regardless of media type — but translator.go only ever
+					// sends application/pdf and image/* (excluding SVG, which
+					// it decodes as text) as actual inlineData; a base64 TEXT
+					// document (CSV, code, logs — common for big data files)
+					// gets decoded to a plain text part and NEVER touches
+					// Gemini's real inlineData limit at all, so counting it
+					// here produced false HTTP 413s on large text-only
+					// requests well under any real limit. Mirror translator.go's
+					// own routing condition exactly instead of assuming every
+					// base64 block is binary.
+					mediaType := strings.ToLower(src.Get("media_type").String())
+					if mediaType == "" {
+						if ptype == "document" {
+							mediaType = "application/pdf"
+						} else {
+							mediaType = "image/png"
+						}
+					}
+					if mediaType != "image/svg+xml" && (mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/")) {
+						total += len(src.Get("data").String())
+					}
 				}
 			case "tool_result":
 				c := block.Get("content")
@@ -1408,6 +1477,17 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 					// re-failed on the same dead token instead of forcing
 					// a genuine refresh.
 					globalAccountManager.InvalidateAccessToken(activeAcc.Email)
+				} else if lastStatus == http.StatusServiceUnavailable {
+					// An audit caught 503 (Google UNAVAILABLE, typically a
+					// transient overload) was excluded only for THIS
+					// request's own retry attempts, same gap 429/403/401
+					// already had fixed — the very next user request got
+					// routed right back onto the same overloaded account
+					// with no cooldown at all. Shorter than 429's 15min
+					// since this is more likely a brief blip than real
+					// quota exhaustion, but long enough that the immediate
+					// next request or two doesn't retry it either.
+					globalAccountManager.MarkAccountCooldown(activeAcc.Email, 3*time.Minute)
 				}
 			}
 			return
@@ -1448,6 +1528,9 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				// same rejected token until it happened to hit its real
 				// ExpiresAt. Force a genuine refresh next time instead.
 				globalAccountManager.InvalidateAccessToken(activeAcc.Email)
+			} else if lastStatus == http.StatusServiceUnavailable {
+				// Same 503-cooldown gap as the early-headers branch above.
+				globalAccountManager.MarkAccountCooldown(activeAcc.Email, 3*time.Minute)
 			}
 		}
 
@@ -2140,7 +2223,13 @@ func executeNonStreaming(
 				"model":   blockRespModel,
 				"content": []map[string]interface{}{{"type": "text", "text": "I am unable to complete this request because it was flagged by upstream safety filters: " + br}},
 				"usage": map[string]interface{}{
-					"input_tokens":  0,
+					// An audit caught this was hardcoded to 0 rather than a
+					// real estimate — a safety refusal still consumed real
+					// input tokens upstream (the whole prompt had to be
+					// read before Google could flag it), so reporting 0
+					// understated actual usage in the client's own /usage
+					// tracking.
+					"input_tokens":  estimateApproxClaudeTokens(claudeBodyBytes),
 					"output_tokens": 0,
 				},
 				"stop_reason":   "refusal",
@@ -2165,7 +2254,12 @@ func executeNonStreaming(
 		}
 	}
 	inTok := geminiJSON.Get("usageMetadata.promptTokenCount").Int()
-	outTok := geminiJSON.Get("usageMetadata.candidatesTokenCount").Int()
+	// An audit caught the same thoughtsTokenCount omission as sse.go's
+	// streaming path — Anthropic bills thinking tokens as output tokens,
+	// but this only read candidatesTokenCount, undercounting output_tokens
+	// by the full size of the thinking block (commonly 80-98% on a
+	// thinking-heavy turn).
+	outTok := geminiJSON.Get("usageMetadata.candidatesTokenCount").Int() + geminiJSON.Get("usageMetadata.thoughtsTokenCount").Int()
 	cacheTok := geminiJSON.Get("usageMetadata.cachedContentTokenCount").Int()
 
 	// Previously only computed for the dashboard's own RequestLog entry
@@ -2710,6 +2804,17 @@ var knownModels = []map[string]interface{}{
 	{"id": "claude-3-opus-20240229", "type": "model", "display_name": "Claude 3 Opus", "created_at": "2024-02-29T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 4096, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
 	{"id": "claude-3-opus-latest", "type": "model", "display_name": "Claude 3 Opus", "created_at": "2024-02-29T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 4096, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
 	{"id": "claude-opus-4-6-thinking", "type": "model", "display_name": "Claude Opus 4.6 Thinking", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	// An audit caught these canonical model IDs were never added to the
+	// catalog — GET /v1/models/claude-opus-4-5 etc. 404ed even though
+	// tiering.go's own model-string matching (HasPrefix(model,
+	// "claude-opus")/"claude-sonnet"/"claude-haiku") routes requests FOR
+	// these exact models just fine; the 404 only ever broke SDK model
+	// lookups, not actual message requests.
+	{"id": "claude-opus-4-5", "type": "model", "display_name": "Claude Opus 4.5", "created_at": "2025-11-01T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-opus-4-7", "type": "model", "display_name": "Claude Opus 4.7", "created_at": "2025-12-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-opus-4-8", "type": "model", "display_name": "Claude Opus 4.8", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-sonnet-4-5", "type": "model", "display_name": "Claude Sonnet 4.5", "created_at": "2025-09-29T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
+	{"id": "claude-haiku-4-5", "type": "model", "display_name": "Claude Haiku 4.5", "created_at": "2025-10-01T00:00:00Z", "max_input_tokens": 200000, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "vision": true}},
 	{"id": "claude-sonnet-4-6", "type": "model", "display_name": "Claude Sonnet 4.6", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 64000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 	{"id": "claude-opus-5-5", "type": "model", "display_name": "Claude Opus 5.5", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 128000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
 	{"id": "claude-sonnet-5-5", "type": "model", "display_name": "Claude Sonnet 5.5", "created_at": "2026-01-01T00:00:00Z", "max_input_tokens": 1048576, "max_tokens": 128000, "capabilities": map[string]interface{}{"tools": true, "thinking": true, "vision": true}},
@@ -3221,8 +3326,45 @@ func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	type BucketOut struct {
+		Window           string  `json:"window"`
+		DisplayName      string  `json:"display_name"`
+		RemainingPercent float64 `json:"remaining_percent"`
+		ResetTime        string  `json:"reset_time"`
+		Description      string  `json:"description"`
+	}
+
+	type GroupOut struct {
+		DisplayName string      `json:"display_name"`
+		Description string      `json:"description"`
+		Buckets     []BucketOut `json:"buckets"`
+	}
+
+	// An audit caught this 404'd outright for a tenant with
+	// google_auth_type "api_key" (no OAuth pool at all, so acc is nil) —
+	// handleOAuthUsage already has a synthetic low-utilization fallback
+	// for this exact case (isSyntheticAccount), but this sibling endpoint
+	// never got the same treatment, so /v1/usage was simply broken for
+	// every API-key-only tenant instead of showing a stable low number.
 	if acc == nil {
-		writeAnthropicError(w, http.StatusNotFound, "not_found_error", "no accounts available")
+		now := time.Now()
+		resp := map[string]interface{}{
+			"account":        "",
+			"project_id":     "",
+			"cooldown_until": nil,
+			"last_checked":   now,
+			"groups": []GroupOut{{
+				DisplayName: "Usage",
+				Description: "This tenant authenticates with a direct API key, not a Google OAuth account pool — no real quota data to report.",
+				Buckets: []BucketOut{
+					{Window: "5h", DisplayName: "5-Hour", RemainingPercent: 95.0, ResetTime: now.Add(5 * time.Hour).UTC().Format(time.RFC3339), Description: "Synthetic — no OAuth account pool"},
+					{Window: "7d", DisplayName: "Weekly", RemainingPercent: 95.0, ResetTime: now.Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339), Description: "Synthetic — no OAuth account pool"},
+				},
+			}},
+		}
+		b, _ := json.MarshalIndent(resp, "", "  ")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(b)
 		return
 	}
 
@@ -3237,20 +3379,6 @@ func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) 
 		acc, _ = globalAccountManager.GetAccount(acc.Email)
 	} else {
 		globalAccountManager.TriggerAsyncQuotaRefresh(acc.Email, 45*time.Second)
-	}
-
-	type BucketOut struct {
-		Window           string  `json:"window"`
-		DisplayName      string  `json:"display_name"`
-		RemainingPercent float64 `json:"remaining_percent"`
-		ResetTime        string  `json:"reset_time"`
-		Description      string  `json:"description"`
-	}
-
-	type GroupOut struct {
-		DisplayName string      `json:"display_name"`
-		Description string      `json:"description"`
-		Buckets     []BucketOut `json:"buckets"`
 	}
 
 	var groupsOut []GroupOut

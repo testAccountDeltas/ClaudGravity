@@ -333,10 +333,22 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	if toolsArr, ok := reqMap["tools"].([]interface{}); ok {
 		for _, t := range toolsArr {
 			if tMap, isMap := t.(map[string]interface{}); isMap {
-				name := strings.ToLower(fmt.Sprint(tMap["name"]))
-				switch name {
-				case "edit", "write", "notebookedit", "str_replace_editor":
+				rawName := fmt.Sprint(tMap["name"])
+				name := strings.ToLower(rawName)
+				// An audit caught this switch had its own narrower, stale
+				// copy of exactly what server.go's isModifyingToolName
+				// already fixed — missing "update" entirely, and no MCP
+				// write/create/modify tool detection at all. A session
+				// using only an MCP write tool (no native Edit/Write
+				// declared) was wrongly classified as read-only, getting
+				// the main agent's tight 10-reads-in-15-turns threshold
+				// instead of the relaxed explore one. Reuse that same
+				// function instead of keeping a second copy to drift out
+				// of sync again.
+				if isModifyingToolName(rawName) {
 					hasModifyingTools = true
+				}
+				switch name {
 				case "exitplanmode":
 					// Claude Code declares Edit/Write alongside ExitPlanMode
 					// even while Plan Mode is active — the tool catalog
@@ -442,11 +454,32 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// caught it, and Google rejected a functionResponse.name that matches
 	// no declared tool.
 	declaredToolNames := make(map[string]bool)
+	// effectiveToolNames mirrors the SAME filtering the tools-declaration
+	// loop further below applies (strip_search_tools, the synthetic
+	// web_search/google_search marker) — computed here, before messages
+	// are translated, specifically so the tool_use/tool_result replay
+	// below can tell a tool that's merely DECLARED by the client apart
+	// from one actually SENT to Gemini this request. See its use below.
+	effectiveToolNames := make(map[string]bool)
+	earlyForcedToolName := ""
+	if tc := root.Get("tool_choice"); tc.Get("type").String() == "tool" {
+		earlyForcedToolName = tc.Get("name").String()
+	}
 	if toolsArr := root.Get("tools"); toolsArr.IsArray() {
 		toolsArr.ForEach(func(_, t gjson.Result) bool {
-			if n := t.Get("name").String(); n != "" {
-				declaredToolNames[n] = true
+			n := t.Get("name").String()
+			if n == "" {
+				return true
 			}
+			declaredToolNames[n] = true
+			normName := strings.ToLower(strings.ReplaceAll(n, "_", ""))
+			if normName == "websearch" || normName == "googlesearch" {
+				return true
+			}
+			if tenant.StripSearchTools && DropSearchTools[n] && n != earlyForcedToolName {
+				return true
+			}
+			effectiveToolNames[n] = true
 			return true
 		})
 	}
@@ -766,6 +799,32 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							partsJSON = append(partsJSON, part)
 							return true
 						}
+						if !effectiveToolNames[name] {
+							// An audit caught that a tool_use for a tool
+							// this request no longer declares to Gemini at
+							// all — most commonly Grep/Glob under the
+							// default strip_search_tools, used in an
+							// EARLIER turn before being stripped from every
+							// later turn's functionDeclarations — still got
+							// replayed as a functionCall referencing that
+							// undeclared name. Gemini validates every
+							// functionCall.name in the conversation against
+							// the CURRENT declared list and 400s the WHOLE
+							// request the moment history contains one that
+							// isn't there, permanently breaking any
+							// multi-turn conversation that ever used a
+							// since-stripped tool. Degrade to readable text
+							// instead of emitting a functionCall Gemini will
+							// reject outright.
+							argsPreview := argsRaw
+							if len(argsPreview) > 200 {
+								argsPreview = argsPreview[:200] + "..."
+							}
+							part := `{"text":""}`
+							part, _ = sjson.Set(part, "text", "[Called "+name+"("+argsPreview+")]")
+							partsJSON = append(partsJSON, part)
+							return true
+						}
 						part := `{"thoughtSignature":"","functionCall":{"name":"","args":{}}}`
 						part, _ = sjson.Set(part, "thoughtSignature", sig)
 						// An audit caught that sanitizeGeminiFunctionName
@@ -981,6 +1040,23 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						if p.Get("is_error").Bool() {
 							responseField = "error"
 						}
+						if !effectiveToolNames[fnName] {
+							// Same undeclared-tool gap as tool_use above,
+							// mirrored for its paired result — a
+							// functionResponse naming a tool no longer in
+							// this request's functionDeclarations (most
+							// commonly Grep/Glob stripped by
+							// strip_search_tools) 400s the whole request the
+							// same way an orphaned functionCall does.
+							resultPreview := resText
+							if len(resultPreview) > 200 {
+								resultPreview = resultPreview[:200] + "..."
+							}
+							part := `{"text":""}`
+							part, _ = sjson.Set(part, "text", "[Result of "+fnName+": "+resultPreview+"]")
+							partsJSON = append(partsJSON, part)
+							return true
+						}
 						part := `{"functionResponse":{"name":"","response":{}}}`
 						// Same history-replay sanitization gap as
 						// functionCall.name above — fnName here is the
@@ -1061,7 +1137,20 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						// the turn's structure intact with a placeholder
 						// instead of silently dropping it, which could
 						// otherwise leave an assistant turn with zero parts.
-						if role != "assistant" {
+						if role != "assistant" || !isLastAssistantMsg {
+							// An audit caught that the "only keep thinking
+							// on the most recent assistant turn" rule
+							// (applied to genuine "thinking" blocks
+							// elsewhere in this switch) was never extended
+							// to this case — every historical
+							// redacted_thinking block kept getting resent
+							// as a thought:true part on every subsequent
+							// request. Unlike real thinking, there's no
+							// genuine signature here to preserve either way
+							// (always the same skip_thought_signature_validator
+							// placeholder), so there's no reason to ever
+							// treat an OLDER one as thought:true — degrade
+							// straight to plain text.
 							part := `{"text":"[Prior reasoning redacted]"}`
 							partsJSON = append(partsJSON, part)
 							return true
@@ -1195,6 +1284,15 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// the function by its sanitized one.
 	reverseToolNameMap := make(map[string]string)
 	sentToolNames := make(map[string]string) // original name -> sanitized (Gemini-bound) name
+	// An audit caught that sanitizeGeminiFunctionName can map two DIFFERENT
+	// original names onto the IDENTICAL sanitized string — "docker:run"
+	// and "docker_run" both become "docker_run", and two Cyrillic-only
+	// names (every character non-ASCII, each becoming "_") can collapse
+	// to the same all-underscore placeholder — producing duplicate names
+	// in tools.functionDeclarations, which Gemini 400s on outright. Track
+	// which original name first claimed each sanitized name so a later
+	// collision can be disambiguated instead of silently duplicated.
+	claimedSanitizedNames := make(map[string]string) // sanitized name -> the first original name that claimed it
 	// An audit caught that tool_choice:{"type":"tool","name":"Grep"} with
 	// strip_search_tools enabled (the default) silently did nothing: Grep
 	// never reached sentToolNames (stripped below before that point), so
@@ -1285,6 +1383,19 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			}
 
 			sanitizedName := sanitizeGeminiFunctionName(name)
+			if existingOrig, claimed := claimedSanitizedNames[sanitizedName]; claimed && existingOrig != name {
+				// A real collision: disambiguate with a short, stable
+				// numeric suffix derived from how many names have already
+				// collided onto this sanitized string, trimming first if
+				// needed to stay within Gemini's 63-char limit.
+				suffix := fmt.Sprintf("_%d", len(claimedSanitizedNames))
+				base := sanitizedName
+				if len(base)+len(suffix) > 63 {
+					base = base[:63-len(suffix)]
+				}
+				sanitizedName = base + suffix
+			}
+			claimedSanitizedNames[sanitizedName] = name
 			if sanitizedName != name {
 				reverseToolNameMap[sanitizedName] = name
 			}

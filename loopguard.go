@@ -151,6 +151,15 @@ const (
 var readEquivalentBashPattern = regexp.MustCompile(`(?i)\b(sed\s+-n|head|tail|cat|more|less|pr\b|seq\b|dd\s+bs=|cut\s+-[df]|fold\b|nl\s+-)\b`)
 var awkNRPattern = regexp.MustCompile(`(?i)\bNR\s*[<>=!]`)
 
+// awkInvocationPattern requires "awk" to appear as an actual command
+// (start of string or after a shell boundary character), not merely as a
+// substring anywhere in the command line — an audit caught the plain
+// strings.Contains(lc, "awk") check below used to match ANY command whose
+// argument happened to contain "awk", such as reading a file at
+// internal/hawk/auth.go or scripts/awk_report.sh, silently excluding that
+// read from the loop counter entirely even though no awk was ever invoked.
+var awkInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])awk\b`)
+
 // catIsWritePattern matches `cat` used to WRITE a file (heredoc into a
 // redirect, e.g. `cat << 'EOF' > file.go`, or `cat file1 file2 > out`) —
 // an audit caught this counting as a Read when it's actually genuine
@@ -211,7 +220,7 @@ func isReadEquivalentBashCommand(command string) bool {
 	if grepInvocationPattern.MatchString(command) {
 		return false
 	}
-	if strings.Contains(lc, "awk") {
+	if awkInvocationPattern.MatchString(command) {
 		return awkNRPattern.MatchString(command)
 	}
 	// python/perl one-liners doing the same slice-the-file trick under a

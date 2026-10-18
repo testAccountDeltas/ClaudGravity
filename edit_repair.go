@@ -166,7 +166,18 @@ func sweepStaleSessionSnapshots() {
 // the snapshot entirely on an exact-string-match lookup, since nothing
 // normalized slash direction or relative/absolute form between calls.
 func canonicalSnapshotKey(path string) string {
-	return filepath.Clean(filepath.ToSlash(strings.TrimSpace(path)))
+	// An audit caught that filepath.ToSlash is a no-op on this binary's
+	// OWN build target, not the path's origin: filepath.Separator is '/'
+	// on a GOOS=linux build (the VPS instance), so ToSlash returns its
+	// input completely unchanged regardless of whether the path itself
+	// still has Windows backslashes — a path recorded from a Windows
+	// client's own absolute path (or just read with backslashes in the
+	// session) never got normalized on the Linux deployment. The
+	// snapshot was stored under "src\\utils\\parser.go" while lookups
+	// searched for "src/utils/parser.go", so every snapshot silently
+	// stopped being found on the remote instance. Strip backslashes
+	// explicitly, independent of which OS this binary itself targets.
+	return filepath.Clean(strings.ReplaceAll(strings.TrimSpace(path), "\\", "/"))
 }
 
 func getSessionSnapshot(sessionID, path string) (string, bool) {
@@ -349,7 +360,27 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					oldStr := firstNonEmpty(input.Get("old_string").String(), input.Get("old_str").String(), input.Get("pattern").String(), input.Get("old_text").String())
 					newStr := firstNonEmpty(input.Get("new_string").String(), input.Get("new_str").String(), input.Get("new_text").String())
 					if oldStr != "" {
-						if cur, ok := getSessionSnapshot(sessionID, path); ok && strings.Contains(cur, oldStr) {
+						// An audit caught this lookup only ever tried the
+						// literal `path` as given — if an earlier Read in
+						// this same session recorded its snapshot under an
+						// ABSOLUTE path (Claude Code's own tools normally
+						// use absolute paths) and this same-turn replay then
+						// names the file with a RELATIVE path instead, the
+						// lookup missed the existing snapshot entirely,
+						// even though the write-back two lines below this
+						// already resolves against session CWD. Try the
+						// CWD-resolved candidate too, same as
+						// RepairEditToolCall's own snapshot lookup does.
+						lookupPath := path
+						cur, ok := getSessionSnapshot(sessionID, lookupPath)
+						if !ok && !isAbsPath(path) {
+							if cwd := GetSessionCWD(sessionID); cwd != "" {
+								if resolved, rok := getSessionSnapshot(sessionID, joinCWD(cwd, path)); rok {
+									cur, ok, lookupPath = resolved, true, joinCWD(cwd, path)
+								}
+							}
+						}
+						if ok && strings.Contains(cur, oldStr) {
 							n := 1
 							if input.Get("replace_all").Bool() {
 								n = -1
@@ -358,7 +389,7 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 							// Preserves whatever fullness the snapshot being
 							// replayed-against already had — editing text
 							// within a partial slice doesn't make it complete.
-							wasFull := isSessionSnapshotFull(sessionID, path)
+							wasFull := isSessionSnapshotFull(sessionID, lookupPath)
 							setSessionSnapshot(sessionID, path, updated, wasFull)
 							if !isAbsPath(path) {
 								if cwd := GetSessionCWD(sessionID); cwd != "" {
@@ -974,23 +1005,52 @@ func reapplyLineIndents(newStr string, lineIndents []string, fileLine0Indent str
 			// average depth) — prefer the nearest PRECEDING matched
 			// line's real indent over the generic baseIndent guess when
 			// one is available.
-			nearestPreceding := ""
+			//
+			// An audit caught that gluing the nearest preceding anchor's
+			// indent on flatly (after stripping the new line's OWN
+			// leading whitespace) threw away real signal when the model
+			// wrote the new line with its own correct, DEEPER relative
+			// indent than that anchor — e.g. inserting a statement one
+			// level further nested than the line right before it still
+			// landed at the anchor's flat depth, not one level deeper.
+			// Snapshot each line's own ORIGINAL leading whitespace before
+			// any mutation below, then — same technique already used for
+			// the single-old-line case above — compute the new line's
+			// indentation delta relative to the anchor's own original
+			// whitespace, and layer that delta on top of the anchor's
+			// REAL (corrected) indent, instead of discarding it. The
+			// anchor starts as line 0 itself (own indent / corrected
+			// indent) so even an insertion before the first matched line
+			// benefits from this, not just insertions after one.
+			originalOwnIndent := make([]string, len(lines))
+			for j, l := range lines {
+				originalOwnIndent[j] = l[:len(l)-len(strings.TrimLeft(l, " \t"))]
+			}
+			anchorOwnIndent := origLine0OwnIndent
+			anchorRealIndent := fileLine0Indent
 			for j := range lines {
 				if j == 0 {
 					continue // line 0 already handled above
 				}
 				if assigned[j] {
-					nearestPreceding = assignedIndent[j]
+					anchorOwnIndent = originalOwnIndent[j]
+					anchorRealIndent = assignedIndent[j]
 				}
 				if strings.TrimSpace(lines[j]) == "" {
 					continue // don't indent a genuinely blank line
 				}
 				trimmed := strings.TrimLeft(lines[j], " \t")
-				target := baseIndent + trimmed
-				if assigned[j] {
+				var target string
+				switch {
+				case assigned[j]:
 					target = assignedIndent[j] + trimmed
-				} else if nearestPreceding != "" {
-					target = nearestPreceding + trimmed
+				case anchorRealIndent != "" && strings.HasPrefix(originalOwnIndent[j], anchorOwnIndent):
+					delta := originalOwnIndent[j][len(anchorOwnIndent):]
+					target = anchorRealIndent + delta + trimmed
+				case baseIndent != "":
+					target = baseIndent + trimmed
+				default:
+					target = anchorRealIndent + trimmed
 				}
 				if target == lines[j] {
 					continue // already correct
