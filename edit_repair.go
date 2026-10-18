@@ -633,6 +633,22 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 	if oldStrKey == "" || oldStr == "" {
 		return argsRaw, false
 	}
+	// An audit caught that a model copying its own prior Read-tool output
+	// directly into old_string (including the "cat -n"-style "   42\t"
+	// line-number prefix Read's own dump carries) never got stripped —
+	// stripCatNPrefix was only ever applied to the STORED snapshot, not
+	// to this incoming argument, so a line-number-polluted old_string
+	// could never match the real file content either exactly or via
+	// fuzzy matching (normalizeLineForMatch only normalizes whitespace,
+	// not digit+tab prefixes). Clean it the same way, before any
+	// matching attempt below; a no-op for the overwhelmingly common case
+	// of a real old_string with no such prefixes.
+	if cleaned := stripCatNPrefix(oldStr); cleaned != oldStr {
+		oldStr = cleaned
+		if withClean, err := sjson.Set(argsRaw, oldStrKey, oldStr); err == nil {
+			argsRaw = withClean
+		}
+	}
 
 	// 3. Resolve path against filesystem and session CWD
 	cwdCandidate := ""
@@ -824,6 +840,21 @@ func reapplyLineIndents(newStr string, lineIndents []string, fileLine0Indent str
 		return newStr, false
 	}
 	lines := strings.Split(newStr, "\n")
+	// An audit caught that findFuzzyLineMatch strips a trailing newline's
+	// resulting empty element from old_string's own line split (giving
+	// lineIndents a length matching the REAL line count), but this
+	// function's own split never got the same treatment — a completely
+	// normal new_string that happens to end in "\n" with the exact same
+	// real line count as old_string had ONE MORE element here than
+	// lineIndents, so the precise exact-1:1 branch below never fired for
+	// what should be its most common, simplest case, falling through to
+	// the less-precise heuristic branch instead. Strip it the same way,
+	// and remember to restore it when rejoining at the end.
+	hadTrailingNewline := false
+	if len(lines) > 1 && lines[len(lines)-1] == "" && strings.HasSuffix(newStr, "\n") {
+		lines = lines[:len(lines)-1]
+		hadTrailingNewline = true
+	}
 	changed := false
 
 	// Captured before line 0 is potentially rewritten below — the
@@ -1063,7 +1094,11 @@ func reapplyLineIndents(newStr string, lineIndents []string, fileLine0Indent str
 	if !changed {
 		return newStr, false
 	}
-	return strings.Join(lines, "\n"), true
+	result := strings.Join(lines, "\n")
+	if hadTrailingNewline {
+		result += "\n"
+	}
+	return result, true
 }
 
 // findFuzzyLineMatch returns (the real file content matching oldStr,

@@ -806,15 +806,15 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 		}
 	}
 
+	// An audit caught message_start (above) always includes both cache
+	// fields (even as 0), but this final message_delta usage object only
+	// included them when non-zero — an inconsistency a strict typed SDK
+	// (fields declared as required numbers, not optional) could choke on.
 	usage := map[string]interface{}{
-		"input_tokens":  uncachedInputTokens,
-		"output_tokens": s.outputTokens,
-	}
-	if cacheCreationTokens > 0 {
-		usage["cache_creation_input_tokens"] = cacheCreationTokens
-	}
-	if s.cacheTokens > 0 {
-		usage["cache_read_input_tokens"] = s.cacheTokens
+		"input_tokens":                uncachedInputTokens,
+		"output_tokens":               s.outputTokens,
+		"cache_creation_input_tokens": cacheCreationTokens,
+		"cache_read_input_tokens":     s.cacheTokens,
 	}
 
 	var stopSequenceField interface{}

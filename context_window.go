@@ -32,7 +32,7 @@ const minPDFTokenFloor = 2500
 // truncation safety check below, where undercounting means a request slips
 // through and hits a raw context-length 400 from Google — so it must err
 // on the side of over-truncating, never under-truncating.
-func conservativeTokenEstimate(v interface{}) int {
+func conservativeTokenEstimate(v interface{}, isLastAssistant bool) int {
 	if v == nil {
 		return 0
 	}
@@ -52,7 +52,7 @@ func conservativeTokenEstimate(v interface{}) int {
 				if !isMap {
 					continue
 				}
-				total += blockTokenEstimate(bMap)
+				total += blockTokenEstimate(bMap, isLastAssistant)
 				counted = true
 			}
 			if counted {
@@ -73,7 +73,7 @@ func conservativeTokenEstimate(v interface{}) int {
 			total := 0
 			counted := false
 			for _, bMap := range blocks {
-				total += blockTokenEstimate(bMap)
+				total += blockTokenEstimate(bMap, isLastAssistant)
 				counted = true
 			}
 			if counted {
@@ -118,8 +118,25 @@ func contentSourceTextFromBlockMap(content interface{}) string {
 	return ""
 }
 
-func blockTokenEstimate(bMap map[string]interface{}) int {
+func blockTokenEstimate(bMap map[string]interface{}, isLastAssistant bool) int {
 	switch bMap["type"] {
+	case "thinking", "redacted_thinking":
+		// An audit caught that this fell through to the default
+		// flat-len/2 case, pricing the FULL text of every historical
+		// thinking block into the truncation budget — up to 80-100k
+		// tokens across a long agentic session — even though
+		// translator.go (fixed earlier this session) guarantees every
+		// one of these gets stripped from history before the request
+		// ever reaches Gemini, except the single most recent assistant
+		// turn's. Counting phantom tokens that will never actually be
+		// sent caused this budget check to drop real, surviving
+		// messages (the user's own history) to compensate for thinking
+		// blocks that were already going to disappear for free. Price
+		// anything but the one turn translator.go actually keeps at 0.
+		if !isLastAssistant {
+			return 0
+		}
+		return flatTokenEstimate(bMap)
 	case "image":
 		// An audit cross-referenced Anthropic's own documented image-pricing
 		// formula (ceil(w*h/750) after capping the longer side to 1568px)
@@ -186,6 +203,15 @@ func blockTokenEstimate(bMap map[string]interface{}) int {
 					}
 					if mediaType == "application/pdf" || mediaType == "" {
 						est := len(dataStr) / 500
+						// An audit caught this density guess undercounts a
+						// text-sparse/vector PDF several-fold vs. Gemini's
+						// real flat per-page billing — prefer a real page
+						// count when it's directly readable in the raw
+						// bytes (uncompressed PDFs only; a best-effort
+						// improvement, not a full parser).
+						if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok && pageEst > est {
+							est = pageEst
+						}
 						if est < minPDFTokenFloor {
 							return minPDFTokenFloor
 						}
@@ -212,7 +238,7 @@ func blockTokenEstimate(bMap map[string]interface{}) int {
 		total := 0
 		for _, b := range inner {
 			if innerMap, isMap := b.(map[string]interface{}); isMap {
-				total += blockTokenEstimate(innerMap)
+				total += blockTokenEstimate(innerMap, isLastAssistant)
 			}
 		}
 		return total
@@ -302,16 +328,29 @@ func TruncateConversationToFit(reqMap map[string]interface{}, modelName string, 
 
 	systemTokens := 0
 	if sys, ok := reqMap["system"]; ok {
-		systemTokens = conservativeTokenEstimate(sys)
+		systemTokens = conservativeTokenEstimate(sys, false)
 	}
 	if tools, ok := reqMap["tools"]; ok {
-		systemTokens += conservativeTokenEstimate(tools)
+		systemTokens += conservativeTokenEstimate(tools, false)
+	}
+
+	// Mirrors translator.go's own lastAssistantIdx: only the single most
+	// recent assistant message's thinking survives to actually reach
+	// Gemini (everything older is stripped from history there), so only
+	// that one message should price its thinking blocks at their real
+	// size below — see blockTokenEstimate's "thinking" case.
+	lastAssistantIdx := -1
+	for i := len(msgsList) - 1; i >= 0; i-- {
+		if mMap, ok := msgsList[i].(map[string]interface{}); ok && mMap["role"] == "assistant" {
+			lastAssistantIdx = i
+			break
+		}
 	}
 
 	msgTokens := make([]int, len(msgsList))
 	total := systemTokens
 	for i, m := range msgsList {
-		msgTokens[i] = conservativeTokenEstimate(m) + 3 // per-message framing overhead
+		msgTokens[i] = conservativeTokenEstimate(m, i == lastAssistantIdx) + 3 // per-message framing overhead
 		total += msgTokens[i]
 	}
 

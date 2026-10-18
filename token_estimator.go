@@ -8,6 +8,8 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"math"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -60,6 +62,47 @@ func estimateImageTokens(b64Data string) int {
 		tokens = 1
 	}
 	return tokens
+}
+
+// pdfPageCountPattern looks for an uncompressed PDF page-tree's /Count key
+// directly in the raw decoded bytes — this is a best-effort heuristic, not
+// a real PDF parser: a PDF using compressed object streams (common for
+// larger/newer-generator PDFs) hides this inside a FlateDecode stream this
+// won't see, in which case the scan simply finds nothing and callers fall
+// back to their existing estimate. It never makes an estimate WORSE: it
+// only replaces a generic density-based guess with Gemini's real flat
+// 258-tokens/page billing on PDFs where the page count happens to be
+// directly readable in the raw bytes — verified against a real exim: see
+// git history for the test that validated the regex against a
+// constructed, syntactically valid uncompressed PDF.
+var pdfPageCountPattern = regexp.MustCompile(`/Count\s+(\d+)`)
+
+// geminiPDFTokensPerPage is Gemini's real documented flat per-page PDF
+// billing, independent of how text-dense or image-dense that page is —
+// the len/500 density-based estimate below this function's callers can
+// undercount a text-sparse/vector-graphics-heavy PDF by several times
+// since it has far less base64 "weight" per page than a scanned/rasterized
+// one despite costing Gemini the same flat per-page rate either way.
+const geminiPDFTokensPerPage = 258
+
+// estimatePDFTokensFromPageCount decodes base64 PDF data and looks for a
+// plaintext /Count N. Returns (0, false) if decoding fails or no page
+// count is found in the raw bytes, letting the caller fall back to its
+// own density-based estimate.
+func estimatePDFTokensFromPageCount(b64Data string) (int, bool) {
+	raw, err := base64.StdEncoding.DecodeString(stripBase64Whitespace(b64Data))
+	if err != nil || len(raw) == 0 {
+		return 0, false
+	}
+	m := pdfPageCountPattern.FindSubmatch(raw)
+	if m == nil {
+		return 0, false
+	}
+	pages, err := strconv.Atoi(string(m[1]))
+	if err != nil || pages <= 0 {
+		return 0, false
+	}
+	return pages * geminiPDFTokensPerPage, true
 }
 
 // estimateContentSourceText extracts the real text from a document block
@@ -251,6 +294,14 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 											// 500 base64 chars) — len/2 here would price a 2MB
 											// scanned PDF at ~1.33M tokens, see context_window.go.
 											est = len(dataStr) / 500
+											// An audit caught this density guess undercounts a
+											// text-sparse/vector PDF (far fewer base64 bytes per
+											// page than a scanned one, same real per-page Gemini
+											// cost) by several times — prefer a real page count
+											// when it's readable directly in the raw bytes.
+											if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok && pageEst > est {
+												est = pageEst
+											}
 										} else {
 											// A base64 text document (code, logs, CSV) has none
 											// of a PDF's image-heavy byte density — decode to raw
@@ -311,6 +362,9 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 							var est int
 							if mediaType == "application/pdf" || mediaType == "" {
 								est = len(dataStr) / 500
+								if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok && pageEst > est {
+									est = pageEst
+								}
 							} else {
 								decodedBytes := len(dataStr) * 3 / 4
 								est = decodedBytes / 2

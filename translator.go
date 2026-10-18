@@ -461,9 +461,61 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// below can tell a tool that's merely DECLARED by the client apart
 	// from one actually SENT to Gemini this request. See its use below.
 	effectiveToolNames := make(map[string]bool)
+	// disambiguatedToolName is the SINGLE source of truth for each
+	// original tool name's final, Gemini-bound sanitized name, including
+	// any collision suffix. An audit caught that history replay (right
+	// below, Section 5) ran strictly BEFORE the tools-declaration loop
+	// (Section 6, further down this file) where collision disambiguation
+	// used to be computed — history emitted the RAW sanitized name with
+	// no suffix, while the declaration got "_1" appended for the second
+	// of two colliding names (e.g. "docker:run" and "docker_run" both
+	// sanitize to "docker_run"), so turn 2+ replayed a functionCall.name
+	// that matched NO declared function, 400ing. Computing the full
+	// disambiguation map here, before anything else runs, and having
+	// BOTH history replay and the declaration loop read from this same
+	// map guarantees they can never disagree.
+	disambiguatedToolName := make(map[string]string)
+	claimedSanitizedNames := make(map[string]string) // sanitized name -> the first original name that claimed it
 	earlyForcedToolName := ""
-	if tc := root.Get("tool_choice"); tc.Get("type").String() == "tool" {
-		earlyForcedToolName = tc.Get("name").String()
+	toolChoiceType := ""
+	if tc := root.Get("tool_choice"); tc.Exists() {
+		toolChoiceType = tc.Get("type").String()
+		if toolChoiceType == "tool" {
+			earlyForcedToolName = tc.Get("name").String()
+		}
+	}
+	// An audit caught that tool_choice:"any" (forced tool use, no specific
+	// name) wasn't covered by the forcedToolName exemption above (which
+	// only ever fires for tool_choice:"tool" naming ONE tool) — if every
+	// tool the client declared happens to be a search tool
+	// (Grep/Glob, the only two in DropSearchTools), StripSearchTools
+	// removed BOTH, leaving zero declared tools for Gemini to honor a
+	// forced "any" tool-use request with at all; Gemini just answers with
+	// plain text instead, violating the client's explicit contract.
+	// Detect this specific all-tools-would-be-stripped case up front and
+	// suppress stripping entirely for this one request if so — only a
+	// request where literally every declared tool is a search tool hits
+	// this, so it never weakens the strip for any request with at least
+	// one non-search tool available.
+	keepSearchToolsForForcedAny := false
+	if toolChoiceType == "any" {
+		keepSearchToolsForForcedAny = true
+		if toolsArr := root.Get("tools"); toolsArr.IsArray() {
+			toolsArr.ForEach(func(_, t gjson.Result) bool {
+				n := t.Get("name").String()
+				normName := strings.ToLower(strings.ReplaceAll(n, "_", ""))
+				if normName == "websearch" || normName == "googlesearch" {
+					return true
+				}
+				if !DropSearchTools[n] {
+					keepSearchToolsForForcedAny = false
+					return false
+				}
+				return true
+			})
+		} else {
+			keepSearchToolsForForcedAny = false
+		}
 	}
 	if toolsArr := root.Get("tools"); toolsArr.IsArray() {
 		toolsArr.ForEach(func(_, t gjson.Result) bool {
@@ -472,11 +524,22 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				return true
 			}
 			declaredToolNames[n] = true
+			sanitized := sanitizeGeminiFunctionName(n)
+			if existingOrig, claimed := claimedSanitizedNames[sanitized]; claimed && existingOrig != n {
+				suffix := fmt.Sprintf("_%d", len(claimedSanitizedNames))
+				base := sanitized
+				if len(base)+len(suffix) > 63 {
+					base = base[:63-len(suffix)]
+				}
+				sanitized = base + suffix
+			}
+			claimedSanitizedNames[sanitized] = n
+			disambiguatedToolName[n] = sanitized
 			normName := strings.ToLower(strings.ReplaceAll(n, "_", ""))
 			if normName == "websearch" || normName == "googlesearch" {
 				return true
 			}
-			if tenant.StripSearchTools && DropSearchTools[n] && n != earlyForcedToolName {
+			if tenant.StripSearchTools && DropSearchTools[n] && n != earlyForcedToolName && !keepSearchToolsForForcedAny {
 				return true
 			}
 			effectiveToolNames[n] = true
@@ -526,7 +589,18 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			// Pre-pass: map tool_use IDs to function names
 			if parts := msg.Get("content"); parts.IsArray() {
 				parts.ForEach(func(_, p gjson.Result) bool {
-					if p.Get("type").String() == "tool_use" {
+					// A follow-up audit caught that this ran regardless of
+					// the enclosing message's role, same blind spot
+					// sanitizer.go's toolUsesSeen had (now fixed) — a
+					// tool_use sitting in a role-inverted USER message
+					// still got its id registered here, even though the
+					// actual tool_use block itself degrades to plain text
+					// below (role != "assistant" case) and never becomes a
+					// real functionCall. A later tool_result for that same
+					// id then found a non-empty fnName and emitted a real
+					// functionResponse with no matching functionCall ever
+					// sent — an orphaned response Gemini rejects.
+					if p.Get("type").String() == "tool_use" && role == "assistant" {
 						id := p.Get("id").String()
 						name := p.Get("name").String()
 						if id != "" && name != "" {
@@ -837,7 +911,19 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						// name here, and Gemini validates every
 						// functionCall.name in the conversation against the
 						// sanitized declared list, 400ing the whole request.
-						part, _ = sjson.Set(part, "functionCall.name", sanitizeGeminiFunctionName(name))
+						// A follow-up audit caught that plain sanitization
+						// alone isn't enough either: disambiguatedToolName
+						// (computed once, up front) must be used so a
+						// collision-disambiguated name ("docker_run_1")
+						// matches exactly what the declaration loop sent —
+						// falling back to plain sanitization only for a
+						// tool_use whose name isn't in the CURRENT request's
+						// declared tools at all (e.g. truncated-out history).
+						callFnName := disambiguatedToolName[name]
+						if callFnName == "" {
+							callFnName = sanitizeGeminiFunctionName(name)
+						}
+						part, _ = sjson.Set(part, "functionCall.name", callFnName)
 						if callID != "" {
 							part, _ = sjson.Set(part, "functionCall.id", callID)
 						}
@@ -1058,10 +1144,14 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							return true
 						}
 						part := `{"functionResponse":{"name":"","response":{}}}`
-						// Same history-replay sanitization gap as
+						// Same disambiguation-consistency gap as
 						// functionCall.name above — fnName here is the
 						// raw Claude-side name recovered from toolIDToName.
-						part, _ = sjson.Set(part, "functionResponse.name", sanitizeGeminiFunctionName(fnName))
+						responseFnName := disambiguatedToolName[fnName]
+						if responseFnName == "" {
+							responseFnName = sanitizeGeminiFunctionName(fnName)
+						}
+						part, _ = sjson.Set(part, "functionResponse.name", responseFnName)
 						if toolUseID != "" {
 							part, _ = sjson.Set(part, "functionResponse.id", toolUseID)
 						}
@@ -1284,15 +1374,10 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// the function by its sanitized one.
 	reverseToolNameMap := make(map[string]string)
 	sentToolNames := make(map[string]string) // original name -> sanitized (Gemini-bound) name
-	// An audit caught that sanitizeGeminiFunctionName can map two DIFFERENT
-	// original names onto the IDENTICAL sanitized string — "docker:run"
-	// and "docker_run" both become "docker_run", and two Cyrillic-only
-	// names (every character non-ASCII, each becoming "_") can collapse
-	// to the same all-underscore placeholder — producing duplicate names
-	// in tools.functionDeclarations, which Gemini 400s on outright. Track
-	// which original name first claimed each sanitized name so a later
-	// collision can be disambiguated instead of silently duplicated.
-	claimedSanitizedNames := make(map[string]string) // sanitized name -> the first original name that claimed it
+	// Collision disambiguation (two original names sanitizing to the same
+	// string) is now decided once, up front — see disambiguatedToolName's
+	// doc comment near the top of this function — and simply looked up
+	// here, rather than recomputed independently.
 	// An audit caught that tool_choice:{"type":"tool","name":"Grep"} with
 	// strip_search_tools enabled (the default) silently did nothing: Grep
 	// never reached sentToolNames (stripped below before that point), so
@@ -1330,7 +1415,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				// check below never actually fired either way.
 				return true
 			}
-			if tenant.StripSearchTools && DropSearchTools[name] && name != forcedToolName {
+			if tenant.StripSearchTools && DropSearchTools[name] && name != forcedToolName && !keepSearchToolsForForcedAny {
 				return true
 			}
 			desc := t.Get("description").String()
@@ -1382,20 +1467,15 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				syntheticReasonTools[name] = true
 			}
 
-			sanitizedName := sanitizeGeminiFunctionName(name)
-			if existingOrig, claimed := claimedSanitizedNames[sanitizedName]; claimed && existingOrig != name {
-				// A real collision: disambiguate with a short, stable
-				// numeric suffix derived from how many names have already
-				// collided onto this sanitized string, trimming first if
-				// needed to stay within Gemini's 63-char limit.
-				suffix := fmt.Sprintf("_%d", len(claimedSanitizedNames))
-				base := sanitizedName
-				if len(base)+len(suffix) > 63 {
-					base = base[:63-len(suffix)]
-				}
-				sanitizedName = base + suffix
+			// Reuse the single disambiguation decision computed up front
+			// (before message history was translated) rather than
+			// recomputing it independently here — the two MUST agree, or
+			// history replay and this declaration diverge on exactly the
+			// collision case this mechanism exists to handle.
+			sanitizedName, ok := disambiguatedToolName[name]
+			if !ok {
+				sanitizedName = sanitizeGeminiFunctionName(name)
 			}
-			claimedSanitizedNames[sanitizedName] = name
 			if sanitizedName != name {
 				reverseToolNameMap[sanitizedName] = name
 			}

@@ -199,6 +199,12 @@ func stripStderrRedirects(command string) string {
 // counter entirely — the exact opposite of what a loop-nudge guard is for.
 var grepInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])(grep|rg)\b`)
 
+// jqInvocationPattern recognizes jq as an actual command invocation (not
+// a path substring), same boundary convention as awk/grep above — jq
+// reads and filters a file's content to stdout, the same read-loop shape
+// as sed -n/head/tail, but under a tool name those patterns never match.
+var jqInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])jq\b`)
+
 // psSearchInvocationPattern is grepInvocationPattern's PowerShell
 // counterpart, covering findstr/grep/rg the same way — select-string is
 // intentionally excluded here since it's checked separately with a plain
@@ -227,7 +233,11 @@ func isReadEquivalentBashCommand(command string) bool {
 	// different interpreter — not exhaustive (this is inherently an
 	// arms race the audit itself calls out), but covers the concrete
 	// pattern actually observed/predicted: readlines()[a:b]-style slicing.
-	if strings.Contains(lc, "readlines") || strings.Contains(lc, "splitlines") {
+	// An audit caught bare .read() (not just .readlines()/.splitlines())
+	// and jq (reads/filters a file's content to stdout, same read-loop
+	// shape as grep/sed -n) were both missing from this set.
+	if strings.Contains(lc, "readlines") || strings.Contains(lc, "splitlines") ||
+		strings.Contains(lc, ".read(") || jqInvocationPattern.MatchString(command) {
 		return true
 	}
 	if (strings.Contains(lc, "cat") || strings.Contains(lc, "head") || strings.Contains(lc, "tail") || strings.Contains(lc, "sed")) &&
@@ -255,7 +265,12 @@ var readEquivalentPowerShellPattern = regexp.MustCompile(`(?i)\b(get-content|gc|
 // forward progress) had no exclusion here, miscounting it as an
 // unproductive read-loop turn the same way plain Bash `cat` without this
 // guard used to.
-var powerShellIsWritePattern = regexp.MustCompile(`(?i)>|Out-File|Set-Content|Add-Content`)
+// An audit caught this only matched the full cmdlet names, not their
+// standard short aliases (sc = Set-Content, ac = Add-Content) — a model
+// using the alias form was invisible to BOTH this write check and the
+// read-equivalent check below, so it counted as neither a read nor a
+// write and never reset the read-streak counter after a genuine write.
+var powerShellIsWritePattern = regexp.MustCompile(`(?i)>|Out-File|Set-Content|Add-Content|\bsc\b|\bac\b`)
 
 func isReadEquivalentPowerShellCommand(command string) bool {
 	lc := strings.ToLower(command)
@@ -318,24 +333,42 @@ func isPlanModeRequest(claudeBodyBytes []byte) bool {
 // agent nudged off Read switched straight to `sed -n 'N,Mp' file` /
 // `head`/`tail` chains in Bash and was then completely invisible to a
 // counter that only ever matched the literal string "Read".
-func readLoopEquivalentToolName(signature string) (name string, isReadEquivalent bool) {
+// isWriteEquivalent reports true when a Bash/PowerShell command's actual
+// TEXT performed a file write (cat <<EOF > file, Set-Content, sed -i, ...).
+// An audit caught that isModifyingToolName (server.go) only ever checks
+// the TOOL NAME — "Bash"/"PowerShell" are never in its list, since the
+// name alone says nothing about what the command inside it did — so a
+// write performed entirely through a shell command was neither counted as
+// a read (catIsWritePattern/powerShellIsWritePattern already correctly
+// exclude it from that) NOR credited as real progress, falling through
+// invisibly: the read-streak counter was never reset after a genuine
+// successful write, and LoopGuard could still fire a stop-reading nudge
+// right after the model just finished writing the very file it had been
+// reading.
+func readLoopEquivalentToolName(signature string) (name string, isReadEquivalent bool, isWriteEquivalent bool) {
 	idx := strings.IndexByte(signature, ':')
 	if idx < 0 {
-		return signature, signature == "Read"
+		return signature, signature == "Read", false
 	}
 	name = signature[:idx]
 	if name == "Read" {
-		return name, true
+		return name, true, false
 	}
 	if name == "Bash" {
 		command := gjson.Get(signature[idx+1:], "command").String()
-		return name, isReadEquivalentBashCommand(command)
+		if isReadEquivalentBashCommand(command) {
+			return name, true, false
+		}
+		return name, false, catIsWritePattern.MatchString(stripStderrRedirects(command))
 	}
 	if name == "PowerShell" {
 		command := gjson.Get(signature[idx+1:], "command").String()
-		return name, isReadEquivalentPowerShellCommand(command)
+		if isReadEquivalentPowerShellCommand(command) {
+			return name, true, false
+		}
+		return name, false, powerShellIsWritePattern.MatchString(stripStderrRedirects(command))
 	}
-	return name, false
+	return name, false, false
 }
 
 func readLoopLimits(agentKey string, hasModifyingTools bool) (windowSize, threshold int) {
@@ -355,6 +388,7 @@ type LoopGuardManager struct {
 	lastSeen     map[string]time.Time // agentKey -> last activity, for staleness sweeps
 	nudgeCount   map[string]int       // agentKey -> how many read-loop nudges fired since the last genuine Write/Edit; escalates wording instead of staying a one-time whisper
 	editFailures map[string]int       // agentKey -> consecutive Edit tool_result is_error:true count
+	lastPlanMode map[string]bool      // agentKey -> whether the last-recorded turn was under Plan Mode's lenient window/threshold
 }
 
 var globalLoopGuard = &LoopGuardManager{
@@ -363,6 +397,7 @@ var globalLoopGuard = &LoopGuardManager{
 	lastSeen:     make(map[string]time.Time),
 	nudgeCount:   make(map[string]int),
 	editFailures: make(map[string]int),
+	lastPlanMode: make(map[string]bool),
 }
 
 // RecordEditResult tracks consecutive Edit tool_result failures per agent —
@@ -418,8 +453,8 @@ func (lg *LoopGuardManager) touchLocked(agentKey string) {
 // sliding window. madeProgress (a Write/Edit happened, or the turn carried a
 // substantial amount of actual explanatory text/thinking — not just "let me
 // check X") wipes the window: that's real forward motion, not skimming.
-func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeProgress bool, windowSize int) {
-	lg.RecordReadTurnWithRealProgress(agentKey, readCount, madeProgress, madeProgress, windowSize)
+func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeProgress bool, windowSize int, isPlanMode bool) {
+	lg.RecordReadTurnWithRealProgress(agentKey, readCount, madeProgress, madeProgress, windowSize, isPlanMode)
 }
 
 // RecordReadTurnWithRealProgress separates "this turn resets the read-count
@@ -437,13 +472,28 @@ func (lg *LoopGuardManager) RecordReadTurn(agentKey string, readCount int, madeP
 // Write/Edit progress should earn that clean slate; a text-only turn
 // still resets the detection WINDOW (so unrelated activity doesn't
 // falsely accumulate), just not the escalation level.
-func (lg *LoopGuardManager) RecordReadTurnWithRealProgress(agentKey string, readCount int, madeProgress, realProgress bool, windowSize int) {
+func (lg *LoopGuardManager) RecordReadTurnWithRealProgress(agentKey string, readCount int, madeProgress, realProgress bool, windowSize int, isPlanMode bool) {
 	if agentKey == "" || agentKey == "auxiliary" || strings.HasPrefix(agentKey, "auxiliary|") {
 		return
 	}
 	lg.mu.Lock()
 	defer lg.mu.Unlock()
 	lg.touchLocked(agentKey)
+
+	// An audit caught that exiting Plan Mode (lenient window=40/threshold=40,
+	// since Plan Mode is EXPECTED to read many files) dropped straight into
+	// the strict window=10/threshold=10 pair, but the window itself still
+	// held Plan-Mode-era entries — appending this turn's count and THEN
+	// truncating to the new, smaller size just kept the most RECENT of
+	// those stale entries instead of discarding them, so their sum could
+	// already meet or exceed the new threshold on literally the first
+	// real-execution turn, nudging an agent that hadn't looped on
+	// anything yet. Clear the window outright on a true→false transition.
+	wasPlanMode, seen := lg.lastPlanMode[agentKey]
+	if seen && wasPlanMode && !isPlanMode {
+		delete(lg.readWindows, agentKey)
+	}
+	lg.lastPlanMode[agentKey] = isPlanMode
 
 	if madeProgress {
 		delete(lg.readWindows, agentKey)

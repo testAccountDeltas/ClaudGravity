@@ -506,10 +506,26 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 	toolResultsSeen := make(map[string]bool)
 
 	for _, m := range newMsgs {
+		role, _ := m["role"].(string)
 		blocks := m["content"].([]map[string]interface{})
 		for _, b := range blocks {
 			bType, _ := b["type"].(string)
-			if bType == "tool_use" {
+			// An audit caught this tracked a tool_use's id regardless of
+			// which role it sat in — a role-inverted tool_use (buggy
+			// client or corrupted history, sitting in a USER turn instead
+			// of assistant) got "seen" here, so its paired tool_result
+			// was never flagged as orphaned even though Anthropic only
+			// ever puts a real tool_use in an assistant turn. The actual
+			// Gemini-facing 400 risk from a role-inverted tool_use itself
+			// is independently guarded in translator.go (it degrades to
+			// text there), but a separate blind spot in translator.go's
+			// own toolIDToName (same role-unaware tracking) still lets a
+			// correctly-user-role tool_result for that id through as a
+			// real functionResponse with no matching functionCall —
+			// orphaned on Gemini's side. That part needs a translator.go
+			// fix outside this file's scope; this fixes sanitizer.go's
+			// own copy of the same blind spot.
+			if bType == "tool_use" && role == "assistant" {
 				if id, ok := b["id"].(string); ok && id != "" {
 					toolUsesSeen[id] = true
 				}

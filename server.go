@@ -647,6 +647,11 @@ func main() {
 	mux.HandleFunc("/api/event_logging", handleTelemetryJSON)
 	mux.HandleFunc("/api/telemetry", handleTelemetryJSON)
 	mux.HandleFunc("/api/telemetry/", handleTelemetryJSON)
+	// An audit caught these two weren't registered at all (404ing and
+	// spamming the terminal) — same telemetry-sink pattern as the paths
+	// just above, reusing the same handler.
+	mux.HandleFunc("/api/claude_code/telemetry", handleTelemetryJSON)
+	mux.HandleFunc("/api/claude_code/crash_reports", handleTelemetryJSON)
 	mux.HandleFunc("/api/organizations/current", handleOrganizationsCurrentJSON)
 	mux.HandleFunc("/api/auth/current_user", handleAuthCurrentUserJSON)
 	mux.HandleFunc("/api/organizations/current/billing", handleBillingJSON)
@@ -748,6 +753,8 @@ func main() {
 	interceptedMux.Handle("/api/event_logging", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
 	interceptedMux.Handle("/api/telemetry", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
 	interceptedMux.Handle("/api/telemetry/", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
+	interceptedMux.Handle("/api/claude_code/telemetry", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
+	interceptedMux.Handle("/api/claude_code/crash_reports", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
 	interceptedMux.Handle("/api/organizations/current", commonAPIMiddleware(http.HandlerFunc(handleOrganizationsCurrentJSON)))
 	interceptedMux.Handle("/api/auth/current_user", commonAPIMiddleware(http.HandlerFunc(handleAuthCurrentUserJSON)))
 	interceptedMux.Handle("/api/organizations/current/billing", commonAPIMiddleware(http.HandlerFunc(handleBillingJSON)))
@@ -884,8 +891,8 @@ func main() {
 // not count against its 20MB limit.
 func estimateInlineDataBytes(root gjson.Result) int {
 	total := 0
-	var walkBlocks func(blocks gjson.Result)
-	walkBlocks = func(blocks gjson.Result) {
+	var walkBlocks func(blocks gjson.Result, role string)
+	walkBlocks = func(blocks gjson.Result, role string) {
 		if !blocks.IsArray() {
 			return
 		}
@@ -915,21 +922,39 @@ func estimateInlineDataBytes(root gjson.Result) int {
 							mediaType = "image/png"
 						}
 					}
-					if mediaType != "image/svg+xml" && (mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/")) {
+					isBinary := mediaType != "image/svg+xml" && (mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/"))
+					// A follow-up audit caught that even a genuinely binary
+					// image/PDF never reaches inlineData at all when it sits
+					// in an ASSISTANT-role message — translator.go swaps it
+					// for a short text placeholder there (Gemini's model role
+					// only allows text/thought/functionCall parts), so an
+					// assistant-side screenshot or PDF in history still
+					// shouldn't count toward a limit it structurally can't
+					// touch. Only a genuinely binary block in a USER message
+					// ever becomes real inlineData bytes.
+					if isBinary && role != "assistant" {
 						total += len(src.Get("data").String())
 					}
 				}
 			case "tool_result":
 				c := block.Get("content")
 				if c.IsArray() {
-					walkBlocks(c)
+					// tool_result itself is always carried in a USER turn
+					// per the Anthropic spec (the role passed in here is
+					// whatever the OUTER message's role was) — pass it
+					// through unchanged rather than hardcoding "user", so a
+					// role-inverted tool_result (already a separate,
+					// rejected-elsewhere edge case) doesn't silently start
+					// counting bytes it also can't actually reach inlineData
+					// with.
+					walkBlocks(c, role)
 				}
 			}
 			return true
 		})
 	}
 	root.Get("messages").ForEach(func(_, msg gjson.Result) bool {
-		walkBlocks(msg.Get("content"))
+		walkBlocks(msg.Get("content"), msg.Get("role").String())
 		return true
 	})
 	return total
@@ -2032,10 +2057,10 @@ UpstreamReady:
 	readCount := 0
 	madeProgress := false
 	for _, sig := range streamer.toolCallSignatures {
-		name, isReadEquiv := readLoopEquivalentToolName(sig)
+		name, isReadEquiv, isWriteEquiv := readLoopEquivalentToolName(sig)
 		if isReadEquiv {
 			readCount++
-		} else if isModifyingToolName(name) {
+		} else if isModifyingToolName(name) || isWriteEquiv {
 			madeProgress = true
 		}
 	}
@@ -2052,8 +2077,9 @@ UpstreamReady:
 		madeProgress = streamer.textChars > 200
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
-	readWindowSize, _ := readLoopLimits(agentKey, !isPlanModeRequest(claudeBodyBytes))
-	globalLoopGuard.RecordReadTurnWithRealProgress(loopKey, readCount, madeProgress, realProgress, readWindowSize)
+	isPlanModeNow := isPlanModeRequest(claudeBodyBytes)
+	readWindowSize, _ := readLoopLimits(agentKey, !isPlanModeNow)
+	globalLoopGuard.RecordReadTurnWithRealProgress(loopKey, readCount, madeProgress, realProgress, readWindowSize, isPlanModeNow)
 
 	hasIgnoreTag := strings.Contains(streamer.lastText, OscIgnoreTag)
 	globalLoopGuard.RecordToolCalls(loopKey, streamer.toolCallSignatures, hasIgnoreTag)
@@ -2231,6 +2257,13 @@ func executeNonStreaming(
 					// tracking.
 					"input_tokens":  estimateApproxClaudeTokens(claudeBodyBytes),
 					"output_tokens": 0,
+					// A follow-up audit caught the cache fields were missing
+					// entirely here (not just zero) — a strict typed SDK
+					// expecting them always present, as every other 200
+					// usage object in this codebase already does, could
+					// choke on their absence.
+					"cache_creation_input_tokens": 0,
+					"cache_read_input_tokens":     0,
 				},
 				"stop_reason":   "refusal",
 				"stop_sequence": nil,
@@ -2283,8 +2316,18 @@ func executeNonStreaming(
 	// audit caught this firing on every large, cache-miss prompt
 	// regardless of whether cache_control was ever set, misreporting a
 	// plain request as one that paid for a (more expensive) cache write.
+	// An audit caught that gating this strictly on cacheTok == 0 blocked
+	// ANY cache-creation simulation on a turn that also read from an
+	// existing cache — but reading an earlier cache breakpoint and
+	// writing a NEW one for additional content in the same turn are not
+	// mutually exclusive (e.g. a long tool-use loop where the system
+	// prompt/early history is already cached, and the turn also crosses
+	// a new cache_control breakpoint further into its own fresh content).
+	// The real signal to gate on is whether a breakpoint is present and
+	// the remaining UNCACHED amount clears the threshold, not whether
+	// zero bytes were read from cache.
 	var cacheCreationTok int64
-	if cacheTok == 0 && uncachedInTok > cacheCreationThreshold(gjson.GetBytes(claudeBodyBytes, "model").String()) && hasCacheControlBreakpoint(claudeBodyBytes) {
+	if uncachedInTok > cacheCreationThreshold(gjson.GetBytes(claudeBodyBytes, "model").String()) && hasCacheControlBreakpoint(claudeBodyBytes) {
 		frac := cacheBreakpointPrefixFraction(claudeBodyBytes)
 		cacheCreationTok = int64(float64(uncachedInTok) * frac)
 		uncachedInTok -= cacheCreationTok
@@ -2656,10 +2699,10 @@ func executeNonStreaming(
 	readCount := 0
 	madeProgress := false
 	for _, sig := range toolCallSignatures {
-		name, isReadEquiv := readLoopEquivalentToolName(sig)
+		name, isReadEquiv, isWriteEquiv := readLoopEquivalentToolName(sig)
 		if isReadEquiv {
 			readCount++
-		} else if isModifyingToolName(name) {
+		} else if isModifyingToolName(name) || isWriteEquiv {
 			madeProgress = true
 		}
 	}
@@ -2668,8 +2711,9 @@ func executeNonStreaming(
 		madeProgress = textChars > 200
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
-	readWindowSize, _ := readLoopLimits(agentKey, !isPlanModeRequest(claudeBodyBytes))
-	globalLoopGuard.RecordReadTurnWithRealProgress(loopKey, readCount, madeProgress, realProgress, readWindowSize)
+	isPlanModeNow := isPlanModeRequest(claudeBodyBytes)
+	readWindowSize, _ := readLoopLimits(agentKey, !isPlanModeNow)
+	globalLoopGuard.RecordReadTurnWithRealProgress(loopKey, readCount, madeProgress, realProgress, readWindowSize, isPlanModeNow)
 	hasIgnoreTag := strings.Contains(lastText, OscIgnoreTag)
 	globalLoopGuard.RecordToolCalls(loopKey, toolCallSignatures, hasIgnoreTag)
 

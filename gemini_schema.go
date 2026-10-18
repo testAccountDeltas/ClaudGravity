@@ -706,7 +706,19 @@ func convertEnumValuesToStrings(jsonStr string) string {
 		}
 
 		var stringVals []string
+		hasNull := false
 		for _, item := range arr.Array() {
+			if item.Type == gjson.Null {
+				// An audit caught that gjson's String() on a null value
+				// returns "" — a literal `null` entry in enum (valid
+				// JSON Schema: `["opt1","opt2",null]` means the field may
+				// also legitimately be absent/null) silently became the
+				// EMPTY STRING with no nullable flag, so a model that
+				// correctly returned JSON null for this field got
+				// rejected by Gemini's validator instead of accepted.
+				hasNull = true
+				continue
+			}
 			stringVals = append(stringVals, item.String())
 		}
 
@@ -715,6 +727,9 @@ func convertEnumValuesToStrings(jsonStr string) string {
 		jsonStr, _ = sjson.Set(jsonStr, p, stringVals)
 		parentPath := trimSuffix(p, ".enum")
 		jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "type"), "string")
+		if hasNull {
+			jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "nullable"), true)
+		}
 	}
 	return jsonStr
 }
@@ -762,6 +777,12 @@ var unsupportedConstraints = []string{
 	// completely with no trace, instead of degrading to a description
 	// hint like every other unsupported keyword here.
 	"patternProperties",
+	// An audit caught propertyNames (restricts a free-dict's allowed key
+	// names via a regex schema, e.g. {"pattern":"^[A-Z_]+$"}) had the same
+	// gap patternProperties did above — deleted outright with no
+	// description hint, losing the model's only clue about what key
+	// names are actually valid.
+	"propertyNames",
 	"readOnly", "writeOnly", "deprecated",
 	"unevaluatedProperties", "unevaluatedItems", "$comment",
 	"if", "then", "else", "not",
@@ -1127,6 +1148,44 @@ func flattenAnyOfOneOf(jsonStr string) string {
 						propDest := joinPath(parentPath, "properties."+escapeGJSONPathKey(pk.String()))
 						if !gjson.Get(jsonStr, propDest).Exists() {
 							jsonStr, _ = sjson.SetRaw(jsonStr, propDest, pv.Raw)
+							return true
+						}
+						// An audit caught that a property already declared
+						// on the parent (e.g. a base "action" field sitting
+						// alongside oneOf, {"properties":{"action":{"type":
+						// "string"}}, "oneOf":[...]}) skipped merging ANY
+						// branch-specific refinement of that same property
+						// — each branch's own enum (action:"create" in one,
+						// action:"delete" in another) was completely lost,
+						// leaving the parent's "action" with no enum at all
+						// instead of the union of every branch's valid
+						// values. Union this branch's enum into whatever's
+						// already there; everything else about the existing
+						// property stays untouched, same as before.
+						branchEnum := pv.Get("enum")
+						if !branchEnum.IsArray() {
+							return true
+						}
+						existingEnumPath := joinPath(propDest, "enum")
+						existing := gjson.Get(jsonStr, existingEnumPath)
+						seen := make(map[string]bool)
+						var merged []string
+						for _, e := range existing.Array() {
+							s := e.String()
+							if !seen[s] {
+								seen[s] = true
+								merged = append(merged, s)
+							}
+						}
+						for _, e := range branchEnum.Array() {
+							s := e.String()
+							if !seen[s] {
+								seen[s] = true
+								merged = append(merged, s)
+							}
+						}
+						if len(merged) > 0 {
+							jsonStr, _ = sjson.Set(jsonStr, existingEnumPath, merged)
 						}
 						return true
 					})
@@ -2005,7 +2064,17 @@ func convertPrefixItemsToItems(jsonStr string) string {
 		}
 		parentPath := trimSuffix(p, ".prefixItems")
 		itemsPath := joinPath(parentPath, "items")
-		if gjson.Get(jsonStr, itemsPath).Exists() {
+		// An audit caught that gjson's Exists() reports true for ANY
+		// JSON value at the path, including the literal boolean `false`
+		// — Draft 2020-12 tuples commonly pair "prefixItems" with
+		// "items": false (meaning "no additional items beyond the
+		// tuple," not "items has a real schema already"). That false
+		// value wrongly looked like "items already populated" and
+		// blocked the conversion below, letting the literal boolean
+		// `false` reach Gemini where a real Schema object (or no field
+		// at all) is required.
+		existingItems := gjson.Get(jsonStr, itemsPath)
+		if existingItems.Exists() && existingItems.Type != gjson.False {
 			continue
 		}
 		items := arr.Array()
