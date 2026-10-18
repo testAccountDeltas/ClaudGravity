@@ -63,7 +63,20 @@ const (
 	// full-file read. (3) "follow this exactly" plus a paragraph of
 	// justification was wordier than this model needs — shorter, with
 	// concrete numbers, reads as more authoritative.
-	readToolGuidance = "Gateway notice (Read tool): Do not read files in small pages. Call Read without offset/limit by default: it returns up to 2000 lines in one call, which covers most files. Splitting into 100-150 line pages wastes calls and time and saves no context, because the whole file ends up in context anyway.\n\nUse offset/limit only when:\n- a previous Read said the file is longer or too large (then use big chunks, at least 500-800 lines, never 100-150), or\n- a Grep/Bash search already gave you the exact line range you need, and you only need that range.\n\nTo locate one function or symbol in a large file, Grep first, then Read just that range. Do not scan the file page by page."
+	// v4 adds three short pieces, all from an audit of this exact text: a
+	// safety-reassurance line (using only the one fact independently
+	// verified — the tool's own description already says "by default
+	// reads up to 2000 lines" — NOT the audit's unverified decompiled
+	// byte/token-cap numbers from claude.exe, which stay unconfirmed and
+	// are deliberately left out of this text); a line closing off the
+	// shell-trick workaround path at the source instead of only
+	// reactively detecting it (readLoopEquivalentToolName above); and an
+	// explicit "check first, don't guess" procedure — the model's own
+	// stated reason for defaulting to small pages is that it doesn't
+	// know a file's size before reading it, so give it the concrete
+	// first step (list the directory / check size) instead of just
+	// telling it not to guess.
+	readToolGuidance = "Gateway notice (Read tool): Do not read files in small pages. Call Read without offset/limit by default: it returns up to 2000 lines in one call, which covers most files, and the tool itself safely handles anything too large — you do not need to protect against that yourself. Splitting into 100-150 line pages wastes calls and time and saves no context, because the whole file ends up in context anyway.\n\nIf this conversation already showed this file's size — an earlier ls -la, find, or directory listing — use that number, don't default to a cautious small chunk out of habit when you already know the answer. If you don't know the size at all, check first (ls -la) instead of guessing. Under ~150KB: always read it whole, one call, no offset/limit. That covers the large majority of individual source files.\n\nUse offset/limit only when:\n- the file is confirmed at or above that size (then use big chunks, at least 500-800 lines, never 100-150), or\n- a Grep/Bash search already gave you the exact line range you need, and you only need that range.\n\nTo locate one function or symbol in a large file, Grep first, then Read just that range. Do not scan the file page by page. Switching to sed/awk/seq/head/tail/cat/python one-liners to page through a file the same way does not help — it is the same pattern under a different tool and is tracked the same way."
 
 	// NudgeEditFailureLoop fires when Edit has failed (old_string mismatch)
 	// several times in a row for the same agent — the read-loop guard above
@@ -106,18 +119,38 @@ const (
 // without edit permissions), we use the relaxed exploreReadWindow limits so
 // legitimate file inspection does not trigger false-positive read-loop warnings.
 // readEquivalentBashPattern matches a Bash command doing the same "dump
-// raw file content" work the Read tool does — sed -n, head, tail, or cat
-// — as opposed to a genuinely targeted search (grep/rg/awk), which is
+// raw file content" work the Read tool does — sed -n, head, tail, cat,
+// seq-driven range loops, dd/cut/fold/nl — as opposed to a genuinely
+// targeted search (grep/rg, or awk used as a pattern search), which is
 // exactly what NudgeReadLoop itself tells the model to switch to and must
 // never count against this same guard, or the nudge's own advice would
 // trip it again immediately.
-var readEquivalentBashPattern = regexp.MustCompile(`(?i)\b(sed\s+-n|head\s+-[nc]|tail\s+-[nc]|cat)\b`)
+//
+// awk is handled separately below, not in this pattern: an audit caught
+// that the original version of this check excluded "awk" unconditionally
+// (treating it as always a search), which left `awk 'NR>=1 && NR<=120'` —
+// functionally identical line-range pagination, not a search —
+// completely invisible to the counter. awkNRPattern distinguishes the
+// two: an "NR <comparison>" anywhere in the script is pagination; an awk
+// call with no NR comparison at all (e.g. `awk '/pattern/'`) is a real
+// search and must stay excluded.
+var readEquivalentBashPattern = regexp.MustCompile(`(?i)\b(sed\s+-n|head\s+-[nc]|tail\s+-[nc]|cat|seq\b|dd\s+bs=|cut\s+-[df]|fold\b|nl\s+-)\b`)
+var awkNRPattern = regexp.MustCompile(`(?i)\bNR\s*[<>=!]`)
 
 func isReadEquivalentBashCommand(command string) bool {
 	lc := strings.ToLower(command)
-	if strings.Contains(lc, "grep") || strings.Contains(lc, "awk") ||
-		strings.Contains(lc, "rg ") || strings.HasPrefix(lc, "rg") {
+	if strings.Contains(lc, "grep") || strings.Contains(lc, "rg ") || strings.HasPrefix(lc, "rg") {
 		return false
+	}
+	if strings.Contains(lc, "awk") {
+		return awkNRPattern.MatchString(command)
+	}
+	// python/perl one-liners doing the same slice-the-file trick under a
+	// different interpreter — not exhaustive (this is inherently an
+	// arms race the audit itself calls out), but covers the concrete
+	// pattern actually observed/predicted: readlines()[a:b]-style slicing.
+	if strings.Contains(lc, "readlines") || strings.Contains(lc, "splitlines") {
+		return true
 	}
 	return readEquivalentBashPattern.MatchString(command)
 }
