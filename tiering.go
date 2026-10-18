@@ -13,8 +13,20 @@ import (
 //   - high -> 16384 (gemini-3.8-flash-high)
 //   - xhigh / max / ultracode -> -1 (gemini-3.8-flash-tiered with Native Google ModeAuto)
 //   - auxiliary -> 2048 (gemini-3.8-flash-low, eliminates 20s stalls on metadata)
-func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass string) (string, int) {
+func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass string, agentKey string) (string, int) {
 	model, _ := claudeReqJSON["model"].(string)
+
+	// An audit caught that this function only ever checked reqClass ==
+	// "auxiliary" for the cheap/fast tier — reqClass == "subagent" (the
+	// generic Task-tool fallback) was never special-cased at all, and a
+	// lightweight Explore subagent (ParseAgentInfo's agentKey ==
+	// "sub:Explore") inherited the SAME heavy ModeAuto/unlimited-thinking
+	// budget as the main Opus-class thread, adding 30-60s of thinking
+	// latency to what should be a quick, cheap search. Explore (and any
+	// other investigation-only subagent with no edit/write tools, by
+	// convention named the same way) gets the auxiliary-style cheap tier
+	// treatment below instead.
+	isLightweightSubagent := strings.EqualFold(agentKey, "sub:Explore")
 
 	// 1. Explicit native models preservation
 	if model == "claude-sonnet-4-6" || model == "claude-opus-4-6-thinking" || model == "gpt-oss-120b-medium" {
@@ -53,7 +65,7 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 		// down to plain "-medium" with a capped 8192 budget.
 		wasTieredClass := model == "gemini-3.8-flash-tiered"
 		base := "gemini-3.8-flash"
-		if reqClass == "auxiliary" {
+		if reqClass == "auxiliary" || isLightweightSubagent {
 			model = base + "-low"
 			budget = 2048
 		} else {
@@ -105,7 +117,7 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 		}
 	} else if strings.HasSuffix(model, "-tiered") {
 		base := strings.TrimSuffix(model, "-tiered")
-		if reqClass == "auxiliary" {
+		if reqClass == "auxiliary" || isLightweightSubagent {
 			model = base + "-low"
 			budget = 2048
 		} else {
@@ -129,7 +141,7 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 		}
 	} else {
 		// Non-tiered models thinking budget
-		if reqClass == "auxiliary" {
+		if reqClass == "auxiliary" || isLightweightSubagent {
 			budget = 2048
 		} else {
 			switch effort {

@@ -118,7 +118,22 @@ const (
 var (
 	sessionSnapLock sync.RWMutex
 	sessionSnapMap  = make(map[string]map[string]string) // sessionID -> filePath -> content
-	sessionSnapSeen = make(map[string]time.Time)         // sessionID -> last touch, for staleness sweeps
+	// sessionSnapFull tracks whether the stored content is a COMPLETE file
+	// (a Write, or a Read with no offset/limit) versus a partial slice (a
+	// Read with offset/limit set). An audit caught that the original code
+	// only ever checked "does ANY snapshot exist", so once the file's
+	// FIRST read happened to be partial, every later read — including a
+	// different partial slice or even a later full read's own repeat —
+	// was silently discarded as "already have a snapshot", permanently
+	// freezing the fuzzy-match baseline to whatever that first slice
+	// contained. A later full read now always overwrites; a later partial
+	// read only overwrites when no full snapshot already won. This does
+	// NOT merge two different partial ranges of the same file into one —
+	// a second partial read of a different range still replaces rather
+	// than extends the first — that's a known remaining limitation, not
+	// claimed fixed here.
+	sessionSnapFull = make(map[string]map[string]bool)
+	sessionSnapSeen = make(map[string]time.Time) // sessionID -> last touch, for staleness sweeps
 )
 
 func init() {
@@ -140,6 +155,7 @@ func sweepStaleSessionSnapshots() {
 		if t.Before(cutoff) {
 			delete(sessionSnapSeen, sessionID)
 			delete(sessionSnapMap, sessionID)
+			delete(sessionSnapFull, sessionID)
 		}
 	}
 }
@@ -164,18 +180,39 @@ func getSessionSnapshot(sessionID, path string) (string, bool) {
 	return v, ok
 }
 
-func setSessionSnapshot(sessionID, path, content string) {
+// isSessionSnapshotFull reports whether the currently stored snapshot for
+// path is a complete file (see sessionSnapFull's doc comment). False for
+// both "no snapshot at all" and "a partial one" — callers that need to
+// distinguish those two already have getSessionSnapshot's own ok bool.
+func isSessionSnapshotFull(sessionID, path string) bool {
+	sessionSnapLock.RLock()
+	defer sessionSnapLock.RUnlock()
+	m := sessionSnapFull[sessionID]
+	if m == nil {
+		return false
+	}
+	return m[canonicalSnapshotKey(path)]
+}
+
+func setSessionSnapshot(sessionID, path, content string, isFull bool) {
 	if sessionID == "" || path == "" {
 		return
 	}
 	sessionSnapLock.Lock()
 	defer sessionSnapLock.Unlock()
+	key := canonicalSnapshotKey(path)
 	m := sessionSnapMap[sessionID]
 	if m == nil {
 		m = make(map[string]string)
 		sessionSnapMap[sessionID] = m
 	}
-	m[canonicalSnapshotKey(path)] = content
+	m[key] = content
+	fm := sessionSnapFull[sessionID]
+	if fm == nil {
+		fm = make(map[string]bool)
+		sessionSnapFull[sessionID] = fm
+	}
+	fm[key] = isFull
 	sessionSnapSeen[sessionID] = time.Now()
 }
 
@@ -271,7 +308,11 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 				toolIDToName[id] = name
 
 				input := p.Get("input")
-				path := firstNonEmpty(input.Get("file_path").String(), input.Get("path").String(), input.Get("target_file").String())
+				// notebook_path added — an audit caught that RepairEditToolCall
+				// (the function that actually USES these snapshots) already
+				// recognized it, but this recording pass didn't, so a
+				// NotebookEdit tool call's file was never tracked at all.
+				path := firstNonEmpty(input.Get("file_path").String(), input.Get("path").String(), input.Get("target_file").String(), input.Get("notebook_path").String())
 				if path == "" {
 					return true
 				}
@@ -289,10 +330,10 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					// call itself -- no need to wait for the tool_result.
 					if c := input.Get("content"); c.Exists() {
 						contentStr := c.String()
-						setSessionSnapshot(sessionID, path, contentStr)
+						setSessionSnapshot(sessionID, path, contentStr, true)
 						if !isAbsPath(path) {
 							if cwd := GetSessionCWD(sessionID); cwd != "" {
-								setSessionSnapshot(sessionID, joinCWD(cwd, path), contentStr)
+								setSessionSnapshot(sessionID, joinCWD(cwd, path), contentStr, true)
 							}
 						}
 					}
@@ -301,8 +342,12 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					// already have, so a second Edit on a file touched
 					// earlier in this very request compares against
 					// up-to-date content instead of the stale initial Read.
-					oldStr := firstNonEmpty(input.Get("old_string").String(), input.Get("old_str").String(), input.Get("pattern").String())
-					newStr := firstNonEmpty(input.Get("new_string").String(), input.Get("new_str").String())
+					// old_text/new_text added — same gap as notebook_path
+					// above: RepairEditToolCall already recognized these
+					// (NotebookEdit's own param names), this recording pass
+					// didn't.
+					oldStr := firstNonEmpty(input.Get("old_string").String(), input.Get("old_str").String(), input.Get("pattern").String(), input.Get("old_text").String())
+					newStr := firstNonEmpty(input.Get("new_string").String(), input.Get("new_str").String(), input.Get("new_text").String())
 					if oldStr != "" {
 						if cur, ok := getSessionSnapshot(sessionID, path); ok && strings.Contains(cur, oldStr) {
 							n := 1
@@ -310,10 +355,14 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 								n = -1
 							}
 							updated := strings.Replace(cur, oldStr, newStr, n)
-							setSessionSnapshot(sessionID, path, updated)
+							// Preserves whatever fullness the snapshot being
+							// replayed-against already had — editing text
+							// within a partial slice doesn't make it complete.
+							wasFull := isSessionSnapshotFull(sessionID, path)
+							setSessionSnapshot(sessionID, path, updated, wasFull)
 							if !isAbsPath(path) {
 								if cwd := GetSessionCWD(sessionID); cwd != "" {
-									setSessionSnapshot(sessionID, joinCWD(cwd, path), updated)
+									setSessionSnapshot(sessionID, joinCWD(cwd, path), updated, wasFull)
 								}
 							}
 						}
@@ -351,12 +400,24 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 				if resText != "" {
 					cleanContent := stripCatNPrefix(resText)
 					isPartial := toolIDIsPartial[toolUseID]
-					_, hasFullSnap := getSessionSnapshot(sessionID, path)
-					if !isPartial || !hasFullSnap {
-						setSessionSnapshot(sessionID, path, cleanContent)
+					// Was: `_, hasFullSnap := getSessionSnapshot(...)` — that
+					// only ever reported "does ANY snapshot exist", full or
+					// partial, so once this file's first Read happened to be
+					// partial (now the common case for any file long enough
+					// to need the 500+-line chunks readToolGuidance pushes
+					// toward), every later Read of it — including a
+					// DIFFERENT partial slice — was discarded as "already
+					// have one", permanently freezing the fuzzy-match
+					// baseline to that first slice. A full read always
+					// wins; a partial one only wins when no full snapshot
+					// already exists (still doesn't merge two different
+					// partial ranges together — see sessionSnapFull's doc
+					// comment).
+					if !isPartial || !isSessionSnapshotFull(sessionID, path) {
+						setSessionSnapshot(sessionID, path, cleanContent, !isPartial)
 						if !isAbsPath(path) {
 							if cwd := GetSessionCWD(sessionID); cwd != "" {
-								setSessionSnapshot(sessionID, joinCWD(cwd, path), cleanContent)
+								setSessionSnapshot(sessionID, joinCWD(cwd, path), cleanContent, !isPartial)
 							}
 						}
 					}

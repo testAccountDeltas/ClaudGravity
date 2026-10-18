@@ -208,7 +208,14 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 								decodedBytes := len(dataStr) * 3 / 4
 								est = decodedBytes / 2
 							}
-							if est < 1600 {
+							// Same PDF-only floor as the tool_result document
+							// case above (and context_window.go) — applying
+							// it to every media type inflated a small base64
+							// text/code/CSV document's displayed estimate for
+							// no reason. This is the top-level "document"
+							// content block's own copy of that same bug; the
+							// nested tool_result one was already fixed.
+							if (mediaType == "application/pdf" || mediaType == "") && est < 1600 {
 								est = 1600
 							}
 							total += est

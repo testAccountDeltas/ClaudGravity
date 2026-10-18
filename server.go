@@ -1089,6 +1089,33 @@ func hasAssistantTurns(claudeBody []byte) bool {
 	return false
 }
 
+// hasCacheControlBreakpoint reports whether the client's own request
+// actually asked for prompt caching (an Anthropic "cache_control":
+// {"type":"ephemeral"} block somewhere in system/tools/messages) — an audit
+// caught that the cache_creation_input_tokens simulation below (and in
+// sse.go's FinishStream) fired unconditionally whenever cache_read was zero
+// and the prompt was large, regardless of whether the request ever set a
+// cache_control breakpoint at all. A plain substring check is deliberately
+// used instead of walking the full JSON structure: "cache_control" is
+// specific enough that a false positive is practically impossible, and this
+// runs on every request.
+func hasCacheControlBreakpoint(claudeBody []byte) bool {
+	return bytes.Contains(claudeBody, []byte(`"cache_control"`))
+}
+
+// wantsSingleToolUse reports whether the client set
+// disable_parallel_tool_use — an audit caught that this parameter was
+// completely unhandled anywhere in the codebase. translator.go adds a
+// best-effort system instruction asking Gemini not to generate more than
+// one tool call; this flag is also used at the actual emission points
+// (sse.go's HandleFunctionCall, this file's non-streaming candidate-parts
+// loop) to drop any call past the first regardless of whether Gemini
+// listened, since Anthropic's own clients expect the contract enforced,
+// not just requested.
+func wantsSingleToolUse(claudeBody []byte) bool {
+	return gjson.GetBytes(claudeBody, "disable_parallel_tool_use").Bool()
+}
+
 func executeStreamingWithWatchdog(
 	baseCtx context.Context,
 	rid uint64,
@@ -1404,7 +1431,7 @@ UpstreamReady:
 		respModel = modelName
 	}
 	hasPrior := hasAssistantTurns(claudeBodyBytes)
-	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior)
+	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior, hasCacheControlBreakpoint(claudeBodyBytes), wantsSingleToolUse(claudeBodyBytes))
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	if err != nil {
@@ -1437,7 +1464,7 @@ UpstreamReady:
 		madeProgress = streamer.textChars > 200
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
-	readWindowSize, _ := readLoopLimits(agentKey, true)
+	readWindowSize, _ := readLoopLimits(agentKey, !isPlanModeRequest(claudeBodyBytes))
 	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress, readWindowSize)
 
 	hasIgnoreTag := strings.Contains(streamer.lastText, OscIgnoreTag)
@@ -1647,8 +1674,12 @@ func executeNonStreaming(
 	// Same cache_creation_input_tokens approximation as sse.go's
 	// FinishStream — see there for why Gemini gives us no real signal for
 	// this and a cache-miss-but-large-prompt heuristic is the best stand-in.
+	// Gated on the request actually having asked for caching at all — an
+	// audit caught this firing on every large, cache-miss prompt
+	// regardless of whether cache_control was ever set, misreporting a
+	// plain request as one that paid for a (more expensive) cache write.
 	var cacheCreationTok int64
-	if cacheTok == 0 && uncachedInTok > 1024 {
+	if cacheTok == 0 && uncachedInTok > 1024 && hasCacheControlBreakpoint(claudeBodyBytes) {
 		cacheCreationTok = uncachedInTok
 		uncachedInTok = 0
 	}
@@ -1784,9 +1815,16 @@ func executeNonStreaming(
 					textChars += len(t)
 					lastText = t
 				} else if fc := p.Get("functionCall"); fc.Exists() {
+					if len(toolsCalled) > 0 && wantsSingleToolUse(claudeBodyBytes) {
+						// Client asked for at most one tool call per turn
+						// (disable_parallel_tool_use) — drop any call past
+						// the first rather than handing back a second
+						// tool_use block it explicitly said it can't handle.
+						continue
+					}
 					fname := fc.Get("name").String()
 					argsRaw := fc.Get("args").Raw
-					if argsRaw == "" {
+					if argsRaw == "" || argsRaw == "null" {
 						argsRaw = "{}"
 					}
 					argsRaw = coerceNumericEnumArgs(fname, argsRaw)
@@ -1917,7 +1955,7 @@ func executeNonStreaming(
 		madeProgress = textChars > 200
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
-	readWindowSize, _ := readLoopLimits(agentKey, true)
+	readWindowSize, _ := readLoopLimits(agentKey, !isPlanModeRequest(claudeBodyBytes))
 	globalLoopGuard.RecordReadTurn(loopKey, readCount, madeProgress, readWindowSize)
 	hasIgnoreTag := strings.Contains(lastText, OscIgnoreTag)
 	globalLoopGuard.RecordToolCalls(loopKey, toolCallSignatures, hasIgnoreTag)
@@ -1974,6 +2012,10 @@ func executeNonStreaming(
 }
 
 func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "This endpoint requires a POST request")
+		return
+	}
 	clientKey := r.Header.Get("x-api-key")
 	if clientKey == "" {
 		clientKey = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -1983,6 +2025,10 @@ func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Req
 		return
 	}
 	bodyBytes, _ := io.ReadAll(r.Body)
+	if !gjson.ValidBytes(bodyBytes) || !gjson.GetBytes(bodyBytes, "messages").Exists() || !gjson.GetBytes(bodyBytes, "model").Exists() {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Request body must be valid JSON with \"model\" and \"messages\"")
+		return
+	}
 	estTokens := estimateApproxClaudeTokens(bodyBytes)
 	resp := map[string]interface{}{
 		"input_tokens": estTokens,
@@ -2047,7 +2093,28 @@ func allModels() []map[string]interface{} {
 	return out
 }
 
+func authenticatedTenantFromRequest(cfgMgr *ConfigManager, r *http.Request) (TenantConfig, bool) {
+	clientKey := r.Header.Get("x-api-key")
+	if clientKey == "" {
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+			clientKey = strings.TrimSpace(authHeader[7:])
+		} else {
+			clientKey = authHeader
+		}
+	}
+	return cfgMgr.GetTenant(clientKey)
+}
+
 func handleModels(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "This endpoint requires a GET request")
+		return
+	}
+	if _, ok := authenticatedTenantFromRequest(cfgMgr, r); !ok {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+		return
+	}
 	models := allModels()
 	resp := map[string]interface{}{
 		"data": models,
@@ -2066,6 +2133,14 @@ func handleModels(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request)
 }
 
 func handleModelByID(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "This endpoint requires a GET request")
+		return
+	}
+	if _, ok := authenticatedTenantFromRequest(cfgMgr, r); !ok {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+		return
+	}
 	id := r.PathValue("id")
 	for _, m := range allModels() {
 		if m["id"] == id {
@@ -2326,6 +2401,16 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 	// still uses the (slightly stale) cached numbers.
 	globalAccountManager.TriggerAsyncQuotaRefresh(acc.Email, 45*time.Second)
 
+	// Set unconditionally, before the bucket-nil early return below — an
+	// audit caught that a response with no quota bucket data at all
+	// (fiveHourBucket == nil && weeklyBucket == nil) returned before ever
+	// reaching the org/workspace headers set at the end of this function,
+	// so that response carried neither — exactly the inconsistency the
+	// comment at the bottom of this function says this gateway can't
+	// afford to have.
+	header.Set("anthropic-organization-id", fakeOrgID)
+	header.Set("anthropic-workspace-id", fakeWorkspaceID)
+
 	fiveHourBucket, weeklyBucket := pickFiveHourAndWeekly(acc, modelName)
 	if fiveHourBucket == nil && weeklyBucket == nil {
 		return
@@ -2388,15 +2473,9 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 		header.Set("anthropic-ratelimit-tokens-reset", time.Unix(fiveHourReset, 0).UTC().Format(time.RFC3339))
 	}
 
-	// A real account's every response (bootstrap, oauth/usage, /v1/messages)
-	// carries the SAME anthropic-organization-id/anthropic-workspace-id —
-	// confirmed via live capture. We never sent these at all; if the client
-	// cross-checks organization identity consistency across responses before
-	// trusting derived state like usage bars, an always-absent pair could be
-	// exactly what's degrading it. Fixed, fake-but-consistent values (must
-	// match the ones the bootstrap spoof addon sends).
-	header.Set("anthropic-organization-id", fakeOrgID)
-	header.Set("anthropic-workspace-id", fakeWorkspaceID)
+	// anthropic-organization-id/anthropic-workspace-id are set earlier in
+	// this function, before the bucket-nil early return — see the comment
+	// there for why.
 }
 
 const (
@@ -2438,9 +2517,7 @@ func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) 
 	}
 
 	if acc == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"error":"no accounts available"}`))
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", "no accounts available")
 		return
 	}
 

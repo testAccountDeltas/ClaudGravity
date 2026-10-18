@@ -195,7 +195,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 
 	// 1. Dynamic Tiering & Model Effort Resolution
-	modelName, budget := ResolveTieringAndEffort(reqMap, reqClass)
+	modelName, budget := ResolveTieringAndEffort(reqMap, reqClass, agentKey)
 	if modelName == "" {
 		modelName = tenant.DefaultModel
 	}
@@ -319,6 +319,16 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		} else if sys.Type == gjson.String {
 			systemPrompt = ScrubBillingHeader(sys.String())
 		}
+	}
+	// disable_parallel_tool_use was completely unhandled — Gemini frequently
+	// returns multiple functionCall parts in one candidate regardless, so
+	// without this a client that set the flag (expecting at most one
+	// tool_use per turn, per Anthropic's own contract) silently got several
+	// anyway. The actual enforcement (dropping any call past the first) is
+	// in sse.go/server.go — this system instruction is a best-effort nudge
+	// to stop Gemini from generating the extra calls in the first place.
+	if gjson.GetBytes(sanitizedBytes, "disable_parallel_tool_use").Bool() {
+		systemPrompt = strings.TrimSpace(systemPrompt + "\n\nYou must call at most ONE tool in this response. Do not perform parallel/simultaneous tool calls.")
 	}
 	if systemPrompt != "" {
 		// Per Google's REST spec, system_instruction is just {"parts": [...]}
@@ -795,7 +805,25 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			}
 			rawSchema := t.Get("input_schema").Raw
 			schemaRaw := CleanJSONSchemaForAntigravity(name, rawSchema)
-			if strings.TrimSpace(schemaRaw) == "" || schemaRaw == "null" {
+			needsPlaceholder := strings.TrimSpace(schemaRaw) == "" || schemaRaw == "null"
+			if !needsPlaceholder {
+				// An audit caught that a schema like "{}" or
+				// "{\"properties\":{}}" — no "type" field at all, so
+				// addEmptySchemaPlaceholder's own findPaths(jsonStr, "type")
+				// never even sees it to inject the placeholder — fell
+				// through this check too (TrimSpace("{}") is neither ""
+				// nor "null"), reaching Gemini as a bare "parameters: {}"
+				// with no type and no properties. Same real defect as the
+				// one this check already exists for, just a different
+				// raw string shape; catch it the same way.
+				propsVal := gjson.Get(schemaRaw, "properties")
+				propsEmpty := !propsVal.Exists() || (propsVal.IsObject() && len(propsVal.Map()) == 0)
+				schemaType := gjson.Get(schemaRaw, "type").String()
+				if propsEmpty && (schemaType == "" || schemaType == "object") {
+					needsPlaceholder = true
+				}
+			}
+			if needsPlaceholder {
 				// Google rejects an OBJECT-type schema with empty properties
 				// ("parameters.properties: should be non-empty for OBJECT
 				// type") — route through the same placeholder mechanism

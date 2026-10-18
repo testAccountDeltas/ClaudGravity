@@ -134,8 +134,20 @@ const (
 // two: an "NR <comparison>" anywhere in the script is pagination; an awk
 // call with no NR comparison at all (e.g. `awk '/pattern/'`) is a real
 // search and must stay excluded.
-var readEquivalentBashPattern = regexp.MustCompile(`(?i)\b(sed\s+-n|head\s+-[nc]|tail\s+-[nc]|cat|seq\b|dd\s+bs=|cut\s+-[df]|fold\b|nl\s+-)\b`)
+// Head/tail now also match the flagless BSD-style form (`head -50 file`,
+// `tail +10 file`) and bare `more`/`less`/`pr` pagers — an audit caught
+// that the old `-[nc]`-only requirement missed these entirely. `cat` stays
+// in the group (bare `cat file` is still a read), but isReadEquivalentBashCommand
+// below excludes it specifically when it's writing TO a file (heredoc/
+// redirect), not reading one.
+var readEquivalentBashPattern = regexp.MustCompile(`(?i)\b(sed\s+-n|head\s+(-[nc]|[-+]?[0-9]+)|tail\s+(-[nc]|[-+]?[0-9]+)|cat|more|less|pr\b|seq\b|dd\s+bs=|cut\s+-[df]|fold\b|nl\s+-)\b`)
 var awkNRPattern = regexp.MustCompile(`(?i)\bNR\s*[<>=!]`)
+
+// catIsWritePattern matches `cat` used to WRITE a file (heredoc into a
+// redirect, e.g. `cat << 'EOF' > file.go`, or `cat file1 file2 > out`) —
+// an audit caught this counting as a Read when it's actually genuine
+// progress (a file write), which should reset the window, not add to it.
+var catIsWritePattern = regexp.MustCompile(`(?i)\bcat\b[^|]*>`)
 
 func isReadEquivalentBashCommand(command string) bool {
 	lc := strings.ToLower(command)
@@ -152,7 +164,51 @@ func isReadEquivalentBashCommand(command string) bool {
 	if strings.Contains(lc, "readlines") || strings.Contains(lc, "splitlines") {
 		return true
 	}
+	if strings.Contains(lc, "cat") && catIsWritePattern.MatchString(command) {
+		return false
+	}
 	return readEquivalentBashPattern.MatchString(command)
+}
+
+// isReadEquivalentPowerShellCommand is readEquivalentBashPattern's
+// counterpart for the PowerShell tool — an audit caught that
+// readLoopEquivalentToolName only ever recognized "Read" and "Bash" by
+// name, leaving every PowerShell call (the primary shell tool on Windows,
+// where this gateway's own maintainer runs it) completely invisible to
+// the read-loop counter regardless of what it did. Select-String is
+// PowerShell's grep equivalent — a genuine targeted search — and must
+// stay excluded the same way grep/rg does for Bash.
+var readEquivalentPowerShellPattern = regexp.MustCompile(`(?i)\b(get-content|gc)\b|select-object\s+-(first|last|skip)|\btype\b|\bmore\b`)
+
+func isReadEquivalentPowerShellCommand(command string) bool {
+	lc := strings.ToLower(command)
+	if strings.Contains(lc, "select-string") {
+		return false
+	}
+	return readEquivalentPowerShellPattern.MatchString(command)
+}
+
+// isPlanModeRequest detects the same thing translator.go's own inline check
+// does (ExitPlanMode declared among the request's tools) from raw request
+// bytes, so server.go's RecordReadTurn call sites — which only ever have
+// claudeBodyBytes, not the already-parsed/translated reqMap — can use the
+// relaxed exploreReadWindow size (50) during Plan Mode too. An audit caught
+// that both call sites hardcoded windowSize for "has modifying tools" at a
+// flat 15-entry cap regardless of Plan Mode, while the trigger THRESHOLD
+// checked in translator.go correctly relaxed to 40 for Plan Mode — a
+// 15-entry window summed against a 40 threshold can never fire, silently
+// disabling the guard for the exact case (Read/Grep-heavy Plan Mode
+// investigation) it exists to protect.
+func isPlanModeRequest(claudeBodyBytes []byte) bool {
+	isPlanMode := false
+	gjson.GetBytes(claudeBodyBytes, "tools").ForEach(func(_, t gjson.Result) bool {
+		if strings.EqualFold(t.Get("name").String(), "exitplanmode") {
+			isPlanMode = true
+			return false
+		}
+		return true
+	})
+	return isPlanMode
 }
 
 // readLoopEquivalentToolName extracts the tool name from a "name:argsRaw"
@@ -175,6 +231,10 @@ func readLoopEquivalentToolName(signature string) (name string, isReadEquivalent
 	if name == "Bash" {
 		command := gjson.Get(signature[idx+1:], "command").String()
 		return name, isReadEquivalentBashCommand(command)
+	}
+	if name == "PowerShell" {
+		command := gjson.Get(signature[idx+1:], "command").String()
+		return name, isReadEquivalentPowerShellCommand(command)
 	}
 	return name, false
 }

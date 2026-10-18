@@ -199,6 +199,8 @@ type SSEStreamer struct {
 	estInputTokens           int             // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
 	preferRussian            bool            // conversation's own language, detected from the user's latest message — picks which language gateway-synthesized text (grounding footer) uses, since that text bypasses the model entirely
 	syntheticReasonTools     map[string]bool // tool names whose Gemini-bound schema got our synthetic "reason" placeholder injected (translator.go); that key is stripped back out of the model's actual function-call args before handing them to Claude Code
+	hasCacheControl          bool            // whether the client's own request set an Anthropic cache_control breakpoint anywhere — gates the cache_creation_input_tokens simulation in FinishStream, see hasCacheControlBreakpoint's doc comment
+	disableParallelToolUse   bool            // client's disable_parallel_tool_use — HandleFunctionCall drops any call past the first when set, see wantsSingleToolUse's doc comment
 }
 
 type GroundingSource struct {
@@ -213,21 +215,23 @@ const (
 	TypeToolUse  = 3
 )
 
-func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool) *SSEStreamer {
+func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool, hasCacheControl bool, disableParallelToolUse bool) *SSEStreamer {
 	return &SSEStreamer{
-		rid:                  rid,
-		w:                    w,
-		flusher:              flusher,
-		messageID:            fmt.Sprintf("msg_%d", time.Now().UnixNano()),
-		model:                model,
-		currentIndex:         -1,
-		lastEventTime:        time.Now(),
-		sessionID:            sessionID,
-		requestedSafeguards:  requestedSafeguards,
-		estInputTokens:       estInputTokens,
-		preferRussian:        preferRussian,
-		syntheticReasonTools: syntheticReasonTools,
-		hasPriorTurns:        hasPriorTurns,
+		rid:                    rid,
+		w:                      w,
+		flusher:                flusher,
+		messageID:              fmt.Sprintf("msg_%d", time.Now().UnixNano()),
+		model:                  model,
+		currentIndex:           -1,
+		lastEventTime:          time.Now(),
+		sessionID:              sessionID,
+		requestedSafeguards:    requestedSafeguards,
+		estInputTokens:         estInputTokens,
+		preferRussian:          preferRussian,
+		syntheticReasonTools:   syntheticReasonTools,
+		hasCacheControl:        hasCacheControl,
+		disableParallelToolUse: disableParallelToolUse,
+		hasPriorTurns:          hasPriorTurns,
 	}
 }
 
@@ -441,6 +445,14 @@ func (s *SSEStreamer) HandleText(text string) error {
 }
 
 func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSignature string) error {
+	if s.disableParallelToolUse && s.toolUseOccurred {
+		// Client asked for at most one tool call per turn. The system
+		// instruction added at translation time (translator.go) is only a
+		// request Gemini can ignore — this is the actual enforcement:
+		// silently drop any call past the first rather than streaming a
+		// second tool_use block the client explicitly said it can't handle.
+		return nil
+	}
 	argsRaw = coerceNumericEnumArgs(name, argsRaw)
 	if repaired, ok := RepairEditToolCall(name, argsRaw, s.sessionID); ok {
 		argsRaw = repaired
@@ -619,7 +631,11 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	}
 
 	var cacheCreationTokens int64
-	if s.cacheTokens == 0 && uncachedInputTokens > 1024 {
+	// Gated on the request actually having set a cache_control breakpoint
+	// — an audit caught this firing on every large, cache-miss prompt
+	// regardless of whether caching was ever requested, misreporting a
+	// plain request as one that paid for a (more expensive) cache write.
+	if s.cacheTokens == 0 && uncachedInputTokens > 1024 && s.hasCacheControl {
 		cacheCreationTokens = uncachedInputTokens
 		// In Anthropic's formula: Total prompt tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens.
 		// Tokens that created cache must NOT be counted in input_tokens as well, or SDKs double-count every token.
@@ -817,7 +833,12 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 			} else if fc := part.Get("functionCall"); fc.Exists() {
 				name := fc.Get("name").String()
 				args := fc.Get("args").Raw
-				if args == "" {
+				if args == "" || args == "null" {
+					// Anthropic's tool_use.input must be an object; a literal
+					// JSON null here (Gemini can return bare "args": null for
+					// a no-argument call) streamed through as partial_json
+					// "null" instead of "{}", which Claude Code's own
+					// incremental JSON parser can't treat as an object.
 					args = "{}"
 				}
 				callSig := partSig
