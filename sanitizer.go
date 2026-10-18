@@ -255,23 +255,31 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 	// "Continue." instead of actually reaching Gemini's systemInstruction —
 	// extract it into the real system field first.
 	if first, ok := msgsList[0].(map[string]interface{}); ok && first["role"] == "system" {
-		// Only merge when the top-level "system" field is absent or a plain
-		// string — it can also be an array of blocks carrying its own
-		// cache_control, and blindly overwriting that with a string here
-		// would silently discard it.
-		_, isArraySystem := claudeReqJSON["system"].([]interface{})
-		if !isArraySystem {
-			if sysText := strings.TrimSpace(extractPlainText(first["content"])); sysText != "" {
-				existing, _ := claudeReqJSON["system"].(string)
-				if existing != "" {
-					claudeReqJSON["system"] = existing + "\n\n" + sysText
-				} else {
-					claudeReqJSON["system"] = sysText
-				}
+		// system can also be an array of blocks carrying its own
+		// cache_control — overwriting it outright with a plain string
+		// would silently discard that, so the array case appends a block
+		// instead of replacing. An audit caught that the ORIGINAL code
+		// skipped this whole extraction (including removing messages[0]
+		// from msgsList) whenever system was already an array — leaving
+		// a stray role:"system" message sitting in the conversation,
+		// which nothing downstream of this function knows how to
+		// translate (Gemini only has user/model), while the real system
+		// array stayed untouched. Now handled either way: append to an
+		// array, concatenate onto a string, or set fresh — but always
+		// remove messages[0] once its content (if any) has somewhere to
+		// go.
+		sysText := strings.TrimSpace(extractPlainText(first["content"]))
+		if sysText != "" {
+			if existingArr, ok := claudeReqJSON["system"].([]interface{}); ok {
+				claudeReqJSON["system"] = append(existingArr, map[string]interface{}{"type": "text", "text": sysText})
+			} else if existing, _ := claudeReqJSON["system"].(string); existing != "" {
+				claudeReqJSON["system"] = existing + "\n\n" + sysText
+			} else {
+				claudeReqJSON["system"] = sysText
 			}
-			msgsList = msgsList[1:]
-			modified = true
 		}
+		msgsList = msgsList[1:]
+		modified = true
 	}
 	if len(msgsList) == 0 {
 		claudeReqJSON["messages"] = []interface{}{}
@@ -380,6 +388,14 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 									if truncated, did := TruncateMiddle(pt); did {
 										p["text"] = truncated
 										modified = true
+										// An audit caught this sibling case
+										// (array-of-blocks tool_result)
+										// missing the truncatedAny=true its
+										// string-content sibling above
+										// already sets — the dashboard's
+										// "Shrunk" flag silently never fired
+										// for this content shape.
+										truncatedAny = true
 									}
 								}
 							}

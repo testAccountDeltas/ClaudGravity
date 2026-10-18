@@ -178,11 +178,20 @@ func isReadEquivalentBashCommand(command string) bool {
 // the read-loop counter regardless of what it did. Select-String is
 // PowerShell's grep equivalent — a genuine targeted search — and must
 // stay excluded the same way grep/rg does for Bash.
-var readEquivalentPowerShellPattern = regexp.MustCompile(`(?i)\b(get-content|gc)\b|select-object\s+-(first|last|skip)|\btype\b|\bmore\b`)
+// cat is a built-in PowerShell alias for Get-Content — an audit caught it
+// was missing here, leaving a bare `cat file.txt` completely invisible.
+var readEquivalentPowerShellPattern = regexp.MustCompile(`(?i)\b(get-content|gc|cat)\b|select-object\s+-(first|last|skip)|\btype\b|\bmore\b`)
 
 func isReadEquivalentPowerShellCommand(command string) bool {
 	lc := strings.ToLower(command)
-	if strings.Contains(lc, "select-string") {
+	// select-string is PowerShell's own grep equivalent; findstr/rg/grep are
+	// commonly invoked from PowerShell too (findstr is a native Windows
+	// tool, rg/grep if Git-for-Windows or similar is on PATH) — an audit
+	// caught that only select-string was excluded, so a genuine targeted
+	// search piped through any of the others got miscounted as unproductive
+	// reading instead of recognized as exactly what the nudge recommends.
+	if strings.Contains(lc, "select-string") || strings.Contains(lc, "findstr") ||
+		strings.Contains(lc, "grep") || strings.Contains(lc, "rg ") || strings.HasPrefix(lc, "rg") {
 		return false
 	}
 	return readEquivalentPowerShellPattern.MatchString(command)

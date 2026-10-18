@@ -229,7 +229,21 @@ func cleanJSONSchema(toolName, jsonStr string, addPlaceholder bool) (string, []s
 	openDictPaths := make(map[string]bool)
 	for _, p := range findPaths(jsonStr, "additionalProperties") {
 		if gjson.Get(jsonStr, p).Type != gjson.False {
-			openDictPaths[trimSuffix(p, ".additionalProperties")] = true
+			dictPath := trimSuffix(p, ".additionalProperties")
+			openDictPaths[dictPath] = true
+			// An audit caught that a free-form dict declared only as
+			// {"additionalProperties": {"type": "string"}} — no "type"
+			// of its own, a common way to write this in Pydantic/
+			// TypeScript-generated schemas — loses its additionalProperties
+			// in Phase 3 below with nothing left behind to mark it as an
+			// object. Phase 4's addEmptySchemaPlaceholder only ever looks
+			// at paths where "type" ALREADY exists (findPaths(jsonStr,
+			// "type")), so this node was skipped entirely and reached
+			// Gemini as a bare "{}" — "Schema cannot be empty". Force
+			// "type":"object" now so Phase 4 sees it.
+			if !gjson.Get(jsonStr, joinPath(dictPath, "type")).Exists() {
+				jsonStr, _ = sjson.Set(jsonStr, joinPath(dictPath, "type"), "object")
+			}
 		}
 	}
 
@@ -628,7 +642,15 @@ func mergeAllOf(jsonStr string) string {
 				}
 				jsonStr, _ = sjson.Set(jsonStr, reqPath, current)
 			}
-			for _, kw := range []string{"type", "enum", "format", "description", "items", "nullable"} {
+			// anyOf/oneOf added — an audit caught that an allOf branch like
+			// {base}, {oneOf: [variantA, variantB]} (a standard Draft 7/
+			// 2020-12 pattern) had its oneOf silently dropped: this loop
+			// only ever copied the fixed keyword list below, and the
+			// unconditional sjson.Delete(jsonStr, p) after this loop then
+			// deleted the WHOLE allOf array, variants and all, before
+			// flattenAnyOfOneOf (which runs immediately after mergeAllOf)
+			// ever got a chance to see them.
+			for _, kw := range []string{"type", "enum", "format", "description", "items", "nullable", "anyOf", "oneOf"} {
 				if v := item.Get(kw); v.Exists() && !gjson.Get(jsonStr, joinPath(parentPath, kw)).Exists() {
 					jsonStr, _ = sjson.SetRaw(jsonStr, joinPath(parentPath, kw), v.Raw)
 				}
@@ -742,7 +764,11 @@ func flattenAnyOfOneOf(jsonStr string) string {
 			selParsed := gjson.Parse(selected)
 			selParsed.ForEach(func(k, v gjson.Result) bool {
 				skey := k.String()
-				if skey == "properties" && v.IsObject() {
+				switch skey {
+				case "properties":
+					if !v.IsObject() {
+						return true
+					}
 					v.ForEach(func(pk, pv gjson.Result) bool {
 						propDest := joinPath(parentPath, "properties."+escapeGJSONPathKey(pk.String()))
 						if !gjson.Get(jsonStr, propDest).Exists() {
@@ -750,6 +776,53 @@ func flattenAnyOfOneOf(jsonStr string) string {
 						}
 						return true
 					})
+					return true
+				case "description":
+					// Was "only write if parentPath has none yet" — an audit
+					// caught that `selected`'s own description at this point
+					// already IS the fully-combined one (parentDesc merged
+					// in via mergeDescriptionRaw above, plus the "Accepts:
+					// type1 | type2" hint for a multi-type union) — if
+					// parentPath already had ITS OWN plain description
+					// before this function ran (the common case: that's
+					// exactly where parentDesc came from), the generic
+					// "skip if exists" rule above threw the combined
+					// version away and left the plain original in place,
+					// silently dropping the Accepts hint and the variant's
+					// own description. This one key must always overwrite.
+					destPath := joinPath(parentPath, "description")
+					jsonStr, _ = sjson.Set(jsonStr, destPath, v.String())
+					return true
+				case "required":
+					if !v.IsArray() {
+						return true
+					}
+					// Union with whatever's already required at parentPath
+					// instead of "skip if parentPath has any required array
+					// at all" — an audit caught that the generic rule
+					// dropped the selected branch's own required fields
+					// (e.g. "value") whenever the parent already required
+					// something else (e.g. "action"), even though both are
+					// genuinely required once merged.
+					destPath := joinPath(parentPath, "required")
+					existing := gjson.Get(jsonStr, destPath)
+					seen := make(map[string]bool)
+					var merged []string
+					if existing.IsArray() {
+						for _, r := range existing.Array() {
+							if !seen[r.String()] {
+								seen[r.String()] = true
+								merged = append(merged, r.String())
+							}
+						}
+					}
+					for _, r := range v.Array() {
+						if !seen[r.String()] {
+							seen[r.String()] = true
+							merged = append(merged, r.String())
+						}
+					}
+					jsonStr, _ = sjson.Set(jsonStr, destPath, merged)
 					return true
 				}
 				destPath := joinPath(parentPath, skey)
@@ -799,6 +872,18 @@ func flattenTypeArrays(jsonStr string) string {
 
 	for _, p := range paths {
 		res := gjson.Get(jsonStr, p)
+		if res.Type == gjson.String && res.String() == "null" {
+			// A bare scalar "type": "null" (not inside a ["string","null"]
+			// array, which the array branch below already handles) slipped
+			// through unchanged — Gemini's protobuf Schema only recognizes
+			// STRING/NUMBER/INTEGER/BOOLEAN/ARRAY/OBJECT, never "null", and
+			// rejects it outright. Same "string + nullable:true" fallback
+			// the array case below uses when every type option was null.
+			parentPath := trimSuffix(p, ".type")
+			jsonStr, _ = sjson.Set(jsonStr, p, "string")
+			jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "nullable"), true)
+			continue
+		}
 		if !res.IsArray() || len(res.Array()) == 0 {
 			continue
 		}

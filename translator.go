@@ -327,7 +327,12 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// anyway. The actual enforcement (dropping any call past the first) is
 	// in sse.go/server.go — this system instruction is a best-effort nudge
 	// to stop Gemini from generating the extra calls in the first place.
-	if gjson.GetBytes(sanitizedBytes, "disable_parallel_tool_use").Bool() {
+	// An audit caught that the official Anthropic SDKs actually send this
+	// nested inside tool_choice (`tool_choice: {type:"auto",
+	// disable_parallel_tool_use:true}`), not as a top-level request field —
+	// the original check only matched the latter, which real clients may
+	// never even send. Check both.
+	if gjson.GetBytes(sanitizedBytes, "disable_parallel_tool_use").Bool() || gjson.GetBytes(sanitizedBytes, "tool_choice.disable_parallel_tool_use").Bool() {
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\nYou must call at most ONE tool in this response. Do not perform parallel/simultaneous tool calls.")
 	}
 	if systemPrompt != "" {
@@ -406,6 +411,22 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						// way as an image: inlineData with the real
 						// mimeType (application/pdf here instead of
 						// image/*).
+						if role == "assistant" {
+							// Gemini only allows text/thought/functionCall
+							// parts in a "model"-role turn — inlineData there
+							// (an imported conversation history, or a
+							// multimodal subagent's own prior turn, can
+							// legitimately contain an image on the assistant
+							// side) gets rejected outright with "Invalid part
+							// type for model role". Swap it for a text
+							// placeholder instead of silently producing an
+							// upstream 400.
+							mt := p.Get("source.media_type").String()
+							part := `{"text":""}`
+							part, _ = sjson.Set(part, "text", "[Assistant output "+ptype+": "+mt+"]")
+							partsJSON = append(partsJSON, part)
+							return true
+						}
 						src := p.Get("source")
 						switch src.Get("type").String() {
 						case "base64":

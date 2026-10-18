@@ -182,6 +182,8 @@ func anthropicErrorTypeForStatus(status int) string {
 		return "not_found_error"
 	case http.StatusRequestEntityTooLarge:
 		return "request_too_large"
+	case 529:
+		return "overloaded_error"
 	default:
 		return "api_error"
 	}
@@ -259,7 +261,12 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 		wireStatus = 529
 	}
 	if status == http.StatusTooManyRequests {
-		w.Header().Set("Retry-After", "5")
+		// Was "Retry-After: 5" next to a 15-minute unified-reset — an
+		// audit caught that a client honoring Retry-After literally
+		// (reasonable: it's the standard HTTP header) retries in 5
+		// seconds and hits the exact same cooldown again immediately.
+		// 900s matches the unified-reset window below.
+		w.Header().Set("Retry-After", "900")
 		// Claude Code's own rate-limit backoff/countdown reads
 		// anthropic-ratelimit-unified-reset, not Retry-After — without it,
 		// a 429 reported through this path (as opposed to
@@ -271,6 +278,10 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 			w.Header().Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", time.Now().Add(15*time.Minute).Unix()))
 			w.Header().Set("anthropic-ratelimit-unified-status", "rejected")
 		}
+		// A 429 claiming full quota is still left is a contradiction a
+		// careful client could reasonably act on — zero these out too.
+		w.Header().Set("anthropic-ratelimit-requests-remaining", "0")
+		w.Header().Set("anthropic-ratelimit-tokens-remaining", "0")
 	} else if errType == "overloaded_error" {
 		w.Header().Set("Retry-After", "3")
 	}
@@ -384,6 +395,20 @@ func main() {
 	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
 		handleEmbeddings(cfgMgr, w, r)
 	})
+	// /v1/complete (legacy text completions) and /v1/messages/batches were
+	// completely unregistered — an audit caught that both fell through to
+	// the dashboard's own catch-all "/" handler, which demands HTTP Basic
+	// Auth and returns an HTML/text-plain 401 instead of a proper Anthropic
+	// JSON error envelope. Neither is actually implemented; both just say
+	// so clearly instead of looking like a broken dashboard login.
+	mux.HandleFunc("/v1/complete", handleDeprecatedComplete)
+	mux.HandleFunc("/v1/messages/batches", handleUnsupportedBatches)
+	mux.HandleFunc("/v1/messages/batches/", handleUnsupportedBatches)
+	// Same reasoning: a typo'd or unimplemented /v1/* path (e.g.
+	// /v1/mesages) fell through to the dashboard's HTML/Basic-Auth catch-all
+	// instead of a clean Anthropic 404 — register a prefix fallback last so
+	// Go's ServeMux only reaches it when nothing more specific above matched.
+	mux.HandleFunc("/v1/", handleUnknownV1Path)
 
 	// Claude Code CLI internal control endpoints: when ANTHROPIC_BASE_URL is set,
 	// the CLI queries these paths. If unhandled on mux, they fall through to "/"
@@ -492,6 +517,14 @@ func main() {
 	interceptedMux.Handle("/v1/embeddings", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleEmbeddings(cfgMgr, w, r)
 	})))
+	// Same reasoning as the plain mux registrations above: without these,
+	// an HTTPS_PROXY-only client hitting these paths fell through to
+	// PassthroughToReal, which forwards to the real api.anthropic.com and
+	// gets a genuine 401 there instead of a clear local answer.
+	interceptedMux.Handle("/v1/complete", commonAPIMiddleware(http.HandlerFunc(handleDeprecatedComplete)))
+	interceptedMux.Handle("/v1/messages/batches", commonAPIMiddleware(http.HandlerFunc(handleUnsupportedBatches)))
+	interceptedMux.Handle("/v1/messages/batches/", commonAPIMiddleware(http.HandlerFunc(handleUnsupportedBatches)))
+	interceptedMux.Handle("/v1/", commonAPIMiddleware(http.HandlerFunc(handleUnknownV1Path)))
 	interceptedMux.HandleFunc("/", PassthroughToReal)
 
 	proxySecret := cfgMgr.ProxySecret()
@@ -774,6 +807,16 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			acc, err := globalSelector.SelectAccountExcluding(clientKey, convAnchor, tenant, excludedAccounts)
 			if err != nil {
 				lastErr = err
+				// Was left at lastStatus's initial http.StatusBadGateway
+				// default — an audit caught that the whole pool being on
+				// cooldown (every account quota-exhausted) is a rate-limit
+				// condition, not a gateway failure, but Claude Code treats
+				// 502 as a fatal connection error and aborts the session
+				// instead of running its normal 429/unified-reset countdown.
+				// writeAnthropicError's own 429 branch (below, at the final
+				// write) sets Retry-After/unified-reset automatically once
+				// this is 429.
+				lastStatus = http.StatusTooManyRequests
 				break
 			}
 			activeAcc = acc
@@ -1113,7 +1156,9 @@ func hasCacheControlBreakpoint(claudeBody []byte) bool {
 // listened, since Anthropic's own clients expect the contract enforced,
 // not just requested.
 func wantsSingleToolUse(claudeBody []byte) bool {
-	return gjson.GetBytes(claudeBody, "disable_parallel_tool_use").Bool()
+	// The official Anthropic SDKs send this nested inside tool_choice, not
+	// as a top-level field — see translator.go's matching comment.
+	return gjson.GetBytes(claudeBody, "disable_parallel_tool_use").Bool() || gjson.GetBytes(claudeBody, "tool_choice.disable_parallel_tool_use").Bool()
 }
 
 func executeStreamingWithWatchdog(
@@ -1591,23 +1636,23 @@ func executeNonStreaming(
 		if errCode == 0 {
 			errCode = http.StatusInternalServerError
 		}
-		errStatus := errNode.Get("status").String()
-		errType := "api_error"
-		switch errStatus {
-		case "RESOURCE_EXHAUSTED":
-			errType = "rate_limit_error"
-		case "INVALID_ARGUMENT", "FAILED_PRECONDITION", "OUT_OF_RANGE":
-			errType = "invalid_request_error"
-		case "UNAUTHENTICATED":
-			errType = "authentication_error"
-		case "PERMISSION_DENIED":
-			errType = "permission_error"
-		case "NOT_FOUND":
-			errType = "not_found_error"
-		default:
-			errType = anthropicErrorTypeForStatus(errCode)
-		}
-		writeAnthropicError(w, errCode, errType, "Upstream error: "+msg)
+		// Was: computed a Gemini-error.status-based errType here and
+		// called writeAnthropicError(w, errCode, errType, ...) before
+		// returning false. An audit caught that this is the ONLY
+		// `return false` in this whole function that writes to w before
+		// returning — every other one (failed request creation, network
+		// failure, non-200 status) leaves that to the caller.
+		// handleMessages's retry loop can legitimately retry a `false`
+		// return (session-token-wall bump, location-gate host rotation)
+		// or fall through to its own final writeAnthropicError assuming
+		// "nothing was sent yet" — both paths then called
+		// w.WriteHeader/w.Write a SECOND time on top of this one,
+		// producing Go's "superfluous response.WriteHeader call" and two
+		// concatenated JSON bodies in the client's response. Just return
+		// the error; the caller's own anthropicErrorTypeForStatus(errCode)
+		// reconstructs essentially the same classification from the
+		// numeric code alone (429->rate_limit_error, 400->invalid_request_error,
+		// etc.) when it writes the response exactly once.
 		return false, errCode, fmt.Errorf("upstream error: %s", msg)
 	}
 	if pf := geminiJSON.Get("promptFeedback"); pf.Exists() {
@@ -2016,11 +2061,12 @@ func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Req
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "This endpoint requires a POST request")
 		return
 	}
-	clientKey := r.Header.Get("x-api-key")
-	if clientKey == "" {
-		clientKey = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	}
-	if _, ok := cfgMgr.GetTenant(clientKey); !ok {
+	// Was a direct strings.TrimPrefix(..., "Bearer ") here — case-sensitive,
+	// so a client sending lowercase "bearer <token>" (several HTTP
+	// libraries normalize the scheme to lowercase) got the whole header
+	// value treated as the key and a false 401. authenticatedTenantFromRequest
+	// (added for handleModels/handleModelByID) already does this correctly.
+	if _, ok := authenticatedTenantFromRequest(cfgMgr, r); !ok {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
 		return
 	}
@@ -2580,6 +2626,30 @@ func handleUsage(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(b)
 }
+
+// handleDeprecatedComplete answers the legacy Anthropic text-completions
+// endpoint (pre-Messages-API) with a clear, actionable error instead of
+// letting it fall through to the dashboard's Basic-Auth catch-all.
+func handleDeprecatedComplete(w http.ResponseWriter, r *http.Request) {
+	writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "The /v1/complete endpoint is deprecated and not supported by this gateway; use /v1/messages instead.")
+}
+
+// handleUnsupportedBatches answers the Message Batches API with a clear
+// "not supported" instead of a 401 Basic Auth challenge — this gateway has
+// no batch-processing backend to run it against.
+func handleUnsupportedBatches(w http.ResponseWriter, r *http.Request) {
+	writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Message batches are not supported by this gateway.")
+}
+
+// handleUnknownV1Path is the last-resort fallback for any /v1/* path not
+// matched by a more specific handler above (ServeMux always prefers the
+// most specific registered pattern) — a typo'd or unimplemented endpoint
+// now gets a clean Anthropic 404 instead of the dashboard's HTML/Basic-Auth
+// catch-all.
+func handleUnknownV1Path(w http.ResponseWriter, r *http.Request) {
+	writeAnthropicError(w, http.StatusNotFound, "not_found_error", fmt.Sprintf("Unknown endpoint: %s %s", r.Method, r.URL.Path))
+}
+
 func handleEmbeddings(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method Not Allowed")
