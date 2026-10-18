@@ -190,6 +190,14 @@ func isReadEquivalentBashCommand(command string) bool {
 // was missing here, leaving a bare `cat file.txt` completely invisible.
 var readEquivalentPowerShellPattern = regexp.MustCompile(`(?i)\b(get-content|gc|cat)\b|select-object\s+-(first|last|skip)|\btype\b|\bmore\b`)
 
+// powerShellIsWritePattern is catIsWritePattern's PowerShell counterpart —
+// an audit caught that `cat file.txt > out.txt` or `gc file.txt | Out-File
+// out.txt` (reading one file specifically to write it elsewhere — genuine
+// forward progress) had no exclusion here, miscounting it as an
+// unproductive read-loop turn the same way plain Bash `cat` without this
+// guard used to.
+var powerShellIsWritePattern = regexp.MustCompile(`(?i)>|Out-File|Set-Content|Add-Content`)
+
 func isReadEquivalentPowerShellCommand(command string) bool {
 	lc := strings.ToLower(command)
 	// select-string is PowerShell's own grep equivalent; findstr/rg/grep are
@@ -203,6 +211,9 @@ func isReadEquivalentPowerShellCommand(command string) bool {
 		return false
 	}
 	if readEquivalentPowerShellPattern.MatchString(command) {
+		if powerShellIsWritePattern.MatchString(command) {
+			return false
+		}
 		return true
 	}
 	// An audit caught that isReadEquivalentBashCommand's own
@@ -539,8 +550,49 @@ func InjectUserNudge(claudeReqJSON map[string]interface{}, text string) {
 	if len(msgs) > 0 {
 		if lastMsg, ok := msgs[len(msgs)-1].(map[string]interface{}); ok {
 			if role, _ := lastMsg["role"].(string); role == "user" {
-				switch content := lastMsg["content"].(type) {
+				switch rawContent := lastMsg["content"].(type) {
+				case []map[string]interface{}:
+					// An audit caught this switch only ever handled
+					// []interface{} and string — a DIFFERENT gap than the
+					// earlier fix above for msgsRaw's own outer type.
+					// SanitizeMessagesAndGraph's normalization can leave a
+					// message's "content" itself as []map[string]interface{},
+					// and neither case here matched that shape, so this
+					// whole block silently did nothing and fell through to
+					// appending a brand new "user" message below —
+					// producing two consecutive user turns, which
+					// SanitizeMessagesAndGraph's merge then places a text
+					// block as a sibling to a tool_result, which Gemini
+					// rejects outright.
+					content := make([]interface{}, len(rawContent))
+					for i, m := range rawContent {
+						content[i] = m
+					}
+					for _, item := range content {
+						block, ok := item.(map[string]interface{})
+						if !ok || block["type"] != "tool_result" {
+							continue
+						}
+						switch c := block["content"].(type) {
+						case string:
+							block["content"] = c + "\n\n[" + text + "]"
+						case []interface{}:
+							block["content"] = append(c, map[string]interface{}{
+								"type": "text",
+								"text": "\n\n[" + text + "]",
+							})
+						default:
+							block["content"] = "\n\n[" + text + "]"
+						}
+						lastMsg["content"] = content
+						claudeReqJSON["messages"] = msgs
+						return
+					}
+					lastMsg["content"] = append(content, nudgeBlock)
+					claudeReqJSON["messages"] = msgs
+					return
 				case []interface{}:
+					content := rawContent
 					// Gemini requires a turn carrying a functionResponse to
 					// contain ONLY functionResponse parts — a bare text block
 					// appended alongside a tool_result here guarantees a 400
@@ -571,7 +623,7 @@ func InjectUserNudge(claudeReqJSON map[string]interface{}, text string) {
 					return
 				case string:
 					lastMsg["content"] = []interface{}{
-						map[string]interface{}{"type": "text", "text": content},
+						map[string]interface{}{"type": "text", "text": rawContent},
 						nudgeBlock,
 					}
 					claudeReqJSON["messages"] = msgs

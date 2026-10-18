@@ -181,19 +181,56 @@ func sealFunctionResponseTurn(parts []string) (sealed []string, followUpImages [
 // non-alphabet byte outright with CorruptInputError, silently dropping an
 // otherwise well-formed document whose encoder happened to wrap lines.
 func decodeBase64Loose(s string) ([]byte, error) {
-	cleaned := strings.Map(func(r rune) rune {
+	return base64.StdEncoding.DecodeString(stripBase64Whitespace(s))
+}
+
+// stripBase64Whitespace removes RFC 2045 line-wrapping whitespace (76-char
+// line wraps, or stray \r\n/\n/spaces some clients leave in) from a base64
+// string. decodeBase64Loose uses this before decoding locally; inlineData.data
+// (sent to Gemini for it to decode) needs the same cleanup for the same
+// reason — some clients produce valid, spec-legal line-wrapped base64 that a
+// strict decoder on the receiving end rejects outright.
+func stripBase64Whitespace(s string) string {
+	return strings.Map(func(r rune) rune {
 		switch r {
 		case ' ', '\t', '\n', '\r':
 			return -1
 		}
 		return r
 	}, s)
-	return base64.StdEncoding.DecodeString(cleaned)
+}
+
+// sanitizeGeminiFunctionName rewrites a tool name to satisfy Gemini's
+// function-calling protobuf identifier regex (^[a-zA-Z_][a-zA-Z0-9_]*$, max
+// 63 chars) — Anthropic's own looser `^[a-zA-Z0-9_-]{1,64}$` permits hyphens
+// (common in MCP tool names like "mcp__brave-search__search") that Gemini
+// rejects outright. Any character outside [a-zA-Z0-9_] becomes "_"; a name
+// that would otherwise start with a digit gets a leading "_".
+func sanitizeGeminiFunctionName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return "_"
+	}
+	if out[0] >= '0' && out[0] <= '9' {
+		out = "_" + out
+	}
+	if len(out) > 63 {
+		out = out[:63]
+	}
+	return out
 }
 
 // ConvertClaudeRequestToGemini converts an Anthropic Messages API payload into
 // a Google Gemini streamGenerateContent payload with full sanitization and tiering.
-func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqClass string, agentKey string, sessionID string, instanceID string) ([]byte, string, int, bool, map[string]bool, error) {
+func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqClass string, agentKey string, sessionID string, instanceID string) ([]byte, string, int, bool, map[string]bool, map[string]string, error) {
 	// loopKey disambiguates both across sessions and across parallel
 	// subagents within one session: agentKey alone (e.g. "sub:general-
 	// purpose") is shared by every concurrent instance of that subagent
@@ -207,7 +244,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// Parse as generic map for in-place AST transformations
 	var reqMap map[string]interface{}
 	if err := json.Unmarshal(claudeJSON, &reqMap); err != nil {
-		return nil, "", 0, false, nil, fmt.Errorf("invalid json: %w", err)
+		return nil, "", 0, false, nil, nil, fmt.Errorf("invalid json: %w", err)
 	}
 
 	// 1. Dynamic Tiering & Model Effort Resolution
@@ -312,7 +349,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// Re-serialize sanitized request
 	sanitizedBytes, err := json.Marshal(reqMap)
 	if err != nil {
-		return nil, "", 0, false, nil, fmt.Errorf("re-marshal sanitized json: %w", err)
+		return nil, "", 0, false, nil, nil, fmt.Errorf("re-marshal sanitized json: %w", err)
 	}
 
 	root := gjson.ParseBytes(sanitizedBytes)
@@ -480,12 +517,36 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							// string and sends them as a "text" part —
 							// invalid UTF-8 that Gemini rejects or garbles.
 							mediaType := strings.ToLower(src.Get("media_type").String())
+							if mediaType == "" && ptype == "document" {
+								// An audit caught context_window.go already
+								// defaults a missing media_type to
+								// "application/pdf" for TOKEN COUNTING
+								// purposes, but this is the separate
+								// function that translates the actual
+								// bytes — without the same default, a
+								// document block with no media_type fell
+								// into the text-decode branch below,
+								// decoding binary PDF bytes as if UTF-8 and
+								// sending invalid text to Gemini (400).
+								mediaType = "application/pdf"
+							}
 							b64Data := src.Get("data").String()
 							if b64Data != "" {
 								if mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/") {
 									part := `{"inlineData":{"mimeType":"","data":""}}`
 									part, _ = sjson.Set(part, "inlineData.mimeType", mediaType)
-									part, _ = sjson.Set(part, "inlineData.data", b64Data)
+									// An audit caught that decodeBase64Loose
+									// (used for the text-document decode
+									// branch just below) strips RFC 2045
+									// line-wrapping whitespace before
+									// decoding, but inlineData.data here was
+									// sent through raw — a client that
+									// MIME-wraps its base64 (a real, spec-
+									// legal encoding some libraries produce)
+									// passed literal newlines/spaces into
+									// Gemini's own base64 decode, which some
+									// strict decoders reject outright.
+									part, _ = sjson.Set(part, "inlineData.data", stripBase64Whitespace(b64Data))
 									partsJSON = append(partsJSON, part)
 								} else {
 									// Plain text, code, CSV, JSON base64 documents:
@@ -521,6 +582,33 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							if u := src.Get("url").String(); u != "" {
 								part := `{"text":""}`
 								part, _ = sjson.Set(part, "text", "[Attached "+ptype+" by URL: "+u+"]")
+								partsJSON = append(partsJSON, part)
+							}
+						case "content":
+							// An audit caught that Anthropic's other text
+							// document form — source.type == "content",
+							// where "content" is either the literal text or
+							// an array of {"type":"text","text":...} blocks
+							// — hit no case here at all and was silently
+							// dropped, same failure mode "url" above was
+							// already fixed for.
+							contentField := src.Get("content")
+							var combined strings.Builder
+							if contentField.IsArray() {
+								contentField.ForEach(func(_, block gjson.Result) bool {
+									if block.Get("type").String() == "text" {
+										combined.WriteString(block.Get("text").String())
+									} else if block.Type == gjson.String {
+										combined.WriteString(block.String())
+									}
+									return true
+								})
+							} else if contentField.Type == gjson.String {
+								combined.WriteString(contentField.String())
+							}
+							if combined.Len() > 0 {
+								part := `{"text":""}`
+								part, _ = sjson.Set(part, "text", combined.String())
 								partsJSON = append(partsJSON, part)
 							}
 						}
@@ -645,7 +733,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 											if mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/") {
 												imgPart := `{"inlineData":{"mimeType":"","data":""}}`
 												imgPart, _ = sjson.Set(imgPart, "inlineData.mimeType", mediaType)
-												imgPart, _ = sjson.Set(imgPart, "inlineData.data", data)
+												imgPart, _ = sjson.Set(imgPart, "inlineData.data", stripBase64Whitespace(data))
 												imageParts = append(imageParts, imgPart)
 											} else {
 												if decoded, err := decodeBase64Loose(data); err == nil {
@@ -869,7 +957,17 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// stripped, so checking against that let tool_choice:{"type":"tool",
 	// "name":"Grep"} through, 400ing with "allowed_function_names contains
 	// 'Grep' which is not in function_declarations".
-	sentToolNames := make(map[string]bool)
+	// An audit caught that tool names were passed to Gemini verbatim —
+	// Anthropic permits hyphens (`^[a-zA-Z0-9_-]{1,64}$`), and MCP tools
+	// commonly use them (e.g. "mcp__brave-search__search"), but Gemini's
+	// function-calling protobuf enforces a stricter
+	// `^[a-zA-Z_][a-zA-Z0-9_]*$` (no hyphens, max 63 chars), rejecting the
+	// whole request with HTTP 400 the moment any declared tool has one.
+	// reverseToolNameMap lets the response path (server.go, sse.go)
+	// restore the original name Claude Code expects once Gemini invokes
+	// the function by its sanitized one.
+	reverseToolNameMap := make(map[string]string)
+	sentToolNames := make(map[string]string) // original name -> sanitized (Gemini-bound) name
 	if tools := root.Get("tools"); tools.IsArray() {
 		var decls []string
 		hasWebSearch := false
@@ -946,12 +1044,16 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				syntheticReasonTools[name] = true
 			}
 
+			sanitizedName := sanitizeGeminiFunctionName(name)
+			if sanitizedName != name {
+				reverseToolNameMap[sanitizedName] = name
+			}
 			decl := `{"name":"","description":"","parameters":{}}`
-			decl, _ = sjson.Set(decl, "name", name)
+			decl, _ = sjson.Set(decl, "name", sanitizedName)
 			decl, _ = sjson.Set(decl, "description", desc)
 			decl, _ = sjson.SetRaw(decl, "parameters", schemaRaw)
 			decls = append(decls, decl)
-			sentToolNames[name] = true
+			sentToolNames[name] = sanitizedName
 			return true
 		})
 
@@ -996,9 +1098,17 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 				case "any":
 					out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.mode", "ANY")
 				case "tool":
-					if name := tc.Get("name").String(); name != "" && sentToolNames[name] {
-						out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.mode", "ANY")
-						out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.allowedFunctionNames.0", name)
+					if name := tc.Get("name").String(); name != "" {
+						if sanitized, ok := sentToolNames[name]; ok {
+							// allowedFunctionNames must reference the
+							// SANITIZED (Gemini-bound) name, not the
+							// original Claude-side one, or Gemini 400s
+							// with "allowed_function_names contains X
+							// which is not in function_declarations" the
+							// moment the original name had a hyphen.
+							out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.mode", "ANY")
+							out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.allowedFunctionNames.0", sanitized)
+						}
 					}
 				case "none":
 					out, _ = sjson.Set(out, "toolConfig.functionCallingConfig.mode", "NONE")
@@ -1149,7 +1259,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		out, _ = sjson.Set(out, fmt.Sprintf("safetySettings.%d.threshold", i), threshold)
 	}
 
-	return []byte(out), modelName, budget, wasShrunk, syntheticReasonTools, nil
+	return []byte(out), modelName, budget, wasShrunk, syntheticReasonTools, reverseToolNameMap, nil
 }
 
 // ScrubBillingHeader strips out fingerprint headers and billing marks that trigger Google 429/Filter:

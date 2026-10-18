@@ -340,6 +340,18 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 		// careful client could reasonably act on — zero these out too.
 		w.Header().Set("anthropic-ratelimit-requests-remaining", "0")
 		w.Header().Set("anthropic-ratelimit-tokens-remaining", "0")
+		// An audit caught that this path never sent the *-limit headers
+		// at all (only *-remaining and the reset timestamps) — an SDK or
+		// telemetry hook computing quota utilization as remaining/limit
+		// either sees a missing key or divides by zero. Match
+		// applyRateLimitHeaders' api_key-tenant defaults.
+		if w.Header().Get("anthropic-ratelimit-requests-limit") == "" {
+			w.Header().Set("anthropic-ratelimit-requests-limit", "1000")
+		}
+		if w.Header().Get("anthropic-ratelimit-tokens-limit") == "" {
+			w.Header().Set("anthropic-ratelimit-tokens-limit", "1000000")
+			setSplitTokenRateLimitHeaders(w.Header(), 1000000, 0, time.Now().Add(15*time.Minute))
+		}
 		// An audit caught that only the Claude-Code-specific
 		// unified-reset (a Unix timestamp) was ever set on a 429 — a
 		// generic Anthropic SDK reads the standard requests-reset/
@@ -518,6 +530,24 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{}`))
 	}
+	// An audit caught these CLI management/telemetry endpoints were
+	// never registered at all — in direct HTTP mode they fell through to
+	// the dashboard handler and got a 401 Basic Auth challenge; over
+	// HTTPS_PROXY/MITM they fell through to PassthroughToReal and either
+	// 401'd against the real api.anthropic.com or hung for its full 30s
+	// timeout. Same spirit as handleProfileJSON/handleValidateJSON above.
+	handleOrganizationsCurrentJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"uuid":"0bad747f-0000-4000-a000-000000000000","name":"ClaudGravity Workspace","organization_type":"enterprise","rate_limit_tier":"tier_4"}`))
+	}
+	handleAuthCurrentUserJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"uuid":"0bad747f-0000-4000-a000-000000000000","email":"user@claudgravity.local","organizations":[{"uuid":"0bad747f-0000-4000-a000-000000000000","name":"ClaudGravity Workspace"}]}`))
+	}
+	handleBillingJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"tier":"tier_4","status":"active","has_payment_method":true,"currency":"usd"}`))
+	}
 
 	mux.HandleFunc("/api/claude_cli_profile", handleProfileJSON)
 	mux.HandleFunc("/api/oauth/profile", handleProfileJSON)
@@ -526,6 +556,17 @@ func main() {
 	mux.HandleFunc("/api/claude_code/settings", handleSettingsJSON)
 	mux.HandleFunc("/managed/settings", handleSettingsJSON)
 	mux.HandleFunc("/api/event_logging/", handleTelemetryJSON)
+	// Go's http.ServeMux 301-redirects a bare "/api/event_logging" (no
+	// trailing slash) to the slash-suffixed form registered above, which
+	// drops the POST body on the redirect — register the bare path too,
+	// same handler, instead of relying on the redirect.
+	mux.HandleFunc("/api/event_logging", handleTelemetryJSON)
+	mux.HandleFunc("/api/telemetry", handleTelemetryJSON)
+	mux.HandleFunc("/api/telemetry/", handleTelemetryJSON)
+	mux.HandleFunc("/api/organizations/current", handleOrganizationsCurrentJSON)
+	mux.HandleFunc("/api/auth/current_user", handleAuthCurrentUserJSON)
+	mux.HandleFunc("/api/organizations/current/billing", handleBillingJSON)
+	mux.HandleFunc("/api/organizations/{id}/billing", handleBillingJSON)
 
 	// Separate mux for TLS-intercepted anthropic.com/claude.ai traffic (see
 	// HandleConnectTunnel). This must NOT be the same mux as above: that one
@@ -598,6 +639,15 @@ func main() {
 	interceptedMux.Handle("/api/claude_code/organizations/metrics_enabled", commonAPIMiddleware(http.HandlerFunc(handleMetricsJSON)))
 	interceptedMux.Handle("/api/claude_code/settings", commonAPIMiddleware(http.HandlerFunc(handleSettingsJSON)))
 	interceptedMux.Handle("/managed/settings", commonAPIMiddleware(http.HandlerFunc(handleSettingsJSON)))
+	// Same CLI management/telemetry endpoints added to the plain mux
+	// above — claude.exe's MITM-tunneled traffic needs them too.
+	interceptedMux.Handle("/api/event_logging", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
+	interceptedMux.Handle("/api/telemetry", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
+	interceptedMux.Handle("/api/telemetry/", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
+	interceptedMux.Handle("/api/organizations/current", commonAPIMiddleware(http.HandlerFunc(handleOrganizationsCurrentJSON)))
+	interceptedMux.Handle("/api/auth/current_user", commonAPIMiddleware(http.HandlerFunc(handleAuthCurrentUserJSON)))
+	interceptedMux.Handle("/api/organizations/current/billing", commonAPIMiddleware(http.HandlerFunc(handleBillingJSON)))
+	interceptedMux.Handle("/api/organizations/{id}/billing", commonAPIMiddleware(http.HandlerFunc(handleBillingJSON)))
 	interceptedMux.Handle("/v1/embeddings", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleEmbeddings(cfgMgr, w, r)
 	})))
@@ -776,6 +826,52 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "\"max_tokens\": required field must be a positive integer")
 		return
 	}
+	// An audit caught that translator.go silently swallowed two
+	// tool_choice misuses the Anthropic spec requires to be a hard 400
+	// instead: tool_choice provided with no "tools" array at all (the
+	// whole field is meaningless without declared tools), and
+	// tool_choice:{"type":"tool","name":X} naming a tool that isn't in
+	// "tools" — both previously just fell back to Gemini's own default
+	// "let the model decide" with no error, silently not doing what the
+	// client explicitly asked for.
+	// An audit caught that this gateway's own 25MB request-body cap
+	// (above) is looser than Gemini's inlineData payload limit (20MB) —
+	// a request between 20-25MB passes our check but still 400s upstream
+	// once translated, instead of getting a clean, fast rejection here.
+	// Sum every base64 "data" field (image/document source blocks) as a
+	// proxy for total inlineData size.
+	var totalInlineDataBytes int
+	for _, p := range findPaths(string(bodyBytes), "data") {
+		if v := gjson.GetBytes(bodyBytes, p); v.Type == gjson.String {
+			totalInlineDataBytes += len(v.Str)
+		}
+	}
+	const maxInlineDataBytes = 20 * 1024 * 1024
+	if totalInlineDataBytes > maxInlineDataBytes {
+		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Combined size of inline image/document data exceeds the 20MB upstream limit")
+		return
+	}
+	if tc := gjson.GetBytes(bodyBytes, "tool_choice"); tc.Exists() {
+		toolsArr := gjson.GetBytes(bodyBytes, "tools")
+		if !toolsArr.IsArray() || len(toolsArr.Array()) == 0 {
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "\"tool_choice\": provided without any \"tools\" declared")
+			return
+		}
+		if tc.Get("type").String() == "tool" {
+			wantName := tc.Get("name").String()
+			found := false
+			for _, t := range toolsArr.Array() {
+				if t.Get("name").String() == wantName {
+					found = true
+					break
+				}
+			}
+			if !found {
+				writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("\"tool_choice\": tool %q is not present in \"tools\"", wantName))
+				return
+			}
+		}
+	}
 
 	// 2. Derive Conversation Anchor for Session Affinity (Prompt Caching)
 	headerSessionID := r.Header.Get("x-claude-code-session-id")
@@ -859,7 +955,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	}
 
 	// 3. Full Orchestrator Translation: Tiering, LoopGuard, Middle-Truncation 64KB, Sanitizer
-	geminiBody, modelName, budget, wasShrunk, syntheticReasonTools, err := ConvertClaudeRequestToGemini(bodyBytes, tenant, reqClass, agentKey, sessionID, instanceID)
+	geminiBody, modelName, budget, wasShrunk, syntheticReasonTools, reverseToolNameMap, err := ConvertClaudeRequestToGemini(bodyBytes, tenant, reqClass, agentKey, sessionID, instanceID)
 	if err != nil {
 		LogGateway("[#%d] Translation error: %v", rid, err)
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Translation error: %v", err))
@@ -1088,9 +1184,9 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				rid, attempt+1, maxAttempts, bump, tenant.Name, accLabel, modelName, budget, isStreaming, len(geminiBody), agentKey)
 
 			if isStreaming {
-				success, lastStatus, lastErr = executeStreamingWithWatchdog(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes, syntheticReasonTools)
+				success, lastStatus, lastErr = executeStreamingWithWatchdog(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes, syntheticReasonTools, reverseToolNameMap)
 			} else {
-				success, lastStatus, lastErr = executeNonStreaming(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes, syntheticReasonTools)
+				success, lastStatus, lastErr = executeNonStreaming(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes, syntheticReasonTools, reverseToolNameMap)
 			}
 
 			if success || !isAntigravity {
@@ -1193,6 +1289,15 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				// notices and disables it by hand.
 				globalAccountManager.MarkAccountCooldown(activeAcc.Email, 60*time.Minute)
 				globalSelector.UnstickAccount(activeAcc.Email)
+			} else if lastStatus == http.StatusUnauthorized {
+				// An audit caught that a Google 401 (token revoked, or
+				// some other auth desync) only ever excluded the account
+				// from THIS request's immediate retry — the cached
+				// AccessToken itself was never cleared, so every
+				// subsequent request kept reusing and re-failing on the
+				// same rejected token until it happened to hit its real
+				// ExpiresAt. Force a genuine refresh next time instead.
+				globalAccountManager.InvalidateAccessToken(activeAcc.Email)
 			}
 		}
 
@@ -1346,6 +1451,7 @@ func executeStreamingWithWatchdog(
 	flusher http.Flusher,
 	claudeBodyBytes []byte,
 	syntheticReasonTools map[string]bool,
+	reverseToolNameMap map[string]string,
 ) (bool, int, error) {
 	panicTimeout := time.Duration(serverCfg.PanicTimeoutSeconds) * time.Second
 	ttftTimeout := time.Duration(serverCfg.TTFTTimeoutSeconds) * time.Second
@@ -1653,7 +1759,7 @@ UpstreamReady:
 		// real Anthropic billing.
 		cachePrefixFrac = cacheBreakpointPrefixFraction(claudeBodyBytes)
 	}
-	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior, cachePrefixFrac, wantsSingleToolUse(claudeBodyBytes))
+	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior, cachePrefixFrac, wantsSingleToolUse(claudeBodyBytes), reverseToolNameMap)
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	if err != nil {
@@ -1764,6 +1870,7 @@ func executeNonStreaming(
 	w http.ResponseWriter,
 	claudeBodyBytes []byte,
 	syntheticReasonTools map[string]bool,
+	reverseToolNameMap map[string]string,
 ) (bool, int, error) {
 	// Unlike the streaming path (which has the panic/TTFT watchdog), this had
 	// no deadline at all — a hung upstream could block the request forever.
@@ -1868,6 +1975,11 @@ func executeNonStreaming(
 				},
 			}
 			blockJSON, _ := json.Marshal(blockResp)
+			// An audit caught applyRateLimitHeaders was never called here
+			// — a 200 response to /v1/messages without the full
+			// anthropic-ratelimit-* header set violates the spec every
+			// other 200 path already honors.
+			applyRateLimitHeaders(w.Header(), activeAcc, modelName)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(blockJSON)
@@ -2069,6 +2181,14 @@ func executeNonStreaming(
 						continue
 					}
 					fname := fc.Get("name").String()
+					if orig, ok := reverseToolNameMap[fname]; ok {
+						// translator.go sanitized this tool's name for
+						// Gemini (e.g. stripped a hyphen) — restore the
+						// original before it reaches Claude Code, and
+						// before any lookup below keyed by that original
+						// name (numericEnumFields, syntheticReasonTools).
+						fname = orig
+					}
 					argsRaw := fc.Get("args").Raw
 					if argsRaw == "" || argsRaw == "null" {
 						argsRaw = "{}"
@@ -2098,12 +2218,28 @@ func executeNonStreaming(
 					argsRaw = stripNestedOpenDictReason(fname, argsRaw)
 					var argsObj interface{}
 					_ = json.Unmarshal([]byte(argsRaw), &argsObj)
-					if argsObj == nil {
+					// An audit caught that the nil-check below only ever
+					// caught malformed JSON — if Gemini instead emitted a
+					// bare string (`args: "ls -la"`) or doubly-encoded JSON
+					// (`args: "{\"cmd\":\"ls\"}"`), json.Unmarshal succeeds
+					// and yields a Go string (not nil), so
+					// `tool_use.input` reached the client as a JSON string
+					// instead of an object, crashing Anthropic SDKs' Zod
+					// validation (which requires Record<string, unknown>).
+					if s, ok := argsObj.(string); ok {
+						var inner interface{}
+						if err := json.Unmarshal([]byte(s), &inner); err == nil {
+							argsObj = inner
+						}
+					}
+					if _, ok := argsObj.(map[string]interface{}); !ok {
 						// Malformed JSON (e.g. truncated mid-argument by a
 						// MAX_TOKENS cutoff) leaves argsObj nil, which
 						// serializes as "input": null — Anthropic's
 						// Messages API requires tool_use.input to be an
-						// object.
+						// object. Any other non-object primitive (bare
+						// string, number, bool, array) is coerced the same
+						// way rather than passed through.
 						argsObj = map[string]interface{}{}
 					}
 					toolsCalled = append(toolsCalled, fname)
@@ -2278,8 +2414,14 @@ func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Req
 	// e.g. {"messages": "a string"} through as 200 OK with a tiny token
 	// count instead of the 400 invalid_request_error Anthropic's spec
 	// requires for a malformed messages field.
-	if !gjson.ValidBytes(bodyBytes) || !gjson.GetBytes(bodyBytes, "messages").IsArray() || !gjson.GetBytes(bodyBytes, "model").Exists() {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Request body must be valid JSON with \"model\" and \"messages\"")
+	// An audit caught this was more permissive than /v1/messages' own
+	// validation: Exists() accepts {"model": ""} (an empty string field
+	// still "exists"), and nothing checked messages was non-empty — an
+	// empty array passes IsArray() too. /v1/messages requires both a
+	// non-empty model and non-empty messages as a hard 400.
+	messagesArr := gjson.GetBytes(bodyBytes, "messages")
+	if !gjson.ValidBytes(bodyBytes) || !messagesArr.IsArray() || len(messagesArr.Array()) == 0 || gjson.GetBytes(bodyBytes, "model").String() == "" {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Request body must be valid JSON with a non-empty \"model\" and non-empty \"messages\"")
 		return
 	}
 	estTokens := estimateApproxClaudeTokens(bodyBytes)

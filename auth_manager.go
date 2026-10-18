@@ -338,7 +338,11 @@ func persistAccountFields(filePath, projectID string, probed bool) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(filePath, updated, 0644)
+	// An audit caught this (and two other sites in this file) wrote
+	// credential JSON directly via os.WriteFile — a crash mid-write
+	// truncates the file to 0 bytes. atomicWriteFile (config.go) already
+	// exists for exactly this; use it here too.
+	_ = atomicWriteFile(filePath, updated)
 }
 
 // discoverAntigravityProjectID retrieves the account's real GCP project id via
@@ -769,7 +773,7 @@ func (am *AccountManager) ToggleAccountDisabled(email string, disabled bool) err
 		data, err := os.ReadFile(filePath)
 		if err == nil {
 			if updated, err := sjson.SetBytes(data, "disabled", disabled); err == nil {
-				_ = os.WriteFile(filePath, updated, 0644)
+				_ = atomicWriteFile(filePath, updated)
 			}
 		}
 	}
@@ -1043,7 +1047,7 @@ func ExchangeAuthCode(code string) (*AccountRecord, error) {
 		"timestamp":     time.Now().UnixMilli(),
 	}
 	b, _ := json.MarshalIndent(fileData, "", "  ")
-	_ = os.WriteFile(filePath, b, 0644)
+	_ = atomicWriteFile(filePath, b)
 
 	record := &AccountRecord{
 		Email:        email,
@@ -1067,6 +1071,25 @@ func ExchangeAuthCode(code string) (*AccountRecord, error) {
 
 // MarkAccountCooldown sets a temporary cooldown on an account (e.g. on 429 RESOURCE_EXHAUSTED)
 // and unbinds any sticky affinity from the selector.
+// InvalidateAccessToken clears a cached access token and its expiry so the
+// next RefreshAccessToken call is forced to actually fetch a new one instead
+// of reusing the cached value. An audit caught that a Google-side HTTP 401
+// (token revoked, or some other auth desync) only ever excluded the account
+// from the IMMEDIATE request's retry loop — the cached AccessToken/ExpiresAt
+// were never touched, so RefreshAccessToken's own cache check
+// (time.Now().Add(60s).Before(cachedExpiry)) kept finding the token "still
+// valid" by its stale expiry and handed the same rejected token right back
+// out on every subsequent request until it naturally expired.
+func (am *AccountManager) InvalidateAccessToken(email string) {
+	am.mu.Lock()
+	if acc, ok := am.accounts[email]; ok {
+		acc.AccessToken = ""
+		acc.ExpiresAt = time.Time{}
+		LogGateway("[AccountManager] Invalidated cached access token for %s after upstream 401", email)
+	}
+	am.mu.Unlock()
+}
+
 func (am *AccountManager) MarkAccountCooldown(email string, duration time.Duration) {
 	am.mu.Lock()
 	if acc, ok := am.accounts[email]; ok {

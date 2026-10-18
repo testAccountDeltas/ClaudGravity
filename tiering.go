@@ -32,12 +32,22 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 	if model == "claude-sonnet-4-6" || model == "claude-opus-4-6-thinking" || model == "gpt-oss-120b-medium" {
 		// Native 3P models supported by CloudCode - keep if explicitly requested
 	} else if strings.HasPrefix(model, "claude-opus") || strings.HasPrefix(model, "claude-3-opus") ||
-		strings.HasPrefix(model, "claude-fable") || strings.HasPrefix(model, "claude-mythos") {
+		strings.HasPrefix(model, "claude-fable") || strings.HasPrefix(model, "claude-mythos") ||
+		model == "opus" || model == "fable" || model == "mythos" {
 		// Canonical mapping matching Python relay-proxy: Opus maps to gemini-3.8-flash-tiered
+		// An audit caught that Claude Code's Agent/Task tool schema allows
+		// the bare aliases "sonnet"/"opus"/"haiku"/"fable" (no "claude-"
+		// prefix) for a subagent's model field — none of the HasPrefix
+		// checks here matched those, so every subagent requesting the
+		// CHEAPEST tier ("haiku") silently fell through to the
+		// unmapped-model fallback below and got escalated to the
+		// heaviest ModeAuto/unlimited-thinking tier instead, burning
+		// 30-60s of extra TTFT and quota on what should've been a quick,
+		// cheap subagent call. Handle the bare aliases explicitly.
 		model = "gemini-3.8-flash-tiered"
-	} else if strings.HasPrefix(model, "claude-sonnet") || strings.HasPrefix(model, "claude-3-5-sonnet") || strings.HasPrefix(model, "claude-3-7-sonnet") || strings.HasPrefix(model, "claude-3-sonnet") {
+	} else if strings.HasPrefix(model, "claude-sonnet") || strings.HasPrefix(model, "claude-3-5-sonnet") || strings.HasPrefix(model, "claude-3-7-sonnet") || strings.HasPrefix(model, "claude-3-sonnet") || model == "sonnet" {
 		model = "gemini-3.8-flash-medium"
-	} else if strings.HasPrefix(model, "claude-haiku") || strings.HasPrefix(model, "claude-3-5-haiku") || strings.HasPrefix(model, "claude-3-haiku") {
+	} else if strings.HasPrefix(model, "claude-haiku") || strings.HasPrefix(model, "claude-3-5-haiku") || strings.HasPrefix(model, "claude-3-haiku") || model == "haiku" {
 		model = "gemini-2.5-flash"
 	} else if !strings.HasPrefix(model, "gemini-") {
 		// Fallback for unmapped or legacy models (claude-2.1, claude-instant, etc.)

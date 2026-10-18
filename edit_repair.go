@@ -508,7 +508,65 @@ type fileLineInfo struct {
 
 // RepairEditToolCall checks if a tool call is an Edit/str_replace_editor/Update call,
 // and if old_string does not match byte-for-byte in the file on disk, repairs it using fuzzy whitespace matching.
+// RepairEditToolCall repairs a fuzzy-matched old_string/new_string against
+// the real file, then normalizes whatever alias parameter names the model
+// used (old_str/new_str/path/notebook_path/target_file/pattern/old_text/
+// new_text) to the exact names Claude Code's own Edit tool schema requires
+// (file_path/old_string/new_string). An audit caught that the repair logic
+// below only ever rewrote the VALUE under whichever key the model used,
+// never the key itself — a model that called Edit with {"path":...,
+// "old_str":...,"new_str":...} got back the same alias names in
+// tool_use.input, which Claude Code's Zod-schema-validated tool dispatcher
+// rejects outright, since it requires file_path/old_string/new_string
+// exactly.
 func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (string, bool) {
+	repaired, changed := repairEditToolCallCore(toolName, argsRaw, sessionID)
+	normalized, renamed := normalizeEditToolCallKeys(toolName, repaired)
+	if renamed {
+		return normalized, true
+	}
+	return repaired, changed
+}
+
+// normalizeEditToolCallKeys renames any alias key present to its canonical
+// Claude Code Edit-tool name, deleting the alias. Safe to call even when no
+// repair happened — it only touches key names, never values.
+func normalizeEditToolCallKeys(toolName string, argsRaw string) (string, bool) {
+	// NotebookEdit's real Claude Code schema uses notebook_path/new_source,
+	// not file_path/old_string/new_string — it's excluded here (unlike
+	// repairEditToolCallCore's broader alias-reading above, which is safe
+	// either way since it only reads a value, never renames a key) because
+	// renaming its genuinely-correct "notebook_path" to "file_path" would
+	// break it, not fix it.
+	nameLower := strings.ToLower(toolName)
+	if nameLower != "edit" && nameLower != "str_replace_editor" && nameLower != "update" {
+		return argsRaw, false
+	}
+	parsed := gjson.Parse(argsRaw)
+	if !parsed.IsObject() {
+		return argsRaw, false
+	}
+	renamed := false
+	rename := func(canonical string, aliases []string) {
+		if parsed.Get(canonical).Exists() {
+			return
+		}
+		for _, alias := range aliases {
+			if val := parsed.Get(alias); val.Exists() {
+				argsRaw, _ = sjson.SetRaw(argsRaw, canonical, val.Raw)
+				argsRaw, _ = sjson.Delete(argsRaw, alias)
+				renamed = true
+				return
+			}
+		}
+	}
+	rename("file_path", []string{"path", "notebook_path", "target_file"})
+	rename("old_string", []string{"old_str", "old_text", "pattern"})
+	rename("new_string", []string{"new_str", "new_text"})
+	return argsRaw, renamed
+}
+
+func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (string, bool) {
 	nameLower := strings.ToLower(toolName)
 	if nameLower != "edit" && nameLower != "str_replace_editor" && nameLower != "update" && nameLower != "notebookedit" {
 		return argsRaw, false
@@ -672,15 +730,15 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 					}
 				}
 				// Re-apply the indentation findFuzzyLineMatch detected as
-				// missing or mismatched on lines 1..N — an audit caught
-				// that only line 0's own leading whitespace was ever
-				// restored (via repairedExact's start offset), so
-				// new_string's later lines kept whatever indentation the
-				// model wrote them with, silently corrupting the file's
-				// indentation on replace. When new_string's line count
-				// differs from old_string's (a line added/removed),
-				// reapplyLineIndents falls back to a uniform best-effort
-				// indent instead of a precise 1:1 mapping.
+				// missing or mismatched on any line, including line 0 when
+				// old_string's own line 0 had SOME indentation of its own
+				// that didn't match the file's real indentation (a
+				// zero-indentation line 0 is handled earlier via
+				// repairedExact's start-offset shift instead). When
+				// new_string's line count differs from old_string's (a
+				// line added/removed), reapplyLineIndents falls back to a
+				// uniform best-effort indent for lines 1..N instead of a
+				// precise 1:1 mapping.
 				if reindented, did := reapplyLineIndents(effectiveNewStr, lineIndents); did {
 					effectiveNewStr = reindented
 				}
@@ -708,9 +766,6 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 // maps to which old one would risk indenting the wrong line instead of
 // just leaving the ambiguous case alone.
 func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
-	if len(lineIndents) < 2 {
-		return newStr, false // only line 0 ever needed fixing, already handled by repairedExact's start offset
-	}
 	hasAny := false
 	for _, ind := range lineIndents {
 		if ind != "" {
@@ -723,6 +778,21 @@ func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
 	}
 	lines := strings.Split(newStr, "\n")
 	changed := false
+
+	// Line 0 is handled the same way regardless of whether the rest of
+	// the lines correspond 1:1: lineIndents[0] already holds the exact
+	// target indentation whenever anything is missing there (findFuzzyLineMatch
+	// zeroes it out itself when its own start-offset shift already fixed
+	// it), so there's never a need to guess at a uniform indent for it the
+	// way lines 1..N do below.
+	if len(lineIndents) > 0 && lineIndents[0] != "" {
+		trimmed := strings.TrimLeft(lines[0], " \t")
+		if lineIndents[0]+trimmed != lines[0] {
+			lines[0] = lineIndents[0] + trimmed
+			changed = true
+		}
+	}
+
 	if len(lines) == len(lineIndents) {
 		// Exact 1:1 correspondence — reapply each line's own detected indent.
 		// lineIndents[j] is the file's real indentation whenever it differs
@@ -734,7 +804,7 @@ func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
 		// tab-indented file).
 		for j, ind := range lineIndents {
 			if ind == "" || j == 0 {
-				continue // line 0's indentation is already handled via repairedExact's start offset, not here
+				continue // line 0 already handled above
 			}
 			trimmed := strings.TrimLeft(lines[j], " \t")
 			if ind+trimmed == lines[j] {
@@ -753,8 +823,9 @@ func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
 		// lines overwhelmingly tend to share one indentation depth (a
 		// single block/function body) — apply the most common non-empty
 		// detected indent uniformly to every new_string line (other than
-		// line 0) that doesn't already have its own leading whitespace,
-		// instead of giving up and guaranteeing flush-left on all of them.
+		// line 0, handled above) that doesn't already have its own
+		// leading whitespace, instead of giving up and guaranteeing
+		// flush-left on all of them.
 		counts := make(map[string]int)
 		for j, ind := range lineIndents {
 			if j == 0 || ind == "" {
@@ -773,7 +844,7 @@ func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
 		if baseIndent != "" {
 			for j := range lines {
 				if j == 0 {
-					continue
+					continue // line 0 already handled above
 				}
 				if strings.TrimSpace(lines[j]) == "" {
 					continue // don't indent a genuinely blank line
@@ -921,8 +992,25 @@ func findFuzzyLineMatch(fileContent, oldStr string) (string, []string, bool) {
 		// whitespace of its own, start the returned span after the file
 		// line's leading whitespace instead, leaving it as untouched
 		// surrounding text outside the replaced span.
-		if lineIndents[0] != "" {
+		//
+		// An audit caught that this shift also fired when old_string's
+		// line 0 DID have its own (wrong-style/wrong-depth) leading
+		// whitespace — e.g. 4 spaces against a tab-indented file. In that
+		// case lineIndents[0] holds the file's real tab, and shifting
+		// startOffset past it excludes the real tab from the matched span
+		// entirely, leaving it as untouched surrounding text; new_string's
+		// line 0 (still carrying its own 4 spaces, since reapplyLineIndents
+		// skipped line 0 unconditionally) then gets inserted right after
+		// that preserved tab, producing "\t    " — tab AND spaces both
+		// present. Only take this shortcut when old_string's own line 0
+		// had NO leading whitespace at all; otherwise leave the real
+		// indentation inside the matched span (so it gets replaced, not
+		// preserved-and-duplicated) and let reapplyLineIndents correct
+		// new_string's line 0 the same way it corrects every other line.
+		oldLine0LeadingLen := len(rawOldLines[0]) - len(strings.TrimLeft(rawOldLines[0], " \t"))
+		if lineIndents[0] != "" && oldLine0LeadingLen == 0 {
 			startOffset += len(lineIndents[0])
+			lineIndents[0] = "" // already handled via the span shift above
 		}
 		lastLine := fileLines[endIdx]
 
@@ -975,6 +1063,22 @@ func RepairGrepToolCall(argsRaw string) (string, bool) {
 	path := parsed.Get("path").String()
 	if pattern != "" {
 		return argsRaw, false
+	}
+	// An audit caught that a model calling Grep with {"path":"main.go",
+	// "query":"HandleRequest"} (a plausible alias a weaker model reaches
+	// for) fell straight into the "path looks like it's actually the
+	// search term" heuristic below — "main.go" has no special regex
+	// chars AND no slash, so it passed — repurposing the FILENAME as the
+	// search pattern, deleting "path" entirely, and silently discarding
+	// "query" (the model's real intended search term). Check for an
+	// actual pattern-alias key first; only fall back to repurposing path
+	// when none of those exist either.
+	for _, aliasKey := range []string{"query", "search", "regex", "term", "text"} {
+		if alias := parsed.Get(aliasKey).String(); alias != "" {
+			fixed, _ := sjson.Set(argsRaw, "pattern", alias)
+			fixed, _ = sjson.Delete(fixed, aliasKey)
+			return fixed, true
+		}
 	}
 	if path != "" && (strings.ContainsAny(path, "*?[]()|^$+\\") || !strings.ContainsAny(path, "/\\")) {
 		fixed, _ := sjson.Set(argsRaw, "pattern", path)

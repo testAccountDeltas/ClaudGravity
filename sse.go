@@ -192,15 +192,16 @@ type SSEStreamer struct {
 	requestedSafeguards      bool
 	toolCallIDs              []string
 	hasFinished              bool
-	thoughtSignature         string          // most recent thoughtSignature seen for the open thinking block, flushed as signature_delta on close
-	lastTurnThoughtSignature string          // durable across the turn; inherited by function calls and parallel tool calls
-	thinkingFinished         bool            // true once a thinking block has been opened and closed — Anthropic allows at most one, so a later "thought" chunk (Gemini can interleave thought->text->thought) must not reopen a second one
-	hasPriorTurns            bool            // whether request had assistant messages in history (prior turns in the conversation)
-	estInputTokens           int             // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
-	preferRussian            bool            // conversation's own language, detected from the user's latest message — picks which language gateway-synthesized text (grounding footer) uses, since that text bypasses the model entirely
-	syntheticReasonTools     map[string]bool // tool names whose Gemini-bound schema got our synthetic "reason" placeholder injected (translator.go); that key is stripped back out of the model's actual function-call args before handing them to Claude Code
-	cachePrefixFrac          float64         // 0 if the client's request set no Anthropic cache_control breakpoint; otherwise the approximate fraction of uncached input tokens that sit before the breakpoint — gates AND scales the cache_creation_input_tokens simulation in FinishStream, see cacheBreakpointPrefixFraction's doc comment
-	disableParallelToolUse   bool            // client's disable_parallel_tool_use — HandleFunctionCall drops any call past the first when set, see wantsSingleToolUse's doc comment
+	thoughtSignature         string            // most recent thoughtSignature seen for the open thinking block, flushed as signature_delta on close
+	lastTurnThoughtSignature string            // durable across the turn; inherited by function calls and parallel tool calls
+	thinkingFinished         bool              // true once a thinking block has been opened and closed — Anthropic allows at most one, so a later "thought" chunk (Gemini can interleave thought->text->thought) must not reopen a second one
+	hasPriorTurns            bool              // whether request had assistant messages in history (prior turns in the conversation)
+	estInputTokens           int               // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
+	preferRussian            bool              // conversation's own language, detected from the user's latest message — picks which language gateway-synthesized text (grounding footer) uses, since that text bypasses the model entirely
+	syntheticReasonTools     map[string]bool   // tool names whose Gemini-bound schema got our synthetic "reason" placeholder injected (translator.go); that key is stripped back out of the model's actual function-call args before handing them to Claude Code
+	cachePrefixFrac          float64           // 0 if the client's request set no Anthropic cache_control breakpoint; otherwise the approximate fraction of uncached input tokens that sit before the breakpoint — gates AND scales the cache_creation_input_tokens simulation in FinishStream, see cacheBreakpointPrefixFraction's doc comment
+	disableParallelToolUse   bool              // client's disable_parallel_tool_use — HandleFunctionCall drops any call past the first when set, see wantsSingleToolUse's doc comment
+	reverseToolNameMap       map[string]string // sanitized (Gemini-bound) tool name -> original Claude-side name, for tools translator.go had to rewrite (e.g. hyphens stripped) — see sanitizeGeminiFunctionName's doc comment
 }
 
 type GroundingSource struct {
@@ -215,7 +216,7 @@ const (
 	TypeToolUse  = 3
 )
 
-func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool, cachePrefixFrac float64, disableParallelToolUse bool) *SSEStreamer {
+func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool, cachePrefixFrac float64, disableParallelToolUse bool, reverseToolNameMap map[string]string) *SSEStreamer {
 	return &SSEStreamer{
 		rid:                    rid,
 		w:                      w,
@@ -231,6 +232,7 @@ func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, mod
 		syntheticReasonTools:   syntheticReasonTools,
 		cachePrefixFrac:        cachePrefixFrac,
 		disableParallelToolUse: disableParallelToolUse,
+		reverseToolNameMap:     reverseToolNameMap,
 		hasPriorTurns:          hasPriorTurns,
 	}
 }
@@ -363,9 +365,19 @@ func (s *SSEStreamer) HandleThinking(text string, thoughtSignature string) error
 		// Gemini can interleave thought -> text -> thought within one
 		// candidate; Anthropic allows at most one "thinking" block and it
 		// must be first. A second one a strict SDK's schema validation
-		// rejects outright, so once the first has closed (or any non-thinking block
-		// has opened), fold any further "thought" chunks into plain text instead of reopening one.
-		return s.HandleText(text)
+		// rejects outright, so once the first has closed (or any
+		// non-thinking block has opened), a further "thought" chunk can't
+		// reopen one.
+		//
+		// An audit caught that folding it into s.HandleText(text) instead
+		// — the previous fallback — leaked the model's internal reasoning
+		// tokens into the user-visible text stream in Claude Code's
+		// terminal, since HandleText's whole job is to emit plain,
+		// user-facing text. Drop it instead; silently discarding a
+		// redundant/duplicate thought chunk is far less harmful than
+		// exposing raw model reasoning as if the model had said it to the
+		// user.
+		return nil
 	}
 	if s.currentType != TypeThinking {
 		if err := s.closeCurrentBlock(); err != nil {
@@ -444,6 +456,42 @@ func (s *SSEStreamer) HandleText(text string) error {
 	return s.SendRaw("content_block_delta", string(b))
 }
 
+// normalizeToolCallArgsToObject guarantees argsRaw, when parsed as JSON, is
+// an object — the Anthropic streaming protocol accumulates this function's
+// "partial_json" deltas into tool_use.input, which the official SDKs' Zod
+// schemas require to be Record<string, unknown>. An audit caught that
+// Gemini occasionally emits a functionCall.args that's itself a bare string
+// (`"ls -la"`) or doubly-encoded JSON (`"{\"cmd\":\"ls\"}"`) instead of an
+// object — streamed through verbatim, the client's accumulated partial_json
+// parses to a string, not an object, crashing SDK validation. The
+// non-streaming path (server.go) has the equivalent fix on the parsed Go
+// value directly; this is the streaming-path version operating on raw text.
+func normalizeToolCallArgsToObject(argsRaw string) string {
+	var v interface{}
+	if err := json.Unmarshal([]byte(argsRaw), &v); err != nil {
+		return "{}"
+	}
+	wasDoubleEncoded := false
+	if s, ok := v.(string); ok {
+		var inner interface{}
+		if err := json.Unmarshal([]byte(s), &inner); err == nil {
+			v = inner
+			wasDoubleEncoded = true
+		}
+	}
+	if _, ok := v.(map[string]interface{}); !ok {
+		return "{}"
+	}
+	if !wasDoubleEncoded {
+		return argsRaw // already a plain object, avoid an unnecessary re-marshal
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
 func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSignature string) error {
 	if s.disableParallelToolUse && s.toolUseOccurred {
 		// Client asked for at most one tool call per turn. The system
@@ -453,6 +501,7 @@ func (s *SSEStreamer) HandleFunctionCall(name string, argsRaw string, thoughtSig
 		// second tool_use block the client explicitly said it can't handle.
 		return nil
 	}
+	argsRaw = normalizeToolCallArgsToObject(argsRaw)
 	argsRaw = coerceNumericEnumArgs(name, argsRaw)
 	if repaired, ok := RepairEditToolCall(name, argsRaw, s.sessionID); ok {
 		argsRaw = repaired
@@ -838,6 +887,12 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 				}
 			} else if fc := part.Get("functionCall"); fc.Exists() {
 				name := fc.Get("name").String()
+				if orig, ok := s.reverseToolNameMap[name]; ok {
+					// translator.go sanitized this tool's name for
+					// Gemini (e.g. stripped a hyphen) — restore the
+					// original before it reaches Claude Code.
+					name = orig
+				}
 				args := fc.Get("args").Raw
 				if args == "" || args == "null" {
 					// Anthropic's tool_use.input must be an object; a literal

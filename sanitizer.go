@@ -294,8 +294,19 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 		modified = true
 	}
 	if len(msgsList) == 0 {
-		claudeReqJSON["messages"] = []interface{}{}
-		return modified, truncatedAny
+		// An audit caught that a request whose "messages" array held ONLY
+		// a system-role message left this genuinely empty after the
+		// extraction above — Gemini requires at least one actual content
+		// turn and 400s on an empty contents array. A placeholder user
+		// turn keeps the request valid; the real instruction already
+		// made it into claudeReqJSON["system"].
+		claudeReqJSON["messages"] = []interface{}{
+			map[string]interface{}{
+				"role":    "user",
+				"content": []interface{}{map[string]interface{}{"type": "text", "text": "Continue."}},
+			},
+		}
+		return true, truncatedAny
 	}
 
 	var newMsgs []map[string]interface{}
