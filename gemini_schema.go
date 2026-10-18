@@ -1169,6 +1169,20 @@ func flattenAnyOfOneOf(jsonStr string) string {
 				}
 				if itm.Get("enum").IsArray() {
 					for _, ev := range itm.Get("enum").Array() {
+						// An audit caught that a literal `null` enum
+						// value (convertConstToEnum's own output for
+						// {"const": null} is "enum":[null], with no
+						// "type" field ever set since its type-inference
+						// switch has no gjson.Null case — so the branch-
+						// level `t == "null"` skip just above never
+						// fires for it) reached here and got appended via
+						// ev.String(), which for a JSON null Result
+						// returns "" — polluting the merged enum with a
+						// literal empty-string "option" instead of being
+						// recognized as the null marker it actually is.
+						if ev.Type == gjson.Null {
+							continue
+						}
 						allEnums = append(allEnums, ev.String())
 					}
 				} else {
@@ -1592,7 +1606,17 @@ func selectBest(items []gjson.Result) (bestIdx int, types []string) {
 			// default: "string" case, and wrongly typed a numeric/
 			// boolean enum as a string. Scan for the first non-null
 			// element instead.
-			t = "string"
+			// An audit caught that a PURELY-null enum (e.g. convertConstToEnum's
+			// own output for {"const": null}, which is "enum":[null] with
+			// no type ever set since its own type-inference switch has no
+			// gjson.Null case) fell all the way through this scan with no
+			// non-null element to infer a real type from, leaving t at its
+			// "string" initializer below — so a const-null union branch
+			// got recorded as a STRING type, not "null", and
+			// flattenAnyOfOneOf's `contains(allTypes, "null")` check never
+			// saw it, silently failing to mark the field nullable for the
+			// one branch whose entire purpose was declaring null valid.
+			t = "null"
 			for _, ev := range item.Get("enum").Array() {
 				if ev.Type == gjson.Number {
 					t = "number"
@@ -1603,7 +1627,8 @@ func selectBest(items []gjson.Result) (bestIdx int, types []string) {
 					break
 				}
 				if ev.Type != gjson.Null {
-					break // some other non-null scalar (string) — "string" stands
+					t = "string" // some other non-null scalar — "string" stands
+					break
 				}
 			}
 			score = 1

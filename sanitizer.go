@@ -68,6 +68,14 @@ func toolResultPlainText(content interface{}) string {
 	case []interface{}:
 		var sb strings.Builder
 		for _, item := range c {
+			// An audit caught that a bare string element (content as
+			// ["line 1\n", "line 2\n"], not typed blocks) failed this
+			// map assertion and was silently skipped, losing 100% of a
+			// tool's real output for that shape.
+			if s, ok := item.(string); ok {
+				sb.WriteString(s)
+				continue
+			}
 			block, ok := item.(map[string]interface{})
 			if !ok {
 				continue
@@ -270,18 +278,26 @@ func blocksToInterfaceSlice(blocks []map[string]interface{}) []interface{} {
 // 5. Converts orphaned tool_results (without tool_use) into plain text.
 // 6. Synthesizes recovery responses for abandoned/unanswered tool_use calls.
 // Returns (modified bool, truncatedAny bool).
-func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool) {
+// SanitizeMessagesAndGraph's 3rd return value, prefillText, is the
+// assistant-prefill text (if any) extracted from the trailing assistant
+// turn this call found — see its use further down. Needed by
+// executeNonStreaming so Anthropic's own prefill contract (the returned
+// completion must begin with the text the client itself supplied as the
+// last assistant turn) can be honored; Gemini has no real prefill
+// mechanism, so the gateway must prepend it itself.
+func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool, string) {
 	msgsRaw, ok := claudeReqJSON["messages"]
 	if !ok {
-		return false, false
+		return false, false, ""
 	}
 	msgsList, ok := msgsRaw.([]interface{})
 	if !ok || len(msgsList) == 0 {
-		return false, false
+		return false, false, ""
 	}
 
 	modified := false
 	truncatedAny := false
+	prefillText := ""
 
 	// Anthropic's real Messages API only allows "user"/"assistant" in
 	// messages[].role — "system" belongs in the separate top-level "system"
@@ -344,7 +360,7 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 				"content": []interface{}{map[string]interface{}{"type": "text", "text": "Continue."}},
 			},
 		}
-		return true, truncatedAny
+		return true, truncatedAny, ""
 	}
 
 	var newMsgs []map[string]interface{}
@@ -398,6 +414,22 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 			})
 		case []interface{}:
 			for _, bItem := range content {
+				// An audit caught that a bare string element here (e.g.
+				// {"content": ["my prompt message"]} — valid per
+				// Anthropic's content-block-or-string union, just at the
+				// array-element level) failed this map assertion and was
+				// silently dropped; if it was the ONLY element, the whole
+				// message then had zero surviving blocks and got replaced
+				// with the generic "..." sentinel further below, losing
+				// the real content entirely.
+				if s, isStr := bItem.(string); isStr {
+					normBlocks = append(normBlocks, map[string]interface{}{
+						"type": "text",
+						"text": s,
+					})
+					modified = true
+					continue
+				}
 				b, ok := bItem.(map[string]interface{})
 				if !ok {
 					continue
@@ -489,7 +521,7 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 	}
 
 	if len(newMsgs) == 0 {
-		return false, false
+		return false, false, ""
 	}
 
 	// Step 2: Ensure First Message is User
@@ -717,19 +749,34 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 			// because Gemini strictly enforces that every functionResponse in turn N
 			// must match a functionCall in turn N-1. Convert it into a plain text block
 			// so the information is preserved without triggering a Gemini protobuf 400 error.
-			for tid, real := range realResults {
-				if !consumed[tid] {
-					cVal := real["content"]
-					txt := toolResultPlainText(cVal)
-					textDesc := fmt.Sprintf("[Delayed tool output for %s]: %s", tid, txt)
-					if txt == "" {
-						textDesc = fmt.Sprintf("[Delayed tool output for %s]", tid)
-					}
-					ordered = append(ordered, map[string]interface{}{
-						"type": "text",
-						"text": textDesc,
-					})
+			// An audit caught this used to iterate the realResults MAP
+			// directly — Go map iteration order is randomized per run,
+			// so when parallel/async tools left more than one delayed
+			// result in the same turn, their order here (and thus the
+			// serialized byte sequence sent to Gemini) changed across
+			// otherwise-identical requests, invalidating Gemini's
+			// server-side prompt prefix cache for no real reason.
+			// Iterate nextBlocks instead, which preserves the real
+			// original insertion order.
+			for _, b := range nextBlocks {
+				if b["type"] != "tool_result" {
+					continue
 				}
+				tid, ok := b["tool_use_id"].(string)
+				if !ok || tid == "" || consumed[tid] {
+					continue
+				}
+				real := realResults[tid]
+				cVal := real["content"]
+				txt := toolResultPlainText(cVal)
+				textDesc := fmt.Sprintf("[Delayed tool output for %s]: %s", tid, txt)
+				if txt == "" {
+					textDesc = fmt.Sprintf("[Delayed tool output for %s]", tid)
+				}
+				ordered = append(ordered, map[string]interface{}{
+					"type": "text",
+					"text": textDesc,
+				})
 			}
 			ordered = append(ordered, otherBlocks...)
 			newMsgs[i+1]["content"] = ordered
@@ -774,7 +821,7 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 	// prefix text and to continue from it without repeating it is the best
 	// Gemini-side approximation available.
 	if len(newMsgs) > 0 && newMsgs[len(newMsgs)-1]["role"] == "assistant" {
-		prefillText := extractPlainText(newMsgs[len(newMsgs)-1]["content"])
+		prefillText = extractPlainText(newMsgs[len(newMsgs)-1]["content"])
 		nudgeText := "Continue."
 		if prefillText != "" {
 			nudgeText = fmt.Sprintf(
@@ -816,5 +863,5 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool)
 		claudeReqJSON["messages"] = genericList
 	}
 
-	return modified, truncatedAny
+	return modified, truncatedAny, prefillText
 }

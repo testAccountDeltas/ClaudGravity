@@ -246,7 +246,10 @@ func stripDataURIPrefix(s string) string {
 func builtinAnthropicToolSchema(toolType string) (string, bool) {
 	switch {
 	case strings.HasPrefix(toolType, "bash_"):
-		return `{"type":"object","properties":{"command":{"type":"string","description":"The bash command to run."},"restart":{"type":"boolean","description":"Set to true to restart the tool instead of running a command."}}}`, true
+		// An audit caught "required" was missing entirely — without it,
+		// the model frequently called bash() with no "command" at all
+		// (restart is an alternative mode, correctly left optional).
+		return `{"type":"object","properties":{"command":{"type":"string","description":"The bash command to run."},"restart":{"type":"boolean","description":"Set to true to restart the tool instead of running a command."}},"required":["command"]}`, true
 	case strings.HasPrefix(toolType, "text_editor_"):
 		return `{"type":"object","properties":{"command":{"type":"string","enum":["view","create","str_replace","insert","undo_edit"],"description":"The editor command to run."},"path":{"type":"string","description":"Absolute path to the file or directory."},"file_text":{"type":"string","description":"Required for create: the full content of the new file."},"old_str":{"type":"string","description":"Required for str_replace: the exact text to replace."},"new_str":{"type":"string","description":"Replacement text for str_replace, or the text to insert for insert."},"insert_line":{"type":"integer","description":"Required for insert: the line number after which to insert."},"view_range":{"type":"array","items":{"type":"integer"},"description":"Optional for view: [start_line, end_line]."}},"required":["command","path"]}`, true
 	case strings.HasPrefix(toolType, "computer_"):
@@ -285,7 +288,7 @@ func sanitizeGeminiFunctionName(name string) string {
 
 // ConvertClaudeRequestToGemini converts an Anthropic Messages API payload into
 // a Google Gemini streamGenerateContent payload with full sanitization and tiering.
-func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqClass string, agentKey string, sessionID string, instanceID string) ([]byte, string, int, bool, map[string]bool, map[string]string, error) {
+func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqClass string, agentKey string, sessionID string, instanceID string) ([]byte, string, int, bool, map[string]bool, map[string]string, string, error) {
 	// loopKey disambiguates both across sessions and across parallel
 	// subagents within one session: agentKey alone (e.g. "sub:general-
 	// purpose") is shared by every concurrent instance of that subagent
@@ -299,7 +302,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// Parse as generic map for in-place AST transformations
 	var reqMap map[string]interface{}
 	if err := json.Unmarshal(claudeJSON, &reqMap); err != nil {
-		return nil, "", 0, false, nil, nil, fmt.Errorf("invalid json: %w", err)
+		return nil, "", 0, false, nil, nil, "", fmt.Errorf("invalid json: %w", err)
 	}
 
 	// 1. Dynamic Tiering & Model Effort Resolution
@@ -340,7 +343,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 
 	// 1. Initial AST Sanitization (Middle Truncation 64KB, role repair, system extraction)
-	_, wasShrunk := SanitizeMessagesAndGraph(reqMap)
+	_, wasShrunk, prefillText := SanitizeMessagesAndGraph(reqMap)
 
 	// Context Window Safety Truncation: runs AFTER initial sanitization so token budget
 	// is measured against middle-truncated outputs and deduplicated reads, preventing
@@ -348,7 +351,9 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	if dropped, truncated := TruncateConversationToFit(reqMap, modelName, requestedMaxOutputHint); truncated {
 		LogGateway("[ContextWindow] dropped %d oldest message(s) to fit %s's context window [%s]", dropped, modelName, agentKey)
 		// Re-sanitize to repair role alternation and orphaned tool calls created by dropping intermediate turns
-		SanitizeMessagesAndGraph(reqMap)
+		if _, _, pt := SanitizeMessagesAndGraph(reqMap); pt != "" {
+			prefillText = pt
+		}
 	}
 
 	// 2. Loop-Guard Nudges (Read-Loop & Oscillation)
@@ -420,14 +425,17 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 
 	// 3. Final graph validation after any loop-guard nudges
-	if _, didShrink := SanitizeMessagesAndGraph(reqMap); didShrink {
+	if _, didShrink, pt := SanitizeMessagesAndGraph(reqMap); didShrink {
 		wasShrunk = true
+		if pt != "" {
+			prefillText = pt
+		}
 	}
 
 	// Re-serialize sanitized request
 	sanitizedBytes, err := json.Marshal(reqMap)
 	if err != nil {
-		return nil, "", 0, false, nil, nil, fmt.Errorf("re-marshal sanitized json: %w", err)
+		return nil, "", 0, false, nil, nil, "", fmt.Errorf("re-marshal sanitized json: %w", err)
 	}
 
 	root := gjson.ParseBytes(sanitizedBytes)
@@ -690,13 +698,27 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							// output from history for no reason.
 							srcTypePeek := p.Get("source.type").String()
 							mtPeek := strings.ToLower(p.Get("source.media_type").String())
-							isBinary := ptype == "image"
+							// An audit caught that SVG (image/svg+xml) was
+							// never excluded here the way every other
+							// image-pricing/routing site in this codebase
+							// (server.go, context_window.go,
+							// token_estimator.go, and this same file's own
+							// base64-decode switch below) already excludes
+							// it — SVG is XML text, not binary raster data,
+							// and Gemini accepts it fine as a plain text
+							// part in the model role. An assistant-authored
+							// SVG diagram/artifact was being destroyed and
+							// replaced with a one-line placeholder for no
+							// reason, the exact same class of bug this
+							// whole isBinary check exists to AVOID for
+							// genuine text documents.
+							isBinary := ptype == "image" && mtPeek != "image/svg+xml"
 							if ptype == "document" && srcTypePeek == "base64" {
 								effectiveMT := mtPeek
 								if effectiveMT == "" {
 									effectiveMT = "application/pdf"
 								}
-								isBinary = effectiveMT == "application/pdf" || strings.HasPrefix(effectiveMT, "image/")
+								isBinary = (effectiveMT == "application/pdf" || strings.HasPrefix(effectiveMT, "image/")) && effectiveMT != "image/svg+xml"
 							}
 							if isBinary {
 								part := `{"text":""}`
@@ -876,6 +898,17 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							// must be an object.
 							argsRaw = "{}"
 						}
+						// An audit caught that sse.go/server.go's own
+						// outbound responses already run newly-generated
+						// tool_use args through normalizeToolCallArgsToObject
+						// (coercing a bare string/array into an object), but
+						// this HISTORY-REPLAY path never did — history
+						// containing a non-object input (a client-supplied
+						// turn, or an older capture) sent e.g. `"npm test"`
+						// straight through as functionCall.args, which
+						// Gemini's protobuf Struct requirement rejects
+						// outright (400: expected struct/object).
+						argsRaw = normalizeToolCallArgsToObject(name, argsRaw)
 						// Prefer the real signature this exact call was
 						// originally emitted with (cached in sse.go/
 						// server.go when we first sent it) over the
@@ -1047,6 +1080,17 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						if c.IsArray() {
 							var sb strings.Builder
 							c.ForEach(func(_, item gjson.Result) bool {
+								// An audit caught that a tool_result.content
+								// array of bare strings (e.g. ["line 1\n",
+								// "line 2\n"], not typed {"type":"text",...}
+								// blocks) has item.Get("type").String()=="" for
+								// every element, matching no case below and
+								// silently contributing nothing — 100% of a
+								// tool's real output vanished for this shape.
+								if item.Type == gjson.String {
+									sb.WriteString(item.String())
+									return true
+								}
 								switch item.Get("type").String() {
 								case "text":
 									sb.WriteString(item.Get("text").String())
@@ -1264,7 +1308,20 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 								// risky — delays TTFT for every response),
 								// this only runs once, on the next turn,
 								// with no latency cost at all.
-								if sig == "skip_thought_signature_validator" {
+								{
+									// An audit caught this was gated strictly
+									// on sig == "skip_thought_signature_validator",
+									// but the outer check above also matches
+									// sig == "" — a historical turn with a
+									// genuinely empty signature (not yet the
+									// placeholder) skipped this recovery
+									// attempt entirely and went straight to
+									// forcing the placeholder below, even
+									// though the exact same sibling-lookup
+									// could have found a real cached signature
+									// for it too. Reaching this block at all
+									// already guarantees sig is one of these
+									// two values, so just always attempt it.
 									content.ForEach(func(_, sibling gjson.Result) bool {
 										if sibling.Get("type").String() != "tool_use" {
 											return true
@@ -1464,6 +1521,24 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 
 		tools.ForEach(func(_, t gjson.Result) bool {
 			name := t.Get("name").String()
+			if name == "" {
+				// An audit caught that a client declaring a built-in
+				// Anthropic tool by "type" alone (e.g. {"type":
+				// "bash_20250124"}, with no "name" key at all — valid per
+				// Anthropic's spec, which lets the server default it)
+				// left name=="" here, and sanitizeGeminiFunctionName("")
+				// produces the useless declaration name "_". Derive a
+				// real name from the type string itself, stripped of its
+				// dated-version suffix ("bash_20250124" -> "bash").
+				if toolType := t.Get("type").String(); toolType != "" {
+					name = strings.TrimRight(strings.TrimRightFunc(toolType, func(r rune) bool {
+						return r >= '0' && r <= '9'
+					}), "_")
+					if name == "" {
+						name = toolType
+					}
+				}
+			}
 			// Claude Code's real native tool is snake_case "web_search"
 			// (confirmed against websearch.go's own fast-path check, which
 			// matches that exact string) — "WebSearch"/"GoogleSearch" never
@@ -1808,7 +1883,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 		out, _ = sjson.Set(out, fmt.Sprintf("safetySettings.%d.threshold", i), threshold)
 	}
 
-	return []byte(out), modelName, budget, wasShrunk, syntheticReasonTools, reverseToolNameMap, nil
+	return []byte(out), modelName, budget, wasShrunk, syntheticReasonTools, reverseToolNameMap, prefillText, nil
 }
 
 // ScrubBillingHeader strips out fingerprint headers and billing marks that trigger Google 429/Filter:

@@ -326,6 +326,22 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 		port = p
 	}
 
+	// An audit caught that the only destination check here was the
+	// private/internal-IP SSRF guard below — a client that knows (or
+	// defeats) the proxy secret could CONNECT to a PUBLIC IP on a
+	// non-HTTPS port (SMTP 25, SSH 22, a database port) and get a raw
+	// TCP tunnel to it. This gateway's own documented job (see the
+	// comment just below) is HTTPS/HTTP proxying for package registries
+	// and APIs, never an arbitrary TCP relay — restrict to the standard
+	// ports that use actually needs.
+	switch port {
+	case "443", "8443", "80":
+	default:
+		LogGateway("[SuperRelay Gateway] Refused CONNECT to non-standard port %s:%s", host, port)
+		http.Error(w, "Tunnel to non-standard port forbidden", http.StatusForbidden)
+		return
+	}
+
 	// This gateway's whole job is proxying to public hosts
 	// (api.anthropic.com, github.com, npm/pypi registries, ...) — it has
 	// no legitimate reason to ever CONNECT to a private, link-local, or

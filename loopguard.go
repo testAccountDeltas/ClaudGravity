@@ -210,7 +210,14 @@ var catIsWritePattern = regexp.MustCompile(`(?i)\b(cat|head|tail|sed|echo)\b[^|]
 // "not preceded by a digit" directly in the write-pattern regexes
 // themselves, so strip this specific shape out of the command first,
 // before testing for a real write-redirect.
-var stderrRedirectPattern = regexp.MustCompile(`[0-9]>\S*`)
+// An audit caught this only matched a numeric-prefixed redirect
+// (2>$null) — PowerShell's `*>$null` (all-streams redirect, suppressing
+// stdout AND stderr both) still had its literal ">" visible to
+// powerShellIsWritePattern afterward, misclassifying a plain read like
+// `Get-Content file.txt *>$null` as a write. The target is PowerShell's
+// null device either way, never a real file being written to, so it's
+// exactly the same "read with suppressed output" shape as 2>$null.
+var stderrRedirectPattern = regexp.MustCompile(`([0-9]|\*)>\S*`)
 
 func stripStderrRedirects(command string) string {
 	return stderrRedirectPattern.ReplaceAllString(command, "")
@@ -282,11 +289,20 @@ func isReadEquivalentBashCommand(command string) bool {
 	// "..."` work identically regardless of which SHELL invokes them, so
 	// a pattern real from one shell is just as real from the other.
 	// Shared single list for both.
-	if oneLinerReadPattern.MatchString(lc) || jqInvocationPattern.MatchString(command) {
+	// An audit caught that oneLinerReadPattern/jqInvocationPattern
+	// returned true unconditionally, with no write-redirect check at
+	// all for THEM — catIsWritePattern below only ever matches
+	// cat/head/tail/sed/echo/sed-i/tee/touch by name, so it can't catch
+	// `jq '.k="v"' file.json > out.json` or `python -c "..." > out.txt`
+	// either (verified: catIsWritePattern doesn't match either string).
+	// These tools write real output via a plain stdout redirect, not one
+	// of those named commands, so check for a bare, non-stderr `>`
+	// directly before trusting the read-pattern match.
+	if (oneLinerReadPattern.MatchString(lc) || jqInvocationPattern.MatchString(command)) &&
+		!strings.Contains(stripStderrRedirects(command), ">") {
 		return true
 	}
-	if (strings.Contains(lc, "cat") || strings.Contains(lc, "head") || strings.Contains(lc, "tail") || strings.Contains(lc, "sed")) &&
-		catIsWritePattern.MatchString(stripStderrRedirects(command)) {
+	if catIsWritePattern.MatchString(stripStderrRedirects(command)) {
 		return false
 	}
 	return readEquivalentBashPattern.MatchString(command)
@@ -377,6 +393,37 @@ func isPlanModeRequest(claudeBodyBytes []byte) bool {
 		return true
 	})
 	return isPlanMode
+}
+
+// hasModifyingToolsInRequest mirrors translator.go's own hasModifyingTools
+// computation (real declared tools, Plan-Mode-aware), as a raw-bytes
+// equivalent for callers that only have claudeBodyBytes, not the parsed
+// request map. An audit caught that server.go's two readLoopLimits call
+// sites were using !isPlanModeNow as a STAND-IN for this instead of
+// checking the request's own declared tools — a main-agent session with
+// genuinely no modifying tools declared (read-only review/exploration,
+// outside Plan Mode) got hasModifyingTools=true from that proxy while
+// translator.go's OWN threshold computation correctly got false from the
+// real tools list, pairing a 15-entry window with a 40-call threshold
+// that can never be reached, silently disabling LoopGuard for exactly
+// the read-heavy sessions it matters most for.
+func hasModifyingToolsInRequest(claudeBodyBytes []byte) bool {
+	hasModifying := false
+	isPlanMode := false
+	gjson.GetBytes(claudeBodyBytes, "tools").ForEach(func(_, t gjson.Result) bool {
+		name := t.Get("name").String()
+		if isModifyingToolName(name) {
+			hasModifying = true
+		}
+		if strings.EqualFold(name, "exitplanmode") {
+			isPlanMode = true
+		}
+		return true
+	})
+	if isPlanMode {
+		return false
+	}
+	return hasModifying
 }
 
 // readLoopEquivalentToolName extracts the tool name from a "name:argsRaw"
@@ -512,6 +559,13 @@ func (lg *LoopGuardManager) syncPlanModeLocked(agentKey string, isPlanMode bool)
 	wasPlanMode, seen := lg.lastPlanMode[agentKey]
 	if seen && wasPlanMode && !isPlanMode {
 		delete(lg.readWindows, agentKey)
+		// An audit caught nudgeCount was left intact on this same
+		// transition — a Plan-Mode-era nudge (nudgeCount==1) survived
+		// into execution, so the FIRST real read-streak during execution
+		// incremented it to 2 and immediately escalated to "you were
+		// already warned" wording despite never actually warning the
+		// agent during execution itself.
+		delete(lg.nudgeCount, agentKey)
 	}
 	lg.lastPlanMode[agentKey] = isPlanMode
 }
@@ -835,6 +889,19 @@ func InjectUserNudge(claudeReqJSON map[string]interface{}, text string) {
 						case string:
 							block["content"] = c + "\n\n[" + text + "]"
 						case []interface{}:
+							block["content"] = append(c, map[string]interface{}{
+								"type": "text",
+								"text": "\n\n[" + text + "]",
+							})
+						case []map[string]interface{}:
+							// An audit caught this sibling branch (outer
+							// "content" is []interface{}, not the
+							// []map[string]interface{} case already fixed
+							// above) still had the same inner gap — a
+							// tool_result's OWN content in this concrete
+							// type fell to default: below and got
+							// overwritten with a bare nudge string,
+							// discarding the tool's real output.
 							block["content"] = append(c, map[string]interface{}{
 								"type": "text",
 								"text": "\n\n[" + text + "]",

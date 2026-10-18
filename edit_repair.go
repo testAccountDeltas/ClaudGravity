@@ -429,12 +429,31 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 								}
 							}
 						}
-						if ok && strings.Contains(cur, oldStr) {
+						// An audit caught this compared cur/oldStr with no
+						// \r\n vs \n normalization — a snapshot stored with
+						// LF (the common case) never matched an incoming
+						// old_string using CRLF (a Windows client), or vice
+						// versa, even when the actual text content was
+						// identical, silently skipping the snapshot update
+						// and leaving later same-turn edits comparing
+						// against stale content.
+						matchOldStr, matchNewStr := oldStr, newStr
+						matchCur := cur
+						if ok && !strings.Contains(matchCur, matchOldStr) {
+							normCur := strings.ReplaceAll(matchCur, "\r\n", "\n")
+							normOld := strings.ReplaceAll(matchOldStr, "\r\n", "\n")
+							if strings.Contains(normCur, normOld) {
+								matchCur = normCur
+								matchOldStr = normOld
+								matchNewStr = strings.ReplaceAll(matchNewStr, "\r\n", "\n")
+							}
+						}
+						if ok && strings.Contains(matchCur, matchOldStr) {
 							n := 1
 							if input.Get("replace_all").Bool() {
 								n = -1
 							}
-							updated := strings.Replace(cur, oldStr, newStr, n)
+							updated := strings.Replace(matchCur, matchOldStr, matchNewStr, n)
 							// Preserves whatever fullness the snapshot being
 							// replayed-against already had — editing text
 							// within a partial slice doesn't make it complete.
@@ -480,6 +499,25 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 				if resText != "" {
 					cleanContent := stripCatNPrefix(resText)
 					isPartial := toolIDIsPartial[toolUseID]
+					// An audit caught that a Read with no explicit
+					// offset/limit still silently gets truncated at 2000
+					// lines by Claude Code's own tool — toolIDIsPartial
+					// only tracks whether OFFSET/LIMIT was given, not
+					// whether the RESULT was actually truncated, so this
+					// case was marked isFull=true (via !isPartial below)
+					// even though lines 2001+ don't exist here at all. A
+					// later explicit read of those lines then got silently
+					// discarded by the isSessionSnapshotFull check, since
+					// the snapshot already claimed to be complete. This
+					// doesn't fully solve 2000+-line files (still needs
+					// real line-indexed snapshot storage to merge ranges
+					// instead of replacing them — a larger, deliberately
+					// deferred restructuring) but it at least lets a
+					// later explicit read of the missing tail actually
+					// register instead of being guaranteed-discarded.
+					if !isPartial && strings.Count(cleanContent, "\n") >= 2000 {
+						isPartial = true
+					}
 					// Was: `_, hasFullSnap := getSessionSnapshot(...)` — that
 					// only ever reported "does ANY snapshot exist", full or
 					// partial, so once this file's first Read happened to be
@@ -619,7 +657,22 @@ func normalizeEditToolCallKeys(toolName string, argsRaw string) (string, bool) {
 	// renaming its genuinely-correct "notebook_path" to "file_path" would
 	// break it, not fix it.
 	nameLower := strings.ToLower(toolName)
-	isEditLike := nameLower == "edit" || nameLower == "str_replace_editor" || nameLower == "update"
+	// An audit caught that renaming keys for "str_replace_editor" here
+	// was actively wrong: that's Anthropic's own OFFICIAL built-in
+	// text-editor tool name (the convention a real Anthropic API client
+	// — not Claude Code, which has a completely different tool of its
+	// own called "Edit" — uses when declaring text_editor_* without a
+	// custom name). Its REAL canonical argument names are command/path/
+	// old_str/new_str (builtinAnthropicToolSchema declares exactly
+	// these), and a genuine Anthropic SDK client's own schema validation
+	// expects path/old_str/new_str back unchanged — renaming them to
+	// file_path/old_string/new_string broke a client using the tool
+	// exactly as officially specified. Only Claude Code's own "Edit" (and
+	// the generic MCP "update" convention) actually need this rename;
+	// str_replace_editor's args still benefit from the broader VALUE
+	// repair elsewhere in this file (whitespace/indentation fixing),
+	// which reads either naming convention without ever renaming a key.
+	isEditLike := nameLower == "edit" || nameLower == "update"
 	// A follow-up audit caught that Write and Read — real Claude Code
 	// tools needing the exact same file_path key, just with no old_string/
 	// new_string concept at all — got NO alias normalization whatsoever,
@@ -699,35 +752,6 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 	if oldStrKey == "" || oldStr == "" {
 		return argsRaw, false
 	}
-	// An audit caught that a model copying its own prior Read-tool output
-	// directly into old_string (including the "cat -n"-style "   42\t"
-	// line-number prefix Read's own dump carries) never got stripped —
-	// stripCatNPrefix was only ever applied to the STORED snapshot, not
-	// to this incoming argument, so a line-number-polluted old_string
-	// could never match the real file content either exactly or via
-	// fuzzy matching (normalizeLineForMatch only normalizes whitespace,
-	// not digit+tab prefixes). Clean it the same way, before any
-	// matching attempt below; a no-op for the overwhelmingly common case
-	// of a real old_string with no such prefixes.
-	// An audit caught that every early return below this point used a
-	// bare "false" regardless of whether the cat-n strip just above
-	// actually changed anything — both call sites of RepairEditToolCall
-	// only adopt the returned argsRaw when the bool is true, discarding
-	// it (and the cleanup baked into it) on false. A model-copied old_string
-	// that, once cleaned, turned out to already match the file exactly
-	// (the single most common outcome of this exact cleanup) silently
-	// sent the ORIGINAL, still-line-number-polluted old_string to the
-	// client instead of the cleaned one — it had already lost its one
-	// chance to ever get cleaned.
-	catNCleaned := false
-	if cleaned := stripCatNPrefix(oldStr); cleaned != oldStr {
-		oldStr = cleaned
-		catNCleaned = true
-		if withClean, err := sjson.Set(argsRaw, oldStrKey, oldStr); err == nil {
-			argsRaw = withClean
-		}
-	}
-
 	// 3. Resolve path against filesystem and session CWD
 	cwdCandidate := ""
 	resolvedPath := targetPath
@@ -769,15 +793,47 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 			snap, ok = getSessionSnapshot(sessionID, cwdCandidate)
 		}
 		if !ok {
-			return argsRaw, catNCleaned
+			return argsRaw, false
 		}
 		fileContent = snap
 	}
 
-	// Direct byte-for-byte match already exists! No repair needed (beyond
-	// the cat-n cleanup already baked into argsRaw above, if any).
+	// Direct byte-for-byte match already exists! No repair needed.
 	if strings.Contains(fileContent, oldStr) {
-		return argsRaw, catNCleaned
+		return argsRaw, false
+	}
+
+	// An audit caught that stripCatNPrefix (added so a model copying its
+	// own prior Read-tool output, including the "cat -n"-style "   42\t"
+	// line-number prefix Read's dump carries, could still match) used to
+	// run UNCONDITIONALLY before this exact-match check even ran — its
+	// regex (`^\s*\d+\t`, digits then a literal tab) has no way to tell
+	// a genuine Read-dump artifact apart from a real data line that just
+	// happens to start the same way (a TSV row "1\tactive\ttrue", a
+	// Makefile target index, ...). Mutating old_string BEFORE checking
+	// whether the ORIGINAL already matched meant a real data line's
+	// exact match was destroyed before ever being tried. Only attempt
+	// the strip now, as a fallback, after the original has already
+	// failed to match on its own.
+	catNCleaned := false
+	if cleaned := stripCatNPrefix(oldStr); cleaned != oldStr {
+		if strings.Contains(fileContent, cleaned) {
+			oldStr = cleaned
+			catNCleaned = true
+			if withClean, err := sjson.Set(argsRaw, oldStrKey, oldStr); err == nil {
+				argsRaw = withClean
+			}
+			return argsRaw, true
+		}
+		// Didn't produce an exact match either, but may still help the
+		// fuzzy matcher below (e.g. combined with tab/space repair) —
+		// keep the cleaned version for the remainder of this function,
+		// same as before.
+		oldStr = cleaned
+		catNCleaned = true
+		if withClean, err := sjson.Set(argsRaw, oldStrKey, oldStr); err == nil {
+			argsRaw = withClean
+		}
 	}
 
 	// Locate new_string's key too (same naming pairs as old_string, minus
@@ -795,6 +851,12 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 	}
 
 	// 4. Try newline normalization (\r\n vs \n)
+	// An audit caught that gating the LF candidate on an else-branch of
+	// hasCRLF (true the moment the file contains a SINGLE \r\n anywhere)
+	// made it unreachable for a file that's mostly LF with one stray
+	// CRLF elsewhere — the target section needing plain LF-normalization
+	// never got tried at all. Try both candidates; a file can legitimately
+	// contain both line-ending styles in different regions.
 	hasCRLF := strings.Contains(fileContent, "\r\n")
 	normalizedLF := strings.ReplaceAll(oldStr, "\r\n", "\n")
 	if hasCRLF {
@@ -818,21 +880,20 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 				return repaired, true
 			}
 		}
-	} else {
-		if strings.Contains(fileContent, normalizedLF) {
-			repaired, err := sjson.Set(argsRaw, oldStrKey, normalizedLF)
-			if err == nil {
-				if newStrKey != "" {
-					normalizedNewLF := strings.ReplaceAll(newStr, "\r\n", "\n")
-					if normalizedNewLF != newStr {
-						if withNew, err2 := sjson.Set(repaired, newStrKey, normalizedNewLF); err2 == nil {
-							repaired = withNew
-						}
+	}
+	if strings.Contains(fileContent, normalizedLF) {
+		repaired, err := sjson.Set(argsRaw, oldStrKey, normalizedLF)
+		if err == nil {
+			if newStrKey != "" {
+				normalizedNewLF := strings.ReplaceAll(newStr, "\r\n", "\n")
+				if normalizedNewLF != newStr {
+					if withNew, err2 := sjson.Set(repaired, newStrKey, normalizedNewLF); err2 == nil {
+						repaired = withNew
 					}
 				}
-				LogGateway("[Auto-Repair Edit] Fixed LF newlines for %s (len: %d)", filepath.Base(resolvedPath), len(normalizedLF))
-				return repaired, true
 			}
+			LogGateway("[Auto-Repair Edit] Fixed LF newlines for %s (len: %d)", filepath.Base(resolvedPath), len(normalizedLF))
+			return repaired, true
 		}
 	}
 

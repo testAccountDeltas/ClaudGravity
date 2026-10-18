@@ -320,6 +320,7 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 										mediaType := strings.ToLower(src.Get("media_type").String())
 										dataStr := src.Get("data").String()
 										var est int
+										pageCountTrusted := false
 										if mediaType == "application/pdf" || mediaType == "" {
 											// PDF token density (~258 tokens/page, ~1 token per
 											// 500 base64 chars) — len/2 here would price a 2MB
@@ -330,8 +331,11 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 											// page than a scanned one, same real per-page Gemini
 											// cost) by several times — prefer a real page count
 											// when it's readable directly in the raw bytes.
-											if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok && pageEst > est {
-												est = pageEst
+											if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok {
+												pageCountTrusted = true
+												if pageEst > est {
+													est = pageEst
+												}
 											}
 										} else if strings.HasPrefix(mediaType, "image/") && mediaType != "image/svg+xml" {
 											// An audit caught a "document" block whose
@@ -356,7 +360,15 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 										// drifted to two DIFFERENT floor values (1600 here,
 										// 2500 there) despite being the same approximation;
 										// now shares one constant.
-										if (mediaType == "application/pdf" || mediaType == "") && est < minPDFTokenFloor {
+										//
+										// A follow-up audit caught the floor was ALSO applied
+										// when estimatePDFTokensFromPageCount succeeded — a
+										// genuine 1-page PDF (real cost ~258 tokens) got
+										// floored up to 2500 even though the page count was
+										// directly read from the PDF's own structure, not
+										// guessed. Skip the floor specifically when that
+										// trustworthy signal was found.
+										if !pageCountTrusted && (mediaType == "application/pdf" || mediaType == "") && est < minPDFTokenFloor {
 											est = minPDFTokenFloor
 										}
 										total += est
@@ -398,10 +410,14 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 							mediaType := strings.ToLower(src.Get("media_type").String())
 							dataStr := src.Get("data").String()
 							var est int
+							pageCountTrusted := false
 							if mediaType == "application/pdf" || mediaType == "" {
 								est = len(dataStr) / 500
-								if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok && pageEst > est {
-									est = pageEst
+								if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok {
+									pageCountTrusted = true
+									if pageEst > est {
+										est = pageEst
+									}
 								}
 							} else if strings.HasPrefix(mediaType, "image/") && mediaType != "image/svg+xml" {
 								// Same image-mispriced-as-text fix as the
@@ -412,8 +428,10 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 								est = decodedBytes / 2
 							}
 							// Same shared minPDFTokenFloor as the tool_result
-							// document case above (and context_window.go).
-							if (mediaType == "application/pdf" || mediaType == "") && est < minPDFTokenFloor {
+							// document case above (and context_window.go) —
+							// skipped when the page-count signal was trusted,
+							// same reasoning as that site.
+							if !pageCountTrusted && (mediaType == "application/pdf" || mediaType == "") && est < minPDFTokenFloor {
 								est = minPDFTokenFloor
 							}
 							total += est

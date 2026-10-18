@@ -721,33 +721,43 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	isSafetyBlock := finishReason == "SAFETY" || finishReason == "RECITATION" || finishReason == "BLOCKLIST" ||
 		finishReason == "PROHIBITED_CONTENT" || finishReason == "SPII"
 
+	// An audit caught that deciding stopReason and emitting the empty-
+	// content fallback were entangled in one else-if chain: when
+	// s.currentIndex < 0 (generation produced zero content blocks — e.g.
+	// Gemini hit MAX_TOKENS before emitting a single token) the
+	// "s.currentIndex < 0" branch caught it first, and the sibling
+	// "else if finishReason == MAX_TOKENS" branch right below became
+	// unreachable for that exact case — the client got stop_reason:
+	// "end_turn" with "(empty response)" instead of "max_tokens", silently
+	// breaking Claude Code's "the model got cut off, ask it to continue"
+	// handling. Decide stopReason from finishReason/isSafetyBlock first,
+	// independent of whether any content was actually emitted, then
+	// separately emit the fallback block if minItems:1 still needs one.
 	stopReason := "end_turn"
 	if isSafetyBlock {
 		stopReason = "refusal"
-		if s.currentIndex < 0 {
-			if err := s.HandleText("I'm not able to help with that request."); err != nil {
-				return err
-			}
-			if err := s.closeCurrentBlock(); err != nil {
-				return err
-			}
-		}
-	} else if s.currentIndex < 0 {
+	} else if finishReason == "MAX_TOKENS" {
+		stopReason = "max_tokens"
+	} else if s.toolUseOccurred {
+		stopReason = "tool_use"
+	}
+
+	if s.currentIndex < 0 {
 		// Anthropic Messages API requires at least one content block (minItems: 1).
 		// If generation finished without emitting any thinking, text, or tool_use block,
 		// emit a fallback block. If a thinking block or tool call was already streamed,
 		// minItems: 1 is already satisfied and we must NEVER inject synthetic dots ("...")
 		// which would be visible in Claude Code's terminal output.
-		if err := s.HandleText("(empty response)"); err != nil {
+		fallbackText := "(empty response)"
+		if stopReason == "refusal" {
+			fallbackText = "I'm not able to help with that request."
+		}
+		if err := s.HandleText(fallbackText); err != nil {
 			return err
 		}
 		if err := s.closeCurrentBlock(); err != nil {
 			return err
 		}
-	} else if finishReason == "MAX_TOKENS" {
-		stopReason = "max_tokens"
-	} else if s.toolUseOccurred {
-		stopReason = "tool_use"
 	}
 
 	// An audit caught that stop_sequences was translated into Gemini's

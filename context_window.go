@@ -209,10 +209,19 @@ func blockTokenEstimate(bMap map[string]interface{}, isLastAssistant bool) int {
 						// count when it's directly readable in the raw
 						// bytes (uncompressed PDFs only; a best-effort
 						// improvement, not a full parser).
-						if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok && pageEst > est {
-							est = pageEst
+						pageCountTrusted := false
+						if pageEst, ok := estimatePDFTokensFromPageCount(dataStr); ok {
+							pageCountTrusted = true
+							if pageEst > est {
+								est = pageEst
+							}
 						}
-						if est < minPDFTokenFloor {
+						// A follow-up audit caught the floor below still
+						// applied even when the page count was directly
+						// read from the PDF's own structure — a genuine
+						// 1-page PDF (real cost ~258 tokens) got floored
+						// up to 2500 regardless. Skip it when trusted.
+						if !pageCountTrusted && est < minPDFTokenFloor {
 							return minPDFTokenFloor
 						}
 						return est

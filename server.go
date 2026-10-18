@@ -1272,7 +1272,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	}
 
 	// 3. Full Orchestrator Translation: Tiering, LoopGuard, Middle-Truncation 64KB, Sanitizer
-	geminiBody, modelName, budget, wasShrunk, syntheticReasonTools, reverseToolNameMap, err := ConvertClaudeRequestToGemini(bodyBytes, tenant, reqClass, agentKey, sessionID, instanceID)
+	geminiBody, modelName, budget, wasShrunk, syntheticReasonTools, reverseToolNameMap, prefillText, err := ConvertClaudeRequestToGemini(bodyBytes, tenant, reqClass, agentKey, sessionID, instanceID)
 	if err != nil {
 		LogGateway("[#%d] Translation error: %v", rid, err)
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Translation error: %v", err))
@@ -1503,7 +1503,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 			if isStreaming {
 				success, lastStatus, lastErr = executeStreamingWithWatchdog(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes, syntheticReasonTools, reverseToolNameMap)
 			} else {
-				success, lastStatus, lastErr = executeNonStreaming(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes, syntheticReasonTools, reverseToolNameMap)
+				success, lastStatus, lastErr = executeNonStreaming(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes, syntheticReasonTools, reverseToolNameMap, prefillText)
 			}
 
 			if success || !isAntigravity {
@@ -2162,7 +2162,12 @@ UpstreamReady:
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
 	isPlanModeNow := isPlanModeRequest(claudeBodyBytes)
-	readWindowSize, _ := readLoopLimits(agentKey, !isPlanModeNow)
+	// An audit caught this used to pass !isPlanModeNow as a STAND-IN for
+	// hasModifyingTools — see hasModifyingToolsInRequest's doc comment
+	// for why that's wrong (mismatches translator.go's own threshold,
+	// computed from the real declared tools, for a read-only main-agent
+	// session outside Plan Mode).
+	readWindowSize, _ := readLoopLimits(agentKey, hasModifyingToolsInRequest(claudeBodyBytes))
 	globalLoopGuard.RecordReadTurnWithRealProgress(loopKey, readCount, madeProgress, realProgress, readWindowSize, isPlanModeNow)
 
 	hasIgnoreTag := strings.Contains(streamer.lastText, OscIgnoreTag)
@@ -2241,6 +2246,7 @@ func executeNonStreaming(
 	claudeBodyBytes []byte,
 	syntheticReasonTools map[string]bool,
 	reverseToolNameMap map[string]string,
+	prefillText string,
 ) (bool, int, error) {
 	// Unlike the streaming path (which has the panic/TTFT watchdog), this had
 	// no deadline at all — a hung upstream could block the request forever.
@@ -2371,6 +2377,14 @@ func executeNonStreaming(
 		}
 	}
 	inTok := geminiJSON.Get("usageMetadata.promptTokenCount").Int()
+	if inTok == 0 {
+		// An audit caught sse.go's streaming path already falls back to
+		// a local estimate when Gemini's response omits usageMetadata
+		// entirely (observed on some safety stops/error boundaries) —
+		// this non-streaming path had no equivalent, reporting
+		// input_tokens:0 and corrupting client-side token accounting.
+		inTok = int64(estimateApproxClaudeTokens(claudeBodyBytes))
+	}
 	// An audit caught the same thoughtsTokenCount omission as sse.go's
 	// streaming path — Anthropic bills thinking tokens as output tokens,
 	// but this only read candidatesTokenCount, undercounting output_tokens
@@ -2813,7 +2827,12 @@ func executeNonStreaming(
 	}
 	loopKey := agentKey + "|" + sessionID + "|" + instanceID
 	isPlanModeNow := isPlanModeRequest(claudeBodyBytes)
-	readWindowSize, _ := readLoopLimits(agentKey, !isPlanModeNow)
+	// An audit caught this used to pass !isPlanModeNow as a STAND-IN for
+	// hasModifyingTools — see hasModifyingToolsInRequest's doc comment
+	// for why that's wrong (mismatches translator.go's own threshold,
+	// computed from the real declared tools, for a read-only main-agent
+	// session outside Plan Mode).
+	readWindowSize, _ := readLoopLimits(agentKey, hasModifyingToolsInRequest(claudeBodyBytes))
 	globalLoopGuard.RecordReadTurnWithRealProgress(loopKey, readCount, madeProgress, realProgress, readWindowSize, isPlanModeNow)
 	hasIgnoreTag := strings.Contains(lastText, OscIgnoreTag)
 	globalLoopGuard.RecordToolCalls(loopKey, toolCallSignatures, hasIgnoreTag)
@@ -2837,6 +2856,26 @@ func executeNonStreaming(
 			"type": "text",
 			"text": emptyText,
 		})
+	}
+
+	// An audit caught that Anthropic's assistant-prefill contract (the
+	// final returned message must BEGIN with whatever text the client
+	// supplied as the trailing assistant turn, with the model continuing
+	// from there) was never honored in the non-streaming path — Gemini
+	// has no real prefill mechanism, so sanitizer.go instructs it via a
+	// system note to continue directly from the prefix WITHOUT repeating
+	// it, but that prefix itself was never prepended back onto the
+	// response. A client expecting content[0].text to start with its own
+	// prefill (e.g. constraining JSON output with a literal "{") got
+	// Gemini's completion alone and failed to parse it.
+	if prefillText != "" {
+		if contentBlocks, ok := claudeResp["content"].([]map[string]interface{}); ok && len(contentBlocks) > 0 {
+			if firstText, ok := contentBlocks[0]["type"].(string); ok && firstText == "text" {
+				if existing, ok := contentBlocks[0]["text"].(string); ok && !strings.HasPrefix(existing, prefillText) {
+					contentBlocks[0]["text"] = prefillText + existing
+				}
+			}
+		}
 	}
 
 	outJSON, _ := json.Marshal(claudeResp)
