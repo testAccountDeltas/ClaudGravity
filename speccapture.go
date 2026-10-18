@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -143,6 +144,17 @@ type SpecCaptureStore struct {
 	fileMu   sync.Mutex
 	fileDate string
 	file     *os.File
+
+	// Raw (unredacted) chunk capture — see AppendRawGeminiChunk. Separate
+	// on/off switch and separate storage from the redacted capture above:
+	// this corpus exists only to feed ClaudGravityNext's offline StreamFSM
+	// replay tests (Часть 7.5 of ARCHITECTURE_V2_SPECIFICATION_AND_MIGRATION_PLAN.md)
+	// and is meant to be enabled briefly, not left on indefinitely.
+	rawMu          sync.Mutex
+	rawEnabled     bool
+	rawDir         string
+	rawMaxSessions int
+	rawMaxBytes    int64
 }
 
 var globalSpecCapture = &SpecCaptureStore{inFlight: make(map[uint64]*inFlightCapture)}
@@ -169,6 +181,27 @@ func InitSpecCapture(enabled bool, dir string, retentionDays int) {
 		return
 	}
 	globalSpecCapture.pruneOld()
+}
+
+// InitSpecCaptureRawChunks wires up the raw (unredacted) chunk corpus
+// independently of InitSpecCapture — it can be on even if the redacted
+// capture above is off, and vice versa. rawDir defaults to "<dir>/raw_chunks".
+func InitSpecCaptureRawChunks(enabled bool, dir string, maxSessions int, maxBytes int64) {
+	globalSpecCapture.rawMu.Lock()
+	globalSpecCapture.rawEnabled = enabled
+	globalSpecCapture.rawDir = dir
+	globalSpecCapture.rawMaxSessions = maxSessions
+	globalSpecCapture.rawMaxBytes = maxBytes
+	globalSpecCapture.rawMu.Unlock()
+	if !enabled {
+		return
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		LogGateway("[SuperRelay Gateway] Warning: raw chunk capture disabled, could not create %s: %v", dir, err)
+		globalSpecCapture.rawMu.Lock()
+		globalSpecCapture.rawEnabled = false
+		globalSpecCapture.rawMu.Unlock()
+	}
 }
 
 func (s *SpecCaptureStore) Begin(rid uint64) {
@@ -256,6 +289,84 @@ func (s *SpecCaptureStore) AppendGeminiChunk(rid uint64, chunk []byte) {
 	}
 }
 
+// AppendRawGeminiChunk records one streamed Gemini chunk UNREDACTED (real
+// generative text included) into request_captures/raw_chunks/<rid>.ndjson —
+// the corpus ClaudGravityNext's cmd/replay (Часть 7.5 of the v2 spec) feeds
+// through internal/stream.FSM offline, without hitting Gemini again. Called
+// from the same sse.go hook as AppendGeminiChunk, gated by its own
+// rawEnabled switch so it can be on/off independently of the redacted
+// capture. Opens/appends/closes the file per call rather than keeping a
+// handle open per in-flight request — simpler and leak-free; this capture
+// is meant to run for a bounded corpus-building window, not indefinitely,
+// so the extra open/close cost is an acceptable trade.
+func (s *SpecCaptureStore) AppendRawGeminiChunk(rid uint64, chunk []byte) {
+	s.rawMu.Lock()
+	enabled, dir := s.rawEnabled, s.rawDir
+	s.rawMu.Unlock()
+	if !enabled || len(chunk) == 0 {
+		return
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d.ndjson", rid))
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	line := append(append([]byte{}, chunk...), '\n')
+	_, _ = f.Write(line)
+	_ = f.Close()
+}
+
+// pruneRawChunks enforces the session-count/total-size ceiling on
+// raw_chunks/ by deleting the OLDEST files (by mtime) until both limits are
+// satisfied. Called once per finished request (not per chunk) from Finish —
+// a directory listing capped at a couple hundred entries is cheap enough to
+// do there without needing a separate background sweep goroutine.
+func (s *SpecCaptureStore) pruneRawChunks() {
+	s.rawMu.Lock()
+	enabled, dir, maxSessions, maxBytes := s.rawEnabled, s.rawDir, s.rawMaxSessions, s.rawMaxBytes
+	s.rawMu.Unlock()
+	if !enabled {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type fileInfo struct {
+		name    string
+		size    int64
+		modTime time.Time
+	}
+	files := make([]fileInfo, 0, len(entries))
+	var totalBytes int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, fileInfo{name: e.Name(), size: info.Size(), modTime: info.ModTime()})
+		totalBytes += info.Size()
+	}
+	if len(files) <= maxSessions && (maxBytes <= 0 || totalBytes <= maxBytes) {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+	for _, f := range files {
+		if len(files) <= maxSessions && (maxBytes <= 0 || totalBytes <= maxBytes) {
+			break
+		}
+		if err := os.Remove(filepath.Join(dir, f.name)); err == nil {
+			totalBytes -= f.size
+			files = files[1:]
+		} else {
+			break
+		}
+	}
+}
+
 // AppendClaudeEvent records one outbound Anthropic SSE event. Called from
 // SSEStreamer.SendRaw — the single lowest-level emit point every event
 // type (message_start, content_block_delta, message_stop, ...) already
@@ -281,6 +392,11 @@ func (s *SpecCaptureStore) AppendClaudeEvent(rid uint64, event string, data stri
 // began but errored out before any other leg was recorded) — it's a no-op
 // whenever there's nothing to flush.
 func (s *SpecCaptureStore) Finish(rid uint64) {
+	// Raw-chunk rotation runs once per finished request regardless of
+	// whether the redacted capture below is enabled — the two are
+	// independent switches (see InitSpecCaptureRawChunks).
+	s.pruneRawChunks()
+
 	if !s.enabled {
 		return
 	}

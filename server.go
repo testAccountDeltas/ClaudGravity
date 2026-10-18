@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -474,6 +475,9 @@ func main() {
 
 	serverCfgAtStartup := cfgMgr.GetServerConfig()
 	InitSpecCapture(serverCfgAtStartup.SpecCaptureIsEnabled(), serverCfgAtStartup.SpecCaptureDir, serverCfgAtStartup.SpecCaptureRetentionDays)
+	rawChunksDir := filepath.Join(serverCfgAtStartup.SpecCaptureDir, "raw_chunks")
+	InitSpecCaptureRawChunks(serverCfgAtStartup.SpecCaptureRawChunksIsEnabled(), rawChunksDir,
+		serverCfgAtStartup.SpecCaptureRawChunksMaxSessions, serverCfgAtStartup.SpecCaptureRawChunksMaxBytes)
 
 	// Initialize account manager from auths directory
 	if err := InitAccountManager("auths"); err != nil {

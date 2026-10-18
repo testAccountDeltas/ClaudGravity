@@ -907,6 +907,7 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 // ProcessGeminiChunk parses a single Gemini SSE JSON line and drives the state machine.
 func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 	globalSpecCapture.AppendGeminiChunk(s.rid, chunkJSON)
+	globalSpecCapture.AppendRawGeminiChunk(s.rid, chunkJSON)
 	root := gjson.ParseBytes(chunkJSON)
 	if respNode := root.Get("response"); respNode.Exists() {
 		root = respNode
