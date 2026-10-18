@@ -452,16 +452,43 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 	messages := root.Get("messages")
 
+	// An audit of Google's own equivalent agy.exe converter (reverse-
+	// engineered, but this specific point is independently corroborated
+	// by Anthropic's own public extended-thinking documentation, not just
+	// the decompile) flagged that this gateway resends EVERY historical
+	// "thinking" block on EVERY subsequent request — Anthropic's own spec
+	// only requires preserving a thinking block for continuity within an
+	// ACTIVE tool-use loop (the most recent assistant turn, whose
+	// signature Google still needs to verify reasoning continuity against
+	// a pending tool_result); once a turn is genuinely complete, resending
+	// its old reasoning serves no purpose and just accumulates context
+	// bloat over a long agentic session. Only the single most recent
+	// assistant message's thinking is kept; every earlier one is dropped
+	// (not placeholder'd — Gemini has no requirement that a thought be
+	// replaced with anything, unlike the image/document role-mismatch
+	// cases elsewhere in this file).
+	lastAssistantIdx := -1
+	if messages.IsArray() {
+		msgArr := messages.Array()
+		for i := len(msgArr) - 1; i >= 0; i-- {
+			if msgArr[i].Get("role").String() == "assistant" {
+				lastAssistantIdx = i
+				break
+			}
+		}
+	}
+
 	if messages.IsArray() {
 		contentIdx := 0
 		var lastRole string
 
-		messages.ForEach(func(_, msg gjson.Result) bool {
+		messages.ForEach(func(msgIdxResult, msg gjson.Result) bool {
 			role := msg.Get("role").String()
 			geminiRole := "user"
 			if role == "assistant" {
 				geminiRole = "model"
 			}
+			isLastAssistantMsg := role == "assistant" && int(msgIdxResult.Int()) == lastAssistantIdx
 
 			// Pre-pass: map tool_use IDs to function names
 			if parts := msg.Get("content"); parts.IsArray() {
@@ -995,6 +1022,19 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 								part := `{"text":""}`
 								part, _ = sjson.Set(part, "text", thoughtTxt)
 								partsJSON = append(partsJSON, part)
+								return true
+							}
+							if !isLastAssistantMsg {
+								// This thinking block belongs to a completed,
+								// older assistant turn — not the one Google
+								// might still need reasoning continuity for
+								// against a pending tool_result. Drop it
+								// silently (no placeholder needed; Gemini has
+								// no requirement that a dropped thought be
+								// replaced with anything) instead of resending
+								// every historical thought on every request,
+								// which accumulates real context bloat over a
+								// long agentic session for zero benefit.
 								return true
 							}
 							// Prefer the real signature the client echoed back

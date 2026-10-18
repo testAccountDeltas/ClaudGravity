@@ -1,12 +1,60 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"math"
 	"strings"
 
 	"github.com/tidwall/gjson"
 )
+
+// anthropicImageTokenFloor is the flat fallback used when the actual pixel
+// dimensions can't be determined (corrupt/truncated/unsupported-format
+// base64, or a non-base64 source like a URL this gateway never fetches) —
+// close to the real cost of a typical mid-size screenshot, so an estimate
+// that has to fall back isn't wildly off either direction.
+const anthropicImageTokenFloor = 1600
+
+// anthropicImageMaxSide is the side-length Anthropic's own documented
+// pipeline downscales an image to before pricing it — a larger image is
+// billed as if resized to fit this, not at its original resolution.
+const anthropicImageMaxSide = 1568
+
+// estimateImageTokens computes Anthropic's own documented image-pricing
+// formula, ceil(width*height/750) after capping the longer side to 1568px,
+// instead of a flat per-image guess that treats a tiny icon and a full
+// desktop screenshot identically. Decodes only the image header (no full
+// pixel decode) via image.DecodeConfig. Falls back to the flat floor when
+// dimensions can't be read.
+func estimateImageTokens(b64Data string) int {
+	if b64Data == "" {
+		return anthropicImageTokenFloor
+	}
+	raw, err := base64.StdEncoding.DecodeString(stripBase64Whitespace(b64Data))
+	if err != nil || len(raw) == 0 {
+		return anthropicImageTokenFloor
+	}
+	cfg, _, err := image.DecodeConfig(strings.NewReader(string(raw)))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		return anthropicImageTokenFloor
+	}
+	w, h := float64(cfg.Width), float64(cfg.Height)
+	if maxSide := math.Max(w, h); maxSide > anthropicImageMaxSide {
+		scale := anthropicImageMaxSide / maxSide
+		w *= scale
+		h *= scale
+	}
+	tokens := int(math.Ceil(w * h / 750))
+	if tokens < 1 {
+		tokens = 1
+	}
+	return tokens
+}
 
 // estimateContentSourceText extracts the real text from a document block
 // whose source.type == "content" (Anthropic's other text-document form,
@@ -185,7 +233,7 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 							rc.ForEach(func(_, item gjson.Result) bool {
 								switch item.Get("type").String() {
 								case "image":
-									total += 1600
+									total += estimateImageTokens(item.Get("source.data").String())
 								case "document":
 									src := item.Get("source")
 									if src.Get("type").String() == "base64" {
@@ -242,8 +290,13 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 							})
 						}
 					case "image":
-						// Rough image token cost (typical Anthropic resolution ~1600 tokens)
-						total += 1600
+						// An audit cross-referenced Anthropic's own documented
+						// image-pricing formula (ceil(w*h/750) after capping
+						// the longer side to 1568px) against this flat 1600
+						// guess — real images vary from a small icon (a few
+						// hundred tokens) to a full desktop screenshot (3000+),
+						// so decode the actual dimensions instead of guessing.
+						total += estimateImageTokens(part.Get("source.data").String())
 					case "document":
 						src := part.Get("source")
 						if src.Get("type").String() == "base64" {

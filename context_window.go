@@ -121,7 +121,17 @@ func contentSourceTextFromBlockMap(content interface{}) string {
 func blockTokenEstimate(bMap map[string]interface{}) int {
 	switch bMap["type"] {
 	case "image":
-		return 1600
+		// An audit cross-referenced Anthropic's own documented image-pricing
+		// formula (ceil(w*h/750) after capping the longer side to 1568px)
+		// against this flat guess — see estimateImageTokens in
+		// token_estimator.go, shared across both estimators the same way
+		// the PDF floor was unified earlier this session.
+		if src, ok := bMap["source"].(map[string]interface{}); ok {
+			if dataStr, ok := src["data"].(string); ok {
+				return estimateImageTokens(dataStr)
+			}
+		}
+		return anthropicImageTokenFloor
 	case "document":
 		// If it's a base64 PDF, scale with realistic PDF token density (~258 tokens/page,
 		// ~1 token per 500 base64 chars) with a floor of 2500 tokens.
