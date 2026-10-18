@@ -312,7 +312,7 @@ func checkConnectTarget(host string) ([]net.IP, error) {
 // proxySecret, when non-empty, is required as a "Proxy-Authorization: Bearer
 // <secret>" header on every CONNECT request — without it, anyone who can
 // reach this port could use it as an open relay to the internet.
-func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, targetHandler http.Handler, proxySecret string) {
+func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, targetHandler http.Handler, proxySecret string, localTLSPort int) {
 	if proxySecret != "" && !proxyAuthOK(r, proxySecret) {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="SuperRelay Proxy"`)
 		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
@@ -333,9 +333,14 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 	// TCP tunnel to it. This gateway's own documented job (see the
 	// comment just below) is HTTPS/HTTP proxying for package registries
 	// and APIs, never an arbitrary TCP relay — restrict to the standard
-	// ports that use actually needs.
+	// ports that use actually needs, plus this gateway's own configured
+	// TLS API port: a client using ANTHROPIC_BASE_URL=https://<host>:<tls_port>
+	// with HTTPS_PROXY pointed at this same gateway legitimately CONNECTs
+	// to its own :tls_port (e.g. 8900), which caused a live outage
+	// (ERR_PROXY_TUNNEL) the first time this restriction shipped.
+	localTLSPortStr := strconv.Itoa(localTLSPort)
 	switch port {
-	case "443", "8443", "80":
+	case "443", "8443", "80", localTLSPortStr:
 	default:
 		LogGateway("[SuperRelay Gateway] Refused CONNECT to non-standard port %s:%s", host, port)
 		http.Error(w, "Tunnel to non-standard port forbidden", http.StatusForbidden)

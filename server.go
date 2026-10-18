@@ -888,7 +888,7 @@ func main() {
 	rootHandler := recoverMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			if mitmCA != nil {
-				HandleConnectTunnel(w, r, mitmCA, interceptedMux, proxySecret)
+				HandleConnectTunnel(w, r, mitmCA, interceptedMux, proxySecret, serverCfg.TLSPort)
 			} else {
 				http.Error(w, "CONNECT proxy not available: MITM CA initialization failed", http.StatusBadGateway)
 			}
