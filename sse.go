@@ -203,6 +203,8 @@ type SSEStreamer struct {
 	disableParallelToolUse   bool              // client's disable_parallel_tool_use — HandleFunctionCall drops any call past the first when set, see wantsSingleToolUse's doc comment
 	reverseToolNameMap       map[string]string // sanitized (Gemini-bound) tool name -> original Claude-side name, for tools translator.go had to rewrite (e.g. hyphens stripped) — see sanitizeGeminiFunctionName's doc comment
 	stopSequences            []string          // client's stop_sequences — Gemini's finishReason is just "STOP" either way, so FinishStream checks s.lastText's own suffix against these to recover stop_reason:"stop_sequence" when that's really what happened
+	prefillText              string            // assistant-prefill text (SanitizeMessagesAndGraph's 3rd return value) that must prefix the very first text delta — a Round 15 audit caught this was threaded into executeNonStreaming only, never into the streaming path, so Gemini continued the prefilled string without ever echoing the prefix itself and streaming clients got a truncated/invalid JSON prefix
+	prefillEmitted           bool              // set once the prefill has been prepended to the first text delta, so a later text block (after a thinking block, or a second turn) never gets it again
 }
 
 type GroundingSource struct {
@@ -217,7 +219,7 @@ const (
 	TypeToolUse  = 3
 )
 
-func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool, cachePrefixFrac float64, disableParallelToolUse bool, reverseToolNameMap map[string]string, stopSequences []string) *SSEStreamer {
+func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool, cachePrefixFrac float64, disableParallelToolUse bool, reverseToolNameMap map[string]string, stopSequences []string, prefillText string) *SSEStreamer {
 	return &SSEStreamer{
 		rid:                    rid,
 		w:                      w,
@@ -236,6 +238,7 @@ func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, mod
 		reverseToolNameMap:     reverseToolNameMap,
 		hasPriorTurns:          hasPriorTurns,
 		stopSequences:          stopSequences,
+		prefillText:            prefillText,
 	}
 }
 
@@ -283,10 +286,16 @@ func (s *SSEStreamer) EnsureMessageStart() error {
 	// message_delta still corrects to the real number either way.
 	cachedEstimate := int64(0)
 	uncachedEstimate := int64(s.estInputTokens)
-	// Only estimate cache read if prompt is large enough to be cache-eligible (>1024 tokens)
+	// Only estimate cache read if prompt is large enough to be cache-eligible
 	// and the conversation has prior assistant turns. A brand new prompt or cold turn
 	// must not inherit a false 85% cache hit.
-	if s.estInputTokens >= 1024 && s.hasPriorTurns {
+	// A Round 15 audit caught this used a hardcoded 1024 while
+	// cacheCreationThreshold (used elsewhere in this same file, e.g. just
+	// below in FinishStream) already knows Haiku's real floor is 2048, not
+	// 1024 — a Haiku prompt in the 1024-2047 range got a simulated cache
+	// hit here even though the real model never actually created a cache
+	// entry that small.
+	if int64(s.estInputTokens) >= cacheCreationThreshold(s.model) && s.hasPriorTurns {
 		if frac, ok := getSessionCacheFraction(s.sessionID); ok && frac > 0 {
 			cachedEstimate = int64(float64(s.estInputTokens) * frac)
 			uncachedEstimate = int64(s.estInputTokens) - cachedEstimate
@@ -463,6 +472,12 @@ func (s *SSEStreamer) HandleText(text string) error {
 		// discard-over-leak choice already made for a second interleaved
 		// thought block above.
 		return nil
+	}
+	if !s.prefillEmitted {
+		s.prefillEmitted = true
+		if s.prefillText != "" && !strings.HasPrefix(text, s.prefillText) {
+			text = s.prefillText + text
+		}
 	}
 	if s.currentType != TypeText {
 		if err := s.closeCurrentBlock(); err != nil {

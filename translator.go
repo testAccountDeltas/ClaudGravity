@@ -109,6 +109,14 @@ func lastTurnHadFailedEdit(reqMap map[string]interface{}) (hadEdit bool, failed 
 		return false, false
 	}
 
+	// A Round 15 audit caught that "failed" was set true the moment ANY
+	// edit in this turn had is_error:true, even when a SIBLING edit in
+	// the same turn succeeded (e.g. a multi-file batch where only one
+	// obscure file's edit failed) — that's forward progress, not a stuck
+	// loop, but it still counted toward the same 3-strike streak as a
+	// genuinely repeated failure on one file. Only report failure when
+	// EVERY edit in the turn failed.
+	successCount, failedCount := 0, 0
 	if blocks, ok := last["content"].([]interface{}); ok {
 		for _, bi := range blocks {
 			b, ok := bi.(map[string]interface{})
@@ -121,10 +129,13 @@ func lastTurnHadFailedEdit(reqMap map[string]interface{}) (hadEdit bool, failed 
 			}
 			hadEdit = true
 			if isErr, _ := b["is_error"].(bool); isErr {
-				failed = true
+				failedCount++
+			} else {
+				successCount++
 			}
 		}
 	}
+	failed = failedCount > 0 && successCount == 0
 	return hadEdit, failed
 }
 
@@ -184,7 +195,18 @@ func sealFunctionResponseTurn(parts []string) (sealed []string, followUpImages [
 
 	target := fnResp[0]
 	if note.Len() > 0 {
-		target, _ = sjson.Set(target, "functionResponse.response.user_note", note.String())
+		// A Round 15 audit caught that this is called again on a growing
+		// combined parts list as consecutive same-role turns keep
+		// merging (see the caller re-sealing an already-sealed previous
+		// turn's parts) — target can already carry a user_note from an
+		// EARLIER merge round, and sjson.Set here blindly overwrote it
+		// with only the current round's note, discarding the first
+		// round's text entirely. Concatenate instead of replacing.
+		newNote := note.String()
+		if existing := gjson.Get(target, "functionResponse.response.user_note").String(); existing != "" {
+			newNote = existing + "\n" + newNote
+		}
+		target, _ = sjson.Set(target, "functionResponse.response.user_note", newNote)
 	}
 	fnResp[0] = target
 	return fnResp, followUpImages
@@ -243,6 +265,21 @@ func stripDataURIPrefix(s string) string {
 // Matches by prefix since Anthropic dates each version (bash_20250124,
 // bash_20241022, ...); the parameter shapes have stayed stable across
 // dates for each tool family so one schema per family is sufficient.
+// isDigitsOnly reports whether s is non-empty and consists solely of ASCII
+// digits — used to recognize Anthropic's dated-version suffix convention
+// (e.g. "20250124") without matching an arbitrary longer suffix.
+func isDigitsOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func builtinAnthropicToolSchema(toolType string) (string, bool) {
 	switch {
 	case strings.HasPrefix(toolType, "bash_"):
@@ -252,7 +289,19 @@ func builtinAnthropicToolSchema(toolType string) (string, bool) {
 		return `{"type":"object","properties":{"command":{"type":"string","description":"The bash command to run."},"restart":{"type":"boolean","description":"Set to true to restart the tool instead of running a command."}},"required":["command"]}`, true
 	case strings.HasPrefix(toolType, "text_editor_"):
 		return `{"type":"object","properties":{"command":{"type":"string","enum":["view","create","str_replace","insert","undo_edit"],"description":"The editor command to run."},"path":{"type":"string","description":"Absolute path to the file or directory."},"file_text":{"type":"string","description":"Required for create: the full content of the new file."},"old_str":{"type":"string","description":"Required for str_replace: the exact text to replace."},"new_str":{"type":"string","description":"Replacement text for str_replace, or the text to insert for insert."},"insert_line":{"type":"integer","description":"Required for insert: the line number after which to insert."},"view_range":{"type":"array","items":{"type":"integer"},"description":"Optional for view: [start_line, end_line]."}},"required":["command","path"]}`, true
-	case strings.HasPrefix(toolType, "computer_"):
+	case strings.HasPrefix(toolType, "computer_") && isDigitsOnly(strings.TrimPrefix(toolType, "computer_")):
+		// A Round 15 audit flagged that a bare "computer_" prefix would
+		// also swallow a hypothetical future variant like
+		// "computer_toolset_20260801" that splits computer-use into many
+		// separate, individually-schemaed tools (screenshot, left_click,
+		// ...) rather than this one monolithic action-dispatch shape —
+		// routing those through this schema instead of their own would
+		// give the model the wrong parameters entirely. Only match the
+		// established dated-version convention this bash_/text_editor_
+		// family actually uses ("computer_" + a pure numeric date stamp,
+		// e.g. "computer_20250124"), the same way every other
+		// known-real builtin type name in this switch is still just a
+		// stable family prefix.
 		return `{"type":"object","properties":{"action":{"type":"string","enum":["key","hold_key","type","cursor_position","mouse_move","left_mouse_down","left_mouse_up","left_click","left_click_drag","right_click","middle_click","double_click","triple_click","scroll","wait","screenshot"],"description":"The computer-use action to perform."},"coordinate":{"type":"array","items":{"type":"integer"},"description":"[x, y] pixel coordinate for click/move/drag actions."},"text":{"type":"string","description":"Text for key/type actions."},"duration":{"type":"integer","description":"Seconds to hold a key or wait."},"scroll_direction":{"type":"string","enum":["up","down","left","right"]},"scroll_amount":{"type":"integer"}},"required":["action"]}`, true
 	}
 	return "", false
@@ -567,12 +616,35 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 			declaredToolNames[n] = true
 			sanitized := sanitizeGeminiFunctionName(n)
 			if existingOrig, claimed := claimedSanitizedNames[sanitized]; claimed && existingOrig != n {
-				suffix := fmt.Sprintf("_%d", len(claimedSanitizedNames))
+				// A Round 15 audit caught that this only ever tried ONE
+				// alternate candidate — if that candidate itself happened
+				// to already be claimed (e.g. a client declaring
+				// "docker:run", "docker_run_1", AND "docker_run": the
+				// first sanitizes to "docker_run" and claims it, the
+				// second claims "docker_run_1" as-is with no collision at
+				// all, then the third literally IS "docker_run" and
+				// collides with the first — generating a suffixed
+				// candidate that could coincide with the second tool's
+				// already-claimed name depending on iteration order), the
+				// single assignment below silently overwrote that OTHER
+				// tool's claim, leaving two distinct Claude-side tool
+				// names mapped to the identical sanitized Gemini name —
+				// Gemini then rejects the whole request with a duplicate
+				// function-declaration error. Keep incrementing the
+				// suffix until an actually-free slot is found.
 				base := sanitized
-				if len(base)+len(suffix) > 63 {
-					base = base[:63-len(suffix)]
+				for n2 := 1; ; n2++ {
+					suffix := fmt.Sprintf("_%d", n2)
+					candidateBase := base
+					if len(candidateBase)+len(suffix) > 63 {
+						candidateBase = candidateBase[:63-len(suffix)]
+					}
+					candidate := candidateBase + suffix
+					if existingOrig2, claimed2 := claimedSanitizedNames[candidate]; !claimed2 || existingOrig2 == n {
+						sanitized = candidate
+						break
+					}
 				}
-				sanitized = base + suffix
 			}
 			claimedSanitizedNames[sanitized] = n
 			disambiguatedToolName[n] = sanitized
@@ -1057,15 +1129,18 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							if fnName != "" && !declaredToolNames[fnName] {
 								fnName = ""
 							}
-							if fnName == "" {
-								// Last resort: any declared tool at least
-								// matches Google's validation; "tool" never
-								// does.
-								for name := range declaredToolNames {
-									fnName = name
-									break
-								}
-							}
+							// A Round 15 audit caught that the random Go
+							// map-iteration pick this used to fall back to
+							// here was non-deterministic — the SAME
+							// conversation history, resent unchanged on a
+							// retry, could pick a DIFFERENT tool name each
+							// time, changing the request's exact byte
+							// content and invalidating Gemini's server-side
+							// prefix cache for no functional reason.
+							// root.Get("tools.0.name") below already covers
+							// this exact case (declaredToolNames non-empty
+							// implies at least one declared tool) and is
+							// fully deterministic.
 							if fnName == "" {
 								fnName = root.Get("tools.0.name").String()
 							}
@@ -1806,13 +1881,32 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	}
 
 	// 6.6 Structured Outputs: translate Anthropic output_config.format into Gemini responseSchema
-	if fmtNode := root.Get("output_config.format"); fmtNode.Exists() {
-		if fmtNode.Get("type").String() == "json_schema" {
+	//
+	// A Round 15 audit caught this only ever read "output_config.format" —
+	// some official SDK call shapes (e.g. client.messages.parse()) send
+	// the format at the request's TOP level as "output_format" instead.
+	// Fall back to that root field when the nested one is absent, rather
+	// than silently treating the request as unstructured text.
+	fmtNode := root.Get("output_config.format")
+	if !fmtNode.Exists() {
+		fmtNode = root.Get("output_format")
+	}
+	if fmtNode.Exists() {
+		switch fmtNode.Get("type").String() {
+		case "json_schema":
 			out, _ = sjson.Set(out, "generationConfig.responseMimeType", "application/json")
 			if schemaNode := fmtNode.Get("schema"); schemaNode.Exists() {
 				cleanedSchema := CleanJSONSchemaForGemini(schemaNode.Raw)
 				out, _ = sjson.SetRaw(out, "generationConfig.responseSchema", cleanedSchema)
 			}
+		case "json", "json_object":
+			// A Round 15 audit caught that a non-strict free-form JSON
+			// request (no "schema" key, just {"type":"json"} — "any valid
+			// JSON, no fixed shape required") never matched the
+			// json_schema-only check above, so the model was never told
+			// to actually emit JSON and commonly wrapped its answer in a
+			// markdown code fence instead of raw JSON.
+			out, _ = sjson.Set(out, "generationConfig.responseMimeType", "application/json")
 		}
 	}
 

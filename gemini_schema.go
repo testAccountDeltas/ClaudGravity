@@ -218,6 +218,37 @@ func walkSchemaForNumericEnums(props gjson.Result, prefix string, fields map[str
 			if items.Get("enum").IsArray() && (itemType == "integer" || itemType == "number" || itemType == "boolean") {
 				fields[path] = "array:" + itemType
 			}
+			// A Round 15 audit caught that a 2D array (items.items, e.g.
+			// "matrix": {"type":"array","items":{"type":"array","items":
+			// {"type":"integer","enum":[0,1]}}}) was never scanned at all
+			// — convertEnumValuesToStrings still stringifies the innermost
+			// enum values for Gemini either way, but with nothing recorded
+			// here, coerceNumericEnumArgs never decoded them back, leaving
+			// every row's values as strings ("0","1") against a schema
+			// declaring integer, failing Claude Code's own validation.
+			if itemType == "array" {
+				innerItems := items.Get("items")
+				innerType := innerItems.Get("type").String()
+				if innerType == "" && innerItems.Get("enum").IsArray() {
+					for _, ev := range innerItems.Get("enum").Array() {
+						if ev.Type == gjson.Number {
+							if strings.Contains(ev.Raw, ".") {
+								innerType = "number"
+							} else {
+								innerType = "integer"
+							}
+							break
+						}
+						if ev.Type == gjson.True || ev.Type == gjson.False {
+							innerType = "boolean"
+							break
+						}
+					}
+				}
+				if innerItems.Get("enum").IsArray() && (innerType == "integer" || innerType == "number" || innerType == "boolean") {
+					fields[path] = "array2D:" + innerType
+				}
+			}
 			// An audit caught that an array of OBJECTS (items.properties,
 			// not items.enum directly) was never recursed into at all —
 			// e.g. "ports": {"type":"array","items":{"type":"object",
@@ -329,6 +360,38 @@ func coerceNumericEnumArgs(toolName, argsRaw string) string {
 			}
 			continue
 		}
+		if itemType, ok := strings.CutPrefix(origType, "array2D:"); ok {
+			rows := gjson.Get(argsRaw, field)
+			if !rows.IsArray() {
+				continue
+			}
+			for ri, row := range rows.Array() {
+				if !row.IsArray() {
+					continue
+				}
+				for ci, el := range row.Array() {
+					if el.Type != gjson.String {
+						continue
+					}
+					idxPath := fmt.Sprintf("%s.%d.%d", field, ri, ci)
+					switch itemType {
+					case "integer":
+						if n, err := strconv.ParseInt(el.String(), 10, 64); err == nil {
+							argsRaw, _ = sjson.Set(argsRaw, idxPath, n)
+						}
+					case "number":
+						if f, err := strconv.ParseFloat(el.String(), 64); err == nil {
+							argsRaw, _ = sjson.Set(argsRaw, idxPath, f)
+						}
+					case "boolean":
+						if b, err := strconv.ParseBool(el.String()); err == nil {
+							argsRaw, _ = sjson.Set(argsRaw, idxPath, b)
+						}
+					}
+				}
+			}
+			continue
+		}
 		v := gjson.Get(argsRaw, field)
 		if v.Type != gjson.String {
 			continue
@@ -429,11 +492,12 @@ func cleanJSONSchema(toolName, jsonStr string, addPlaceholder bool) (string, []s
 	jsonStr = convertRefsToHints(jsonStr)
 	jsonStr = convertConstToEnum(jsonStr)
 	jsonStr = convertPrefixItemsToItems(jsonStr)
+	jsonStr = convertDraft7TuplesToItems(jsonStr)
 
 	// Phase 2: Flatten complex structures
 	jsonStr = mergeAllOf(jsonStr)
-	jsonStr = flattenAnyOfOneOf(jsonStr)
-	jsonStr = flattenTypeArrays(jsonStr)
+	jsonStr = flattenAnyOfOneOf(jsonStr, addPlaceholder)
+	jsonStr = flattenTypeArrays(jsonStr, addPlaceholder)
 
 	// Record numeric and boolean enums AFTER references are inlined and allOf/anyOf
 	// structures are merged, but BEFORE convertEnumValuesToStrings coerces them
@@ -625,6 +689,17 @@ func convertRefsToHints(jsonStr string) string {
 					if !gjson.Get(def, "definitions").Exists() && gjson.Get(jsonStr, "definitions").Exists() {
 						def, _ = sjson.SetRaw(def, "definitions", gjson.Get(jsonStr, "definitions").Raw)
 					}
+					// A Round 15 audit caught that resolveLocalRef (above)
+					// also resolves "#/components/schemas/X" refs, but only
+					// $defs/definitions were ever carried over here — a
+					// root-level ref to "#/components/schemas/Root" lost
+					// the whole components registry the moment root got
+					// replaced with Root's own content, breaking any NESTED
+					// "#/components/schemas/..." ref inside Root on the
+					// next resolution pass.
+					if !gjson.Get(def, "components").Exists() && gjson.Get(jsonStr, "components").Exists() {
+						def, _ = sjson.SetRaw(def, "components", gjson.Get(jsonStr, "components").Raw)
+					}
 				}
 				jsonStr = setRawAt(jsonStr, parentPath, def)
 				continue
@@ -759,10 +834,25 @@ func convertEnumValuesToStrings(jsonStr string) string {
 			stringVals = append(stringVals, item.String())
 		}
 
+		parentPath := trimSuffix(p, ".enum")
+		if len(stringVals) == 0 {
+			// A Round 15 audit caught that a PURELY-null enum (e.g. the
+			// {"enum":[null]} this gateway's own convertConstToEnum emits
+			// for {"const": null}) fell through to the line below with an
+			// empty stringVals slice, writing "enum": [] back into the
+			// schema. Gemini's Protobuf descriptor requires enum to be
+			// non-empty (minItems: 1) and rejects the whole tool
+			// declaration with HTTP 400 INVALID_ARGUMENT. The only real
+			// information this branch carries is "nullable" — drop the
+			// now-empty enum key entirely instead of writing it back.
+			jsonStr, _ = sjson.Delete(jsonStr, p)
+			jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "type"), "null")
+			continue
+		}
+
 		// Always update enum values to strings and set type to "string"
 		// This ensures compatibility with Antigravity Gemini which only allows enum for STRING type
 		jsonStr, _ = sjson.Set(jsonStr, p, stringVals)
-		parentPath := trimSuffix(p, ".enum")
 		jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "type"), "string")
 		if hasNull {
 			jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "nullable"), true)
@@ -1102,7 +1192,7 @@ func mergeAllOf(jsonStr string) string {
 	return jsonStr
 }
 
-func flattenAnyOfOneOf(jsonStr string) string {
+func flattenAnyOfOneOf(jsonStr string, addPlaceholder bool) string {
 	for _, key := range []string{"anyOf", "oneOf"} {
 		paths := findPaths(jsonStr, key)
 		sortByDepth(paths)
@@ -1162,6 +1252,21 @@ func flattenAnyOfOneOf(jsonStr string) string {
 			// only ever sees the final string-typed result either way.
 			allEnums := make([]string, 0)
 			allStringEnums := true
+			// A Round 15 audit caught that a union like
+			// oneOf:[{"enum":["a","b"]}, {"type":"string"}] — one branch
+			// restricted to specific values, a sibling branch accepting
+			// ANY value of the same scalar type — left `selected`
+			// (whichever branch selectBest happened to pick) keeping
+			// whatever "enum" it started with, since allStringEnums below
+			// just turns false and skips the merge entirely rather than
+			// clearing it. The free-scalar branch's whole meaning is "any
+			// value of this type is valid", which a leftover enum
+			// constraint directly contradicts. Track whether any sibling
+			// is a genuine free scalar (not itself an object/array branch,
+			// which mergeObjectBranches/selectBest already handle on their
+			// own terms) with no enum of its own, and strip enum from the
+			// result in that case instead of merging or leaving it alone.
+			sawFreeScalar := false
 			for _, itm := range items {
 				t := itm.Get("type").String()
 				if t == "null" {
@@ -1187,9 +1292,15 @@ func flattenAnyOfOneOf(jsonStr string) string {
 					}
 				} else {
 					allStringEnums = false
+					isObjectOrArray := t == "object" || t == "array" || itm.Get("properties").Exists() || itm.Get("items").Exists()
+					if !isObjectOrArray {
+						sawFreeScalar = true
+					}
 				}
 			}
-			if allStringEnums && len(allEnums) > 0 {
+			if sawFreeScalar {
+				selected, _ = sjson.Delete(selected, "enum")
+			} else if allStringEnums && len(allEnums) > 0 {
 				// A follow-up audit caught this never deduped — two
 				// branches sharing a value (e.g. a shared discriminator
 				// like "update" that both "create|update" and
@@ -1241,26 +1352,35 @@ func flattenAnyOfOneOf(jsonStr string) string {
 				// (non-nullable) string/object/etc.
 				selected, _ = sjson.Set(selected, "nullable", true)
 
-				// Also strip from parent object's required array if this is a property
-				parts := splitGJSONPath(parentPath)
-				if len(parts) >= 2 && parts[len(parts)-2] == "properties" {
-					fieldName := unescapeGJSONPathKey(parts[len(parts)-1])
-					objectPath := strings.Join(parts[:len(parts)-2], ".")
-					reqPath := "required"
-					if objectPath != "" {
-						reqPath = objectPath + ".required"
-					}
-					if req := gjson.Get(jsonStr, reqPath); req.IsArray() {
-						var filtered []string
-						for _, r := range req.Array() {
-							if r.String() != fieldName {
-								filtered = append(filtered, r.String())
-							}
+				// A Round 15 audit caught the same issue flattenTypeArrays
+				// has: stripping a nullable field from "required" is only
+				// correct for tool-declaration schemas. Structured
+				// Outputs' responseSchema (addPlaceholder==false) needs
+				// "required" (key must be present) kept independent of
+				// "nullable" (value may be null) — Pydantic/Zod client
+				// validators enforce exactly that distinction.
+				if addPlaceholder {
+					// Also strip from parent object's required array if this is a property
+					parts := splitGJSONPath(parentPath)
+					if len(parts) >= 2 && parts[len(parts)-2] == "properties" {
+						fieldName := unescapeGJSONPathKey(parts[len(parts)-1])
+						objectPath := strings.Join(parts[:len(parts)-2], ".")
+						reqPath := "required"
+						if objectPath != "" {
+							reqPath = objectPath + ".required"
 						}
-						if len(filtered) == 0 {
-							jsonStr, _ = sjson.Delete(jsonStr, reqPath)
-						} else {
-							jsonStr, _ = sjson.Set(jsonStr, reqPath, filtered)
+						if req := gjson.Get(jsonStr, reqPath); req.IsArray() {
+							var filtered []string
+							for _, r := range req.Array() {
+								if r.String() != fieldName {
+									filtered = append(filtered, r.String())
+								}
+							}
+							if len(filtered) == 0 {
+								jsonStr, _ = sjson.Delete(jsonStr, reqPath)
+							} else {
+								jsonStr, _ = sjson.Set(jsonStr, reqPath, filtered)
+							}
 						}
 					}
 				}
@@ -1304,6 +1424,21 @@ func flattenAnyOfOneOf(jsonStr string) string {
 						// values. Union this branch's enum into whatever's
 						// already there; everything else about the existing
 						// property stays untouched, same as before.
+						// A Round 15 audit caught that this collision-merge
+						// only ever handled "enum" — a colliding property
+						// that's an OBJECT on both sides (e.g. a shared
+						// "config" sub-object, parent declares some of its
+						// fields and this oneOf branch declares others) had
+						// its nested "properties" silently dropped entirely:
+						// branchEnum.IsArray() is false for an object, so
+						// this returned early with nothing merged at all.
+						// Recursively merge nested properties the same way
+						// mergeObjectBranches already does for a collision
+						// between two oneOf/anyOf branches.
+						if branchProps := pv.Get("properties"); branchProps.IsObject() && gjson.Get(jsonStr, joinPath(propDest, "properties")).IsObject() {
+							merged := mergeAllOfPropertiesInto(gjson.Get(jsonStr, propDest).Raw, "properties", branchProps, false)
+							jsonStr, _ = sjson.SetRaw(jsonStr, propDest, merged)
+						}
 						branchEnum := pv.Get("enum")
 						if !branchEnum.IsArray() {
 							return true
@@ -1452,6 +1587,30 @@ func mergeObjectBranches(branches []gjson.Result) string {
 					// way mergeAllOfPropertiesInto already does for allOf
 					// collisions.
 					entry.raw = mergeAllOfPropertiesInto(entry.raw, "properties", pv.Get("properties"), false)
+				} else if !(pv.Get("properties").IsObject() || gjson.Parse(entry.raw).Get("properties").IsObject()) {
+					// A Round 15 audit caught that a scalar-vs-scalar
+					// collision (e.g. branch A declares "id":{"type":
+					// "string"}, branch B declares "id":{"type":"integer"})
+					// fell through the properties-merge `else if` above
+					// doing nothing at all — the second branch's type and
+					// description were silently discarded, keeping only
+					// whichever branch happened to be seen first. Record
+					// the alternate type/description as a hint, the same
+					// "Accepts: X | Y" degradation pattern this file
+					// already uses for anyOf/oneOf unions elsewhere, rather
+					// than losing the information with no trace.
+					existingType := gjson.Parse(entry.raw).Get("type").String()
+					newType := pv.Get("type").String()
+					if newType != "" && newType != existingType {
+						entry.raw = appendHintRaw(entry.raw, "Also accepts: "+newType)
+					}
+					if newDesc := pv.Get("description").String(); newDesc != "" {
+						if existingDesc := gjson.Parse(entry.raw).Get("description").String(); existingDesc == "" {
+							entry.raw, _ = sjson.Set(entry.raw, "description", newDesc)
+						} else if !strings.Contains(existingDesc, newDesc) {
+							entry.raw = appendHintRaw(entry.raw, newDesc)
+						}
+					}
 				}
 				// Record EVERY branch's own nested required list for this
 				// property (not just the merge case) — an audit caught the
@@ -1631,7 +1790,22 @@ func selectBest(items []gjson.Result) (bestIdx int, types []string) {
 					break
 				}
 			}
-			score = 1
+			// A Round 15 audit caught that a purely-null enum branch (t
+			// stayed "null" — no non-null element to infer a real type
+			// from) scored the same `1` as a genuinely typed branch below.
+			// Since the comparison a few lines down is strict `>`, not
+			// `>=`, the FIRST branch with the max score wins ties — a
+			// union like oneOf:[{"const":null}, {"type":"string"}] (null
+			// listed first) let the null branch win outright over the real
+			// string type that followed it, turning a typed field into an
+			// untyped/null one. A null branch's only real job is
+			// contributing "null" to `types` so the caller marks the field
+			// nullable (line ~1680 below still does that regardless of
+			// score) — it should never be able to outrank an actual type,
+			// so score it like the explicit-null default case (0) instead.
+			if t != "null" {
+				score = 1
+			}
 		default:
 			// An audit caught that a branch with NO type signal at all —
 			// not even an enum, e.g. just {"description": "any valid
@@ -1661,7 +1835,7 @@ func selectBest(items []gjson.Result) (bestIdx int, types []string) {
 	return
 }
 
-func flattenTypeArrays(jsonStr string) string {
+func flattenTypeArrays(jsonStr string, addPlaceholder bool) string {
 	paths := findPaths(jsonStr, "type")
 	sortByDepth(paths)
 
@@ -1748,24 +1922,36 @@ func flattenTypeArrays(jsonStr string) string {
 		}
 	}
 
-	for objectPath, fields := range nullableFields {
-		reqPath := joinPath(objectPath, "required")
-		req := gjson.Get(jsonStr, reqPath)
-		if !req.IsArray() {
-			continue
-		}
-
-		var filtered []string
-		for _, r := range req.Array() {
-			if !contains(fields, r.String()) {
-				filtered = append(filtered, r.String())
+	// A Round 15 audit caught that this unconditionally stripped a
+	// nullable field out of "required" — correct for tool-declaration
+	// schemas (addPlaceholder==true), where Gemini genuinely treats a
+	// nullable field as optional and may omit the key entirely, but WRONG
+	// for Structured Outputs' responseSchema (addPlaceholder==false):
+	// JSON Schema's "required" means "the key must be present", entirely
+	// independent of "nullable" (the key's VALUE may be null) — Pydantic/
+	// Zod validators on the client enforce exactly that distinction and
+	// reject a response missing a key it declared required, even if null
+	// would have been an acceptable value for it.
+	if addPlaceholder {
+		for objectPath, fields := range nullableFields {
+			reqPath := joinPath(objectPath, "required")
+			req := gjson.Get(jsonStr, reqPath)
+			if !req.IsArray() {
+				continue
 			}
-		}
 
-		if len(filtered) == 0 {
-			jsonStr, _ = sjson.Delete(jsonStr, reqPath)
-		} else {
-			jsonStr, _ = sjson.Set(jsonStr, reqPath, filtered)
+			var filtered []string
+			for _, r := range req.Array() {
+				if !contains(fields, r.String()) {
+					filtered = append(filtered, r.String())
+				}
+			}
+
+			if len(filtered) == 0 {
+				jsonStr, _ = sjson.Delete(jsonStr, reqPath)
+			} else {
+				jsonStr, _ = sjson.Set(jsonStr, reqPath, filtered)
+			}
 		}
 	}
 	return jsonStr
@@ -1806,6 +1992,31 @@ func removeUnsupportedKeywords(jsonStr string) string {
 		// upstream.
 		"title",
 	)
+
+	// A Round 15 audit caught that "title" was deleted below with no trace
+	// at all — unlike every other unsupported keyword here, which either
+	// degrades to a description hint (moveConstraintsToDescription) or is
+	// a pure structural artifact safe to drop silently ($schema, $ref,
+	// ...). Pydantic/TypeBox-generated MCP tool schemas routinely put the
+	// parameter's actual human-readable description in "title" (e.g.
+	// {"title": "User ID", "type": "string"} with no separate
+	// "description" at all), so deleting it outright left Gemini with zero
+	// semantic information about what the parameter means. Copy it into
+	// "description" first whenever the latter is empty or absent.
+	for _, p := range findPaths(jsonStr, "title") {
+		parentPath := trimSuffix(p, ".title")
+		if isPropertyDefinition(parentPath) {
+			continue
+		}
+		titleVal := gjson.Get(jsonStr, p).String()
+		if titleVal == "" {
+			continue
+		}
+		descPath := joinPath(parentPath, "description")
+		if existing := gjson.Get(jsonStr, descPath).String(); existing == "" {
+			jsonStr, _ = sjson.Set(jsonStr, descPath, titleVal)
+		}
+	}
 
 	deletePaths := make([]string, 0)
 	pathsByField := findPathsByFields(jsonStr, keywords)
@@ -1877,6 +2088,15 @@ func cleanupRequiredFields(jsonStr string) string {
 		req := gjson.Get(jsonStr, p)
 		props := gjson.Get(jsonStr, propsPath)
 		if !req.IsArray() {
+			// A Round 15 audit caught that a non-array "required" (e.g. a
+			// malformed MCP schema emitting "required": true) just skipped
+			// this loop iteration, leaving the invalid value in place.
+			// Gemini's protobuf Schema declares "required" as
+			// repeated string — an unmarshal of a bare boolean/object/
+			// number there fails outright, not just a semantic mismatch.
+			// Delete it; a malformed required list is strictly worse than
+			// no required list at all.
+			jsonStr, _ = sjson.Delete(jsonStr, p)
 			continue
 		}
 		if !props.IsObject() {
@@ -2222,6 +2442,45 @@ func Walk(value gjson.Result, path string, targetKey string, paths *[]string) {
 // of them (flattenAnyOfOneOf, which runs right after this in Phase 2,
 // collapses that down further) — far closer to the original intent than an
 // empty items.
+// convertDraft7TuplesToItems rewrites Draft-7-style tuple validation
+// ("items": [schemaA, schemaB, ...], the array form that predates
+// "prefixItems") into the exact same {"oneOf": [...]} shape
+// convertPrefixItemsToItems already produces for its Draft 2020-12
+// equivalent, before anything downstream (flattenAnyOfOneOf, which
+// collapses that oneOf the same way either form needs) ever runs.
+//
+// A Round 15 audit caught that without this, a Draft-7 tuple survived
+// untouched all the way to addMissingArrayItems in Phase 3, which just
+// took the FIRST element's schema and threw the rest away into a lossy
+// "Tuple items: [...]" text hint — losing every type past the first for
+// Gemini's actual argument-type coercion (recordNumericEnumFields and
+// convertEnumValuesToStrings never saw elements 1..N at all). Running
+// this in Phase 1, alongside its prefixItems sibling, means both tuple
+// forms flow through the identical, already-tested oneOf-collapse path.
+func convertDraft7TuplesToItems(jsonStr string) string {
+	for _, p := range findPaths(jsonStr, "items") {
+		arr := gjson.Get(jsonStr, p)
+		if !arr.IsArray() || len(arr.Array()) == 0 {
+			continue
+		}
+		items := arr.Array()
+		if len(items) == 1 {
+			jsonStr, _ = sjson.SetRaw(jsonStr, p, items[0].Raw)
+			continue
+		}
+		oneOf := "["
+		for i, it := range items {
+			if i > 0 {
+				oneOf += ","
+			}
+			oneOf += it.Raw
+		}
+		oneOf += "]"
+		jsonStr, _ = sjson.SetRaw(jsonStr, p, `{"oneOf":`+oneOf+`}`)
+	}
+	return jsonStr
+}
+
 func convertPrefixItemsToItems(jsonStr string) string {
 	for _, p := range findPaths(jsonStr, "prefixItems") {
 		arr := gjson.Get(jsonStr, p)

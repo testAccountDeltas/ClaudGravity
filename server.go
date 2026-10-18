@@ -139,7 +139,7 @@ func commonAPIMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", "*")
-		h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE, PUT")
+		h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE, PUT, PATCH")
 		// An audit caught that the many small CLI control-endpoint
 		// handlers (settings, metrics_enabled, telemetry, bootstrap,
 		// policy_limits, ...) never set anthropic-organization-id the
@@ -148,6 +148,12 @@ func commonAPIMiddleware(next http.Handler) http.Handler {
 		// (all interceptedMux/MITM-routed registrations) instead of
 		// repeating it in each individual handler closure.
 		h.Set("anthropic-organization-id", fakeOrgID)
+		// A Round 15 audit caught anthropic-workspace-id was declared in
+		// Access-Control-Expose-Headers below (so a browser client is
+		// allowed to read it) but never actually set by this shared
+		// middleware — only a handful of individual response paths set it
+		// directly. Every endpoint routed through here now gets it too.
+		h.Set("anthropic-workspace-id", fakeWorkspaceID)
 		// An audit caught anthropic-dangerous-direct-browser-access missing
 		// here — the official Anthropic SDKs send this REQUEST header
 		// specifically to opt into being called directly from a browser
@@ -642,7 +648,12 @@ func main() {
 		// just "organizations" — a strict client reading memberships to
 		// determine org membership saw an empty/missing list and
 		// concluded the user belongs to no organization at all.
-		_, _ = w.Write([]byte(`{"uuid":"` + fakeAccountID + `","email":"user@claudgravity.local","organizations":[{"uuid":"` + fakeOrgID + `","name":"ClaudGravity Workspace"}],"memberships":[{"organization":{"uuid":"` + fakeOrgID + `","name":"ClaudGravity Workspace"},"role":"admin"}]}`))
+		// A Round 15 audit caught the membership object itself was missing
+		// its own "uuid" and "organization_uuid" fields — a strict client
+		// reading those directly off the membership (not just nested under
+		// "organization") saw them as empty/missing and failed its own
+		// organization-membership validation.
+		_, _ = w.Write([]byte(`{"uuid":"` + fakeAccountID + `","email":"user@claudgravity.local","organizations":[{"uuid":"` + fakeOrgID + `","name":"ClaudGravity Workspace"}],"memberships":[{"uuid":"` + fakeOrgID + `-member","organization_uuid":"` + fakeOrgID + `","organization":{"uuid":"` + fakeOrgID + `","name":"ClaudGravity Workspace"},"role":"admin"}]}`))
 	}
 	handleBillingJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -710,6 +721,10 @@ func main() {
 	mux.HandleFunc("/api/oauth/profile", handleProfileJSON)
 	mux.HandleFunc("/api/oauth/validate", handleValidateJSON)
 	mux.HandleFunc("/api/claude_code/organizations/metrics_enabled", handleMetricsJSON)
+	// A Round 15 audit caught the real CLI request is parameterized by org
+	// UUID — "/api/claude_code/organizations/{id}/metrics_enabled" — same
+	// Go 1.22+ ServeMux exact-segment-count gap as claude_code_first_token_date above.
+	mux.HandleFunc("/api/claude_code/organizations/{id}/metrics_enabled", handleMetricsJSON)
 	mux.HandleFunc("/api/claude_code/settings", handleSettingsJSON)
 	mux.HandleFunc("/managed/settings", handleSettingsJSON)
 	mux.HandleFunc("/api/event_logging/", handleTelemetryJSON)
@@ -725,6 +740,12 @@ func main() {
 	// just above, reusing the same handler.
 	mux.HandleFunc("/api/claude_code/telemetry", handleTelemetryJSON)
 	mux.HandleFunc("/api/claude_code/crash_reports", handleTelemetryJSON)
+	// A Round 15 audit caught some telemetry/crash-report clients send a
+	// trailing slash (same convention "/api/telemetry/" above already
+	// handles) — Go's ServeMux treats a trailing-slash path as a
+	// genuinely different, non-matching pattern from the bare one.
+	mux.HandleFunc("/api/claude_code/telemetry/", handleTelemetryJSON)
+	mux.HandleFunc("/api/claude_code/crash_reports/", handleTelemetryJSON)
 	mux.HandleFunc("/api/organizations", handleOrganizationsListJSON)
 	mux.HandleFunc("/api/organizations/", handleOrganizationsListJSON)
 	mux.HandleFunc("/api/organizations/current", handleOrganizationsCurrentJSON)
@@ -745,7 +766,20 @@ func main() {
 	// registered — some CLI versions request the plural
 	// "organizations" form instead.
 	mux.HandleFunc("/api/organizations/claude_code_first_token_date", handleFirstTokenDateJSON)
+	// A Round 15 audit caught that the real CLI request is parameterized
+	// by org UUID — "/api/organizations/{id}/claude_code_first_token_date"
+	// — which Go 1.22+'s ServeMux (same pattern convention used just above
+	// for {id}/billing etc.) treats as a distinct, non-matching path from
+	// the bare collection route, 401ing instead of 404ing cleanly.
+	mux.HandleFunc("/api/organizations/{id}/claude_code_first_token_date", handleFirstTokenDateJSON)
 	mux.HandleFunc("/api/claude_code/notification/preferences", handleNotificationPreferencesJSON)
+	// A Round 15 audit caught these only matched Claude Code's own
+	// "/oauth/"-prefixed convention — some CLI versions instead query
+	// "/api/account/settings" / "/api/account/grove_notice_viewed" with
+	// no "/oauth/" segment at all, 401ing against this gateway's own
+	// Basic Auth check instead of reaching either handler.
+	mux.HandleFunc("/api/account/settings", handleOAuthAccountSettingsJSON)
+	mux.HandleFunc("/api/account/grove_notice_viewed", handleGroveNoticeViewedJSON)
 	mux.HandleFunc("/api/oauth/account/settings", handleOAuthAccountSettingsJSON)
 	mux.HandleFunc("/api/oauth/account/grove_notice_viewed", handleGroveNoticeViewedJSON)
 	mux.HandleFunc("/v1/messages/cache_touch", handleCacheTouchJSON)
@@ -827,6 +861,7 @@ func main() {
 	interceptedMux.Handle("/api/oauth/profile", commonAPIMiddleware(http.HandlerFunc(handleProfileJSON)))
 	interceptedMux.Handle("/api/oauth/validate", commonAPIMiddleware(http.HandlerFunc(handleValidateJSON)))
 	interceptedMux.Handle("/api/claude_code/organizations/metrics_enabled", commonAPIMiddleware(http.HandlerFunc(handleMetricsJSON)))
+	interceptedMux.Handle("/api/claude_code/organizations/{id}/metrics_enabled", commonAPIMiddleware(http.HandlerFunc(handleMetricsJSON)))
 	interceptedMux.Handle("/api/claude_code/settings", commonAPIMiddleware(http.HandlerFunc(handleSettingsJSON)))
 	interceptedMux.Handle("/managed/settings", commonAPIMiddleware(http.HandlerFunc(handleSettingsJSON)))
 	// Same CLI management/telemetry endpoints added to the plain mux
@@ -836,6 +871,8 @@ func main() {
 	interceptedMux.Handle("/api/telemetry/", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
 	interceptedMux.Handle("/api/claude_code/telemetry", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
 	interceptedMux.Handle("/api/claude_code/crash_reports", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
+	interceptedMux.Handle("/api/claude_code/telemetry/", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
+	interceptedMux.Handle("/api/claude_code/crash_reports/", commonAPIMiddleware(http.HandlerFunc(handleTelemetryJSON)))
 	interceptedMux.Handle("/api/organizations", commonAPIMiddleware(http.HandlerFunc(handleOrganizationsListJSON)))
 	interceptedMux.Handle("/api/organizations/", commonAPIMiddleware(http.HandlerFunc(handleOrganizationsListJSON)))
 	interceptedMux.Handle("/api/organizations/current", commonAPIMiddleware(http.HandlerFunc(handleOrganizationsCurrentJSON)))
@@ -852,7 +889,10 @@ func main() {
 	interceptedMux.Handle("/api/claude_code/policy_limits", commonAPIMiddleware(http.HandlerFunc(handlePolicyLimitsJSON)))
 	interceptedMux.Handle("/api/organization/claude_code_first_token_date", commonAPIMiddleware(http.HandlerFunc(handleFirstTokenDateJSON)))
 	interceptedMux.Handle("/api/organizations/claude_code_first_token_date", commonAPIMiddleware(http.HandlerFunc(handleFirstTokenDateJSON)))
+	interceptedMux.Handle("/api/organizations/{id}/claude_code_first_token_date", commonAPIMiddleware(http.HandlerFunc(handleFirstTokenDateJSON)))
 	interceptedMux.Handle("/api/claude_code/notification/preferences", commonAPIMiddleware(http.HandlerFunc(handleNotificationPreferencesJSON)))
+	interceptedMux.Handle("/api/account/settings", commonAPIMiddleware(http.HandlerFunc(handleOAuthAccountSettingsJSON)))
+	interceptedMux.Handle("/api/account/grove_notice_viewed", commonAPIMiddleware(http.HandlerFunc(handleGroveNoticeViewedJSON)))
 	interceptedMux.Handle("/api/oauth/account/settings", commonAPIMiddleware(http.HandlerFunc(handleOAuthAccountSettingsJSON)))
 	interceptedMux.Handle("/api/oauth/account/grove_notice_viewed", commonAPIMiddleware(http.HandlerFunc(handleGroveNoticeViewedJSON)))
 	interceptedMux.Handle("/v1/messages/cache_touch", commonAPIMiddleware(http.HandlerFunc(handleCacheTouchJSON)))
@@ -1324,6 +1364,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	excludedAccounts := make(map[string]bool)
 	var lastErr error
 	var lastStatus int = http.StatusBadGateway
+	var success bool
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		var activeAcc *AccountRecord
@@ -1471,7 +1512,7 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		// the rest of the conversation instead of just the first one.
 		bump := getSessionBump(antigravitySessionKey)
 		bumpsThisAttempt := 0
-		var success bool
+		success = false
 		for {
 			upstreamURL := directURL
 			if isAntigravity {
@@ -1497,11 +1538,27 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 				finalPayload = stripThoughtFieldsForPublicAPI(geminiBody)
 			}
 
+			// A Round 15 audit caught that the earlier totalInlineDataBytes
+			// check (above, before this retry loop) only ever sums base64
+			// image/document bytes — real, but not the only way to blow
+			// past Gemini's real ~20MB request-body ceiling. A long
+			// conversation history's own JSON (thousands of turns, each
+			// under the inline-data check's radar) plus this payload's own
+			// Protobuf/JSON wrapping overhead can still push the FINAL
+			// wire body over the limit even when every individual image
+			// passed. Catch it here, on the actual bytes about to be sent,
+			// with a clean 413 instead of letting Google's own upstream
+			// reject it as a confusing 500/502.
+			if len(finalPayload) > maxInlineDataBytes {
+				writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds the 20MB upstream limit")
+				return
+			}
+
 			LogGateway("[#%d] >> POST /v1/messages [attempt %d/%d, session-gen %d] key=%s account=%s model=%s thinkBudget=%d stream=%v bytes=%d [%s]",
 				rid, attempt+1, maxAttempts, bump, tenant.Name, accLabel, modelName, budget, isStreaming, len(geminiBody), agentKey)
 
 			if isStreaming {
-				success, lastStatus, lastErr = executeStreamingWithWatchdog(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes, syntheticReasonTools, reverseToolNameMap)
+				success, lastStatus, lastErr = executeStreamingWithWatchdog(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, flusher, bodyBytes, syntheticReasonTools, reverseToolNameMap, prefillText)
 			} else {
 				success, lastStatus, lastErr = executeNonStreaming(r.Context(), rid, t0, activeAcc, clientKey, accLabel, sessionID, tenant, googleToken, isAntigravity, serverCfg, upstreamURL, finalPayload, modelName, agentKey, agentType, subagentName, instanceID, wasShrunk, hasSafeguards, w, bodyBytes, syntheticReasonTools, reverseToolNameMap, prefillText)
 			}
@@ -1651,8 +1708,17 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 		time.Sleep(100 * time.Millisecond) // brief jitter before retry
 	}
 
-	// If all attempts failed and nothing was sent yet
-	if lastErr != nil {
+	// A Round 15 audit caught that this only checked lastErr, not success —
+	// every success==true return path above (see the comment on `if
+	// success {` further up) has already fully written a response to w,
+	// including the panic-watchdog's own "event: error" SSE frame on a
+	// post-headers upstream failure, which still leaves lastErr non-nil
+	// for logging purposes. Calling writeAnthropicError here on top of an
+	// already-committed response caused "superfluous response.WriteHeader"
+	// and appended a second, raw JSON error body into the open SSE socket,
+	// breaking Anthropic SDK stream parsers. Only write the error here if
+	// nothing was ever sent to the client.
+	if !success && lastErr != nil {
 		LogGateway("[#%d] !! All pre-stream failover attempts failed: %v", rid, lastErr)
 		writeAnthropicError(w, lastStatus, anthropicErrorTypeForStatus(lastStatus), fmt.Sprintf("Upstream failed after retries: %v", lastErr))
 	}
@@ -1711,11 +1777,16 @@ func hasAssistantTurns(claudeBody []byte) bool {
 // sse.go's FinishStream) fired unconditionally whenever cache_read was zero
 // and the prompt was large, regardless of whether the request ever set a
 // cache_control breakpoint at all. A plain substring check is deliberately
-// used instead of walking the full JSON structure: "cache_control" is
-// specific enough that a false positive is practically impossible, and this
-// runs on every request.
+// used instead of walking the full JSON structure: "cache_control" (with
+// its quotes, a JSON-key shape, not the bare word) is specific enough that
+// a false positive is practically impossible, and this runs on every
+// request. A Round 15 audit suggested also requiring "ephemeral" — free to
+// add since "ephemeral" is the only type Anthropic's spec defines for this
+// block, so every genuine breakpoint already contains both substrings; this
+// only tightens the already-narrow theoretical false-positive case (e.g. a
+// user pasting a JSON snippet that quotes the key but not its value).
 func hasCacheControlBreakpoint(claudeBody []byte) bool {
-	return bytes.Contains(claudeBody, []byte(`"cache_control"`))
+	return bytes.Contains(claudeBody, []byte(`"cache_control"`)) && bytes.Contains(claudeBody, []byte(`"ephemeral"`))
 }
 
 // cacheCreationThreshold returns the minimum uncached-prompt size (tokens)
@@ -1749,9 +1820,21 @@ func cacheCreationThreshold(claudeModelName string) int64 {
 // coarse, but far closer than treating it as 100% either way.
 func cacheBreakpointPrefixFraction(claudeBody []byte) float64 {
 	idx := bytes.LastIndex(claudeBody, []byte(`"cache_control"`))
-	if idx <= 0 || len(claudeBody) == 0 {
-		return 1.0
+	// A Round 15 audit caught that "not found at all" (idx<0) returned 1.0
+	// — the worst-case "100% is cache_creation" guess — when the honest
+	// answer for "there's no breakpoint" is 0.0, no simulated cache
+	// behavior at all. Currently unreachable in practice (both call sites
+	// already gate on hasCacheControlBreakpoint finding one first), but
+	// matches this function's own documented contract and guards a future
+	// caller that doesn't gate the same way.
+	if idx < 0 || len(claudeBody) == 0 {
+		return 0.0
 	}
+	// idx==0 needs no special case: it falls through to the normal
+	// fraction below like any other position, which correctly yields
+	// ~0.0 (the breakpoint sits at the very start, so ~0% of the body
+	// precedes it) — the original bug conflated this with "not found"
+	// and returned 1.0 for both, even though they're opposite cases.
 	frac := float64(idx) / float64(len(claudeBody))
 	if frac < 0 {
 		return 0
@@ -1803,6 +1886,7 @@ func executeStreamingWithWatchdog(
 	claudeBodyBytes []byte,
 	syntheticReasonTools map[string]bool,
 	reverseToolNameMap map[string]string,
+	prefillText string,
 ) (bool, int, error) {
 	panicTimeout := time.Duration(serverCfg.PanicTimeoutSeconds) * time.Second
 	ttftTimeout := time.Duration(serverCfg.TTFTTimeoutSeconds) * time.Second
@@ -2127,7 +2211,7 @@ UpstreamReady:
 			}
 		}
 	}
-	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior, cachePrefixFrac, wantsSingleToolUse(claudeBodyBytes), reverseToolNameMap, stopSequences)
+	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior, cachePrefixFrac, wantsSingleToolUse(claudeBodyBytes), reverseToolNameMap, stopSequences, prefillText)
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	if err != nil {
@@ -2869,10 +2953,17 @@ func executeNonStreaming(
 	// prefill (e.g. constraining JSON output with a literal "{") got
 	// Gemini's completion alone and failed to parse it.
 	if prefillText != "" {
-		if contentBlocks, ok := claudeResp["content"].([]map[string]interface{}); ok && len(contentBlocks) > 0 {
-			if firstText, ok := contentBlocks[0]["type"].(string); ok && firstText == "text" {
-				if existing, ok := contentBlocks[0]["text"].(string); ok && !strings.HasPrefix(existing, prefillText) {
-					contentBlocks[0]["text"] = prefillText + existing
+		// A Round 15 audit caught this only ever looked at contentBlocks[0]
+		// — when extended thinking is on, that index is the "thinking"
+		// block and the real "text" block sits at index 1+, so the prefill
+		// silently never got re-attached whenever thinking was enabled.
+		if contentBlocks, ok := claudeResp["content"].([]map[string]interface{}); ok {
+			for _, b := range contentBlocks {
+				if t, ok := b["type"].(string); ok && t == "text" {
+					if existing, ok := b["text"].(string); ok && !strings.HasPrefix(existing, prefillText) {
+						b["text"] = prefillText + existing
+					}
+					break
 				}
 			}
 		}
@@ -3185,6 +3276,21 @@ func isNative3PModelExhausted(acc *AccountRecord) bool {
 	return len(acc.Quotas) > 0
 }
 
+// isFiveHourWindow and isWeeklyWindow recognize CloudCode's quota-window
+// name regardless of separator style. A Round 15 audit caught the plain
+// strings.Contains(win, "5h") check (repeated three times below) missed
+// "5_hour"/"5-hour" — there's no contiguous "5h" substring in either, so an
+// account whose quota JSON happens to use underscore/hyphen separators lost
+// its 5-hour bucket match entirely and fell back to the synthetic-quota
+// display. Same gap for "week" never matching "7d"/"7_day"/"7-day".
+func isFiveHourWindow(win string) bool {
+	return strings.Contains(win, "5h") || strings.Contains(win, "5_h") || strings.Contains(win, "5-h") || strings.Contains(win, "18000")
+}
+
+func isWeeklyWindow(win string) bool {
+	return strings.Contains(win, "week") || strings.Contains(win, "7d") || strings.Contains(win, "7_d") || strings.Contains(win, "7-d")
+}
+
 func pickFiveHourAndWeekly(acc *AccountRecord, modelName string) (fiveHour, weekly *QuotaBucket) {
 	if acc == nil || len(acc.Quotas) == 0 {
 		return nil, nil
@@ -3201,9 +3307,9 @@ func pickFiveHourAndWeekly(acc *AccountRecord, modelName string) (fiveHour, week
 			for i := range g.Buckets {
 				b := &g.Buckets[i]
 				win := strings.ToLower(b.Window)
-				if strings.Contains(win, "5h") {
+				if isFiveHourWindow(win) {
 					fiveHour = b
-				} else if strings.Contains(win, "week") {
+				} else if isWeeklyWindow(win) {
 					weekly = b
 				}
 			}
@@ -3219,9 +3325,9 @@ func pickFiveHourAndWeekly(acc *AccountRecord, modelName string) (fiveHour, week
 			for i := range g.Buckets {
 				b := &g.Buckets[i]
 				win := strings.ToLower(b.Window)
-				if strings.Contains(win, "5h") {
+				if isFiveHourWindow(win) {
 					fiveHour = b
-				} else if strings.Contains(win, "week") {
+				} else if isWeeklyWindow(win) {
 					weekly = b
 				}
 			}
@@ -3236,9 +3342,9 @@ func pickFiveHourAndWeekly(acc *AccountRecord, modelName string) (fiveHour, week
 		for i := range g.Buckets {
 			b := &g.Buckets[i]
 			win := strings.ToLower(b.Window)
-			if strings.Contains(win, "5h") {
+			if isFiveHourWindow(win) {
 				fiveHour = b
-			} else if strings.Contains(win, "week") {
+			} else if isWeeklyWindow(win) {
 				weekly = b
 			}
 		}
@@ -3441,8 +3547,14 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 	}
 
 	// Whichever window is currently more exhausted is "representative".
+	// A Round 15 audit caught this used >= while the /usage JSON body's
+	// own is_active flag (further down in this file, same bucket-fraction
+	// comparison) uses fiveHourFrac >= weeklyFrac to decide the OPPOSITE
+	// tie-break — on an exact tie, the header said "seven_day" while the
+	// JSON body marked five_hour as is_active:true, desyncing the UI.
+	// Strict > keeps this consistent with that is_active logic.
 	claim, topStatus, topReset := "five_hour", status(fiveHourFrac), fiveHourReset
-	if weeklyBucket != nil && weeklyFrac >= fiveHourFrac {
+	if weeklyBucket != nil && weeklyFrac > fiveHourFrac {
 		claim, topStatus, topReset = "seven_day", status(weeklyFrac), weeklyReset
 	}
 	header.Set("anthropic-ratelimit-unified-status", topStatus)

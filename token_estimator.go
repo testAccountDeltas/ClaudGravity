@@ -7,6 +7,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"math"
 	"regexp"
 	"strconv"
@@ -52,10 +53,24 @@ func estimateImageTokens(b64Data string) int {
 	// large image (a multi-MB screenshot) at all.
 	cleaned := stripBase64Whitespace(stripDataURIPrefix(b64Data))
 	cfg, _, err := image.DecodeConfig(base64.NewDecoder(base64.StdEncoding, strings.NewReader(cleaned)))
-	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
-		return anthropicImageTokenFloor
+	var width, height int
+	if err == nil && cfg.Width > 0 && cfg.Height > 0 {
+		width, height = cfg.Width, cfg.Height
+	} else {
+		// A Round 15 audit caught that Go's stdlib image package has no
+		// built-in WebP decoder (no golang.org/x/image/webp import, by
+		// design — not worth a new dependency for this), so
+		// image.DecodeConfig always fails on a WebP image and every one
+		// fell back to the flat 1600-token floor regardless of its real
+		// size — a 32x32 icon and a 4K WebP screenshot billed identically.
+		// Parse just the 30-byte RIFF/WebP header by hand instead.
+		if w, h, ok := decodeWebPDimensions(cleaned); ok {
+			width, height = w, h
+		} else {
+			return anthropicImageTokenFloor
+		}
 	}
-	w, h := float64(cfg.Width), float64(cfg.Height)
+	w, h := float64(width), float64(height)
 	if maxSide := math.Max(w, h); maxSide > anthropicImageMaxSide {
 		scale := anthropicImageMaxSide / maxSide
 		w *= scale
@@ -66,6 +81,49 @@ func estimateImageTokens(b64Data string) int {
 		tokens = 1
 	}
 	return tokens
+}
+
+// decodeWebPDimensions hand-parses just enough of a WebP file's RIFF
+// container to read its pixel dimensions, covering all three real payload
+// shapes (simple lossy VP8, lossless VP8L, and the extended VP8X container
+// used for alpha/animation) per Google's documented WebP container format.
+// Decodes only the first 30 bytes of base64 — never the full image.
+func decodeWebPDimensions(b64Data string) (width, height int, ok bool) {
+	buf := make([]byte, 30)
+	n, _ := io.ReadFull(base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64Data)), buf)
+	if n < 30 {
+		return 0, 0, false
+	}
+	if string(buf[0:4]) != "RIFF" || string(buf[8:12]) != "WEBP" {
+		return 0, 0, false
+	}
+	fourCC := string(buf[12:16])
+	payload := buf[20:]
+	switch fourCC {
+	case "VP8 ": // simple lossy: 3-byte frame tag, 3-byte start code, then 14-bit W/H
+		if len(payload) < 10 || payload[3] != 0x9d || payload[4] != 0x01 || payload[5] != 0x2a {
+			return 0, 0, false
+		}
+		w := int(payload[6]) | int(payload[7]&0x3f)<<8
+		h := int(payload[8]) | int(payload[9]&0x3f)<<8
+		return w, h, w > 0 && h > 0
+	case "VP8L": // lossless: 1-byte signature 0x2f, then a packed 32-bit LE field
+		if len(payload) < 5 || payload[0] != 0x2f {
+			return 0, 0, false
+		}
+		val := uint32(payload[1]) | uint32(payload[2])<<8 | uint32(payload[3])<<16 | uint32(payload[4])<<24
+		w := int(val&0x3FFF) + 1
+		h := int((val>>14)&0x3FFF) + 1
+		return w, h, true
+	case "VP8X": // extended container: 1 flags byte, 3 reserved, then 24-bit W-1/H-1
+		if len(payload) < 10 {
+			return 0, 0, false
+		}
+		w := int(payload[4]) | int(payload[5])<<8 | int(payload[6])<<16
+		h := int(payload[7]) | int(payload[8])<<8 | int(payload[9])<<16
+		return w + 1, h + 1, true
+	}
+	return 0, 0, false
 }
 
 // pdfPageCountPattern looks for an uncompressed PDF page-tree's /Count key
@@ -79,7 +137,19 @@ func estimateImageTokens(b64Data string) int {
 // directly readable in the raw bytes — verified against a real exim: see
 // git history for the test that validated the regex against a
 // constructed, syntactically valid uncompressed PDF.
-var pdfPageCountPattern = regexp.MustCompile(`/Count\s+(\d+)`)
+// A Round 15 audit caught that the unanchored /Count\s+(\d+) pattern below
+// matches the FIRST /Count it finds anywhere in the raw bytes — a PDF with
+// a document outline (table of contents / bookmarks) declares its own
+// "/Type /Outlines /Count N" dict, which commonly appears before the real
+// page tree's "/Type /Pages /Count N" in the byte stream, and N there is
+// the outline's own entry count (often 1), not the page count. A 100-page
+// PDF with one top-level bookmark entry was estimated at 258 tokens
+// instead of 25,800 — a 100x undercount that let TruncateConversationToFit
+// treat the request as tiny and pass it straight to Google, which then
+// rejected it for genuinely exceeding the context window. Anchoring to
+// "/Type /Pages" specifically (allowing either key order within a
+// reasonable window) avoids matching the outline's unrelated /Count.
+var pdfPageCountPattern = regexp.MustCompile(`/Type\s*/Pages[\s\S]{0,250}?/Count\s+(\d+)`)
 
 // geminiPDFTokensPerPage is Gemini's real documented flat per-page PDF
 // billing, independent of how text-dense or image-dense that page is —
@@ -106,15 +176,27 @@ func estimatePDFTokensFromPageCount(b64Data string) (int, bool) {
 	if err != nil || len(raw) == 0 {
 		return 0, false
 	}
-	m := pdfPageCountPattern.FindSubmatch(raw)
-	if m == nil {
+	matches := pdfPageCountPattern.FindAllSubmatch(raw, -1)
+	if matches == nil {
 		return 0, false
 	}
-	pages, err := strconv.Atoi(string(m[1]))
-	if err != nil || pages <= 0 {
+	// A nested/intermediate /Pages node (a PDF can have a tree of them, not
+	// just one flat root) carries its own smaller subtree /Count — take the
+	// largest match found, which is always the root's total page count.
+	maxPages := 0
+	for _, m := range matches {
+		pages, err := strconv.Atoi(string(m[1]))
+		if err != nil || pages <= 0 {
+			continue
+		}
+		if pages > maxPages {
+			maxPages = pages
+		}
+	}
+	if maxPages == 0 {
 		return 0, false
 	}
-	return pages * geminiPDFTokensPerPage, true
+	return maxPages * geminiPDFTokensPerPage, true
 }
 
 // estimateContentSourceText extracts the real text from a document block
@@ -313,7 +395,35 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 							rc.ForEach(func(_, item gjson.Result) bool {
 								switch item.Get("type").String() {
 								case "image":
-									total += estimateImageTokens(item.Get("source.data").String())
+									srcType := item.Get("source.type").String()
+									switch {
+									case srcType == "url":
+										// A Round 15 audit caught this fell straight to
+										// estimateImageTokens's flat 1600-token floor (source.data
+										// is empty for a url source) — translator.go never
+										// fetches the URL, it substitutes a short
+										// "[Attached by URL: <url>]" text placeholder instead, so
+										// the honest cost scales with that string's length.
+										if u := item.Get("source.url").String(); u != "" {
+											total += estimateApproxTokens("[Attached by URL: " + u + "]")
+										} else {
+											total += estimateApproxTokens("[Attached by URL: ]")
+										}
+									case strings.ToLower(item.Get("source.media_type").String()) == "image/svg+xml":
+										// A Round 15 audit caught this never checked media_type
+										// the way the "document" branch below already does for
+										// the identical shape — an SVG sent as an "image" block
+										// is XML TEXT (Gemini's inlineData can't take SVG, so
+										// translator.go sends it as text instead), not a raster
+										// image; image.DecodeConfig can't parse XML and this fell
+										// to the flat 1600-token floor regardless of real size, so
+										// a 200KB SVG (~50,000 real tokens of markup) was priced
+										// 30x too low.
+										dataStr := item.Get("source.data").String()
+										total += len(dataStr) * 3 / 4 / 2
+									default:
+										total += estimateImageTokens(item.Get("source.data").String())
+									}
 								case "document":
 									src := item.Get("source")
 									if src.Get("type").String() == "base64" {
@@ -391,10 +501,32 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 										total += estimateApproxTokens(src.Get("data").String())
 									}
 								default:
-									total += estimateApproxTokens(item.Get("text").String())
+									// A Round 15 audit caught that a bare
+									// string array element (content as
+									// ["line 1\n", "line 2\n"], not typed
+									// blocks) has no "type"/"text" key at
+									// all — item.Get("text") on a plain
+									// string scalar returns empty, scoring
+									// it 0 tokens and silently undercounting
+									// a 100KB tool output entirely.
+									if item.Type == gjson.String {
+										total += estimateApproxTokens(item.String())
+									} else {
+										total += estimateApproxTokens(item.Get("text").String())
+									}
 								}
 								return true
 							})
+						} else if rc.Exists() {
+							// A Round 15 audit caught that a tool_result's
+							// content given as a bare JSON OBJECT (neither
+							// a string nor an array — e.g. a tool
+							// returning structured {"text": "...", ...}
+							// directly) matched neither branch above and
+							// fell straight through to scoring 0 tokens.
+							// Price its raw JSON the same conservative way
+							// a single untyped content block is priced.
+							total += estimateApproxTokens(rc.Raw)
 						}
 					case "image":
 						// An audit cross-referenced Anthropic's own documented
@@ -445,9 +577,16 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 							total += estimateApproxTokens(src.Get("data").String())
 						}
 					case "redacted_thinking":
-						if isLastAssistant {
-							total += estimateApproxTokens(part.Get("data").String())
-						}
+						// A Round 15 audit caught this priced the full raw
+						// encrypted "data" blob (can run tens of thousands
+						// of characters) instead of the fixed 26-byte
+						// "[Prior reasoning redacted]" placeholder
+						// translator.go always substitutes before this
+						// ever reaches Gemini — on every turn, not just the
+						// most recent one (unlike real "thinking", which
+						// the isLastAssistant gate correctly protects for
+						// the thought-signature validator's sake).
+						total += estimateApproxTokens("[Prior reasoning redacted]")
 					}
 					return true
 				})
@@ -461,7 +600,22 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 		tools.ForEach(func(_, t gjson.Result) bool {
 			total += estimateApproxTokens(t.Get("name").String())
 			total += estimateApproxTokens(t.Get("description").String())
-			total += estimateApproxTokens(t.Get("input_schema").Raw)
+			rawSchema := t.Get("input_schema").Raw
+			// A Round 15 audit caught this priced input_schema as-is —
+			// Anthropic's server-side built-in tools (bash_20250124,
+			// text_editor_20250728, computer_20250124, ...) are declared
+			// by the client with NO input_schema at all (translator.go's
+			// builtinAnthropicToolSchema already knows this and injects
+			// the real reference schema before ever building the Gemini
+			// payload), so every one of these scored 0 extra tokens here
+			// even though Anthropic's own server fills in and bills for a
+			// real ~150-token parameter schema underneath.
+			if strings.TrimSpace(rawSchema) == "" || rawSchema == "null" || rawSchema == "{}" {
+				if builtin, ok := builtinAnthropicToolSchema(t.Get("type").String()); ok {
+					rawSchema = builtin
+				}
+			}
+			total += estimateApproxTokens(rawSchema)
 			return true
 		})
 	}

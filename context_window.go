@@ -120,7 +120,7 @@ func contentSourceTextFromBlockMap(content interface{}) string {
 
 func blockTokenEstimate(bMap map[string]interface{}, isLastAssistant bool) int {
 	switch bMap["type"] {
-	case "thinking", "redacted_thinking":
+	case "thinking":
 		// An audit caught that this fell through to the default
 		// flat-len/2 case, pricing the FULL text of every historical
 		// thinking block into the truncation budget — up to 80-100k
@@ -137,6 +137,19 @@ func blockTokenEstimate(bMap map[string]interface{}, isLastAssistant bool) int {
 			return 0
 		}
 		return flatTokenEstimate(bMap)
+	case "redacted_thinking":
+		// A Round 15 audit caught this shared the "thinking" branch above,
+		// pricing flatTokenEstimate(bMap) — the ENTIRE block, including
+		// "data", which holds the real encrypted blob (verified: this can
+		// run tens of thousands of characters). translator.go (just above
+		// in this file's sibling) ALWAYS replaces redacted_thinking with
+		// the fixed 26-byte "[Prior reasoning redacted]" placeholder
+		// before it ever reaches Gemini, on every turn, not just the most
+		// recent one — unlike real "thinking", there's no thought-
+		// signature validator requirement keeping the latest one alive in
+		// its original form. Price the fixed placeholder's real size,
+		// always, regardless of isLastAssistant.
+		return flatTokenEstimate("[Prior reasoning redacted]")
 	case "image":
 		// An audit cross-referenced Anthropic's own documented image-pricing
 		// formula (ceil(w*h/750) after capping the longer side to 1568px)
@@ -144,7 +157,28 @@ func blockTokenEstimate(bMap map[string]interface{}, isLastAssistant bool) int {
 		// token_estimator.go, shared across both estimators the same way
 		// the PDF floor was unified earlier this session.
 		if src, ok := bMap["source"].(map[string]interface{}); ok {
+			// A Round 15 audit caught two gaps here, both mirroring fixes
+			// already present in the "document" case just below:
+			// (1) a url-sourced image (no "data" field at all) fell to the
+			// generic 1600-token floor instead of pricing the short
+			// "[Attached by URL: ...]" placeholder translator.go actually
+			// sends; (2) an SVG image (real XML text, not a raster
+			// estimateImageTokens can decode) also fell to the same flat
+			// floor regardless of its real text size.
+			if src["type"] == "url" {
+				if u, ok := src["url"].(string); ok {
+					return flatTokenEstimate("[Attached by URL: " + u + "]")
+				}
+				return flatTokenEstimate("[Attached by URL: ]")
+			}
 			if dataStr, ok := src["data"].(string); ok {
+				if mt, _ := src["media_type"].(string); strings.ToLower(mt) == "image/svg+xml" {
+					decodedBytes := len(dataStr) * 3 / 4
+					if est := decodedBytes / 2; est > 0 {
+						return est
+					}
+					return 1
+				}
 				return estimateImageTokens(dataStr)
 			}
 		}
@@ -261,6 +295,13 @@ func blockTokenEstimate(bMap map[string]interface{}, isLastAssistant bool) int {
 		for _, b := range inner {
 			if innerMap, isMap := b.(map[string]interface{}); isMap {
 				total += blockTokenEstimate(innerMap, isLastAssistant)
+			} else if s, isStr := b.(string); isStr {
+				// A Round 15 audit caught that a bare string array element
+				// (content as ["line 1\n", "line 2\n"], not typed blocks)
+				// matched neither branch and silently contributed 0 —
+				// token_estimator.go's sibling estimator has the same gap,
+				// fixed alongside this one.
+				total += flatTokenEstimate(s)
 			}
 		}
 		return total

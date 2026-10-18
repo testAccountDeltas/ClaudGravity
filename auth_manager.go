@@ -306,6 +306,17 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 			// slot out of maxAttempts on every single request. Put it in
 			// the selector's own cooldown too so it's skipped up front.
 			am.MarkAccountCooldown(email, deadRefreshTokenCooldown)
+			// A Round 15 audit caught MarkAccountCooldown alone doesn't
+			// unstick this account from any session it's already pinned
+			// to — sticky-session affinity (globalSelector) keeps routing
+			// that session's later requests back to the same now-known-
+			// dead account until its sticky entry happens to expire on
+			// its own, even though cooldown correctly excludes it from
+			// being picked FRESH. A fatal, non-transient OAuth error
+			// (revoked/expired grant, bad client) means this account is
+			// not coming back without the user re-authenticating, so
+			// detach it immediately.
+			globalSelector.UnstickAccount(email)
 		}
 		return "", fmt.Errorf("refresh failed (%d): %s", resp.StatusCode, string(bodyBytes))
 	}

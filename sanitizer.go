@@ -65,6 +65,23 @@ func toolResultPlainText(content interface{}) string {
 	switch c := content.(type) {
 	case string:
 		return c
+	case []map[string]interface{}:
+		// A Round 15 audit caught this concrete type — which
+		// SanitizeMessagesAndGraph's own normalization can leave "content"
+		// as at points in its pipeline (same shape mismatch documented
+		// elsewhere in this file for InjectUserNudge/context_window.go) —
+		// matched neither case here and fell through to the empty-string
+		// default, silently losing the tool result's entire text during
+		// dedup/delay processing.
+		var sb strings.Builder
+		for _, block := range c {
+			if block["type"] == "text" {
+				if t, ok := block["text"].(string); ok {
+					sb.WriteString(t)
+				}
+			}
+		}
+		return sb.String()
 	case []interface{}:
 		var sb strings.Builder
 		for _, item := range c {
@@ -144,6 +161,16 @@ func dedupedRepeatedReads(newMsgs []map[string]interface{}) bool {
 					toolIDToPath[id] = key
 				}
 			case "tool_result":
+				// A Round 15 audit caught this had no is_error check at
+				// all — a REPEATED READ ERROR (same wrong path tried twice,
+				// same permission-denied message) got collapsed into
+				// "already shown, don't re-read, proceed with what you
+				// already have," which is actively misleading: there is no
+				// successful content to proceed with, and the real error
+				// text needed to diagnose and fix the path is hidden.
+				if b["is_error"] == true {
+					continue
+				}
 				tid, _ := b["tool_use_id"].(string)
 				path, ok := toolIDToPath[tid]
 				if !ok {
@@ -469,9 +496,8 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool,
 							truncatedAny = true
 						}
 					case []interface{}:
-						for _, pItem := range c {
-							p, ok := pItem.(map[string]interface{})
-							if ok && p["type"] == "text" {
+						for i, pItem := range c {
+							if p, ok := pItem.(map[string]interface{}); ok && p["type"] == "text" {
 								if pt, ok := p["text"].(string); ok {
 									if strings.Contains(pt, "\x00") {
 										pt = strings.ReplaceAll(pt, "\x00", "")
@@ -491,6 +517,27 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool,
 										truncatedAny = true
 									}
 								}
+								continue
+							}
+							// A Round 15 audit caught that a bare string
+							// array element (content as ["line 1\n", "line
+							// 2\n"], not typed blocks — the same shape
+							// toolResultPlainText above already handles)
+							// matched neither the map assertion above nor
+							// anything else here, so a 64KB+ tool output in
+							// this exact shape was sent to Gemini whole,
+							// untruncated, every single turn.
+							if s, ok := pItem.(string); ok {
+								if strings.Contains(s, "\x00") {
+									s = strings.ReplaceAll(s, "\x00", "")
+									modified = true
+								}
+								if truncated, did := TruncateMiddle(s); did {
+									s = truncated
+									modified = true
+									truncatedAny = true
+								}
+								c[i] = s
 							}
 						}
 					}
@@ -587,6 +634,25 @@ func SanitizeMessagesAndGraph(claudeReqJSON map[string]interface{}) (bool, bool,
 				if id, ok := b["id"].(string); ok && id != "" {
 					toolUsesSeen[id] = true
 				}
+			}
+			// A Round 15 audit caught that a role-inverted tool_use (sitting
+			// in a "user" turn — Anthropic's spec only ever puts these in
+			// "assistant") was left untouched in the AST here. translator.go
+			// independently degrades it to an (empty) text part before it
+			// ever reaches Gemini, so there's no live 400 risk, but any
+			// OTHER code walking newMsgs looking for "type":"tool_use" to
+			// decide a real tool call happened (token estimation, future
+			// snapshot/loopguard logic) would still see it as one. Convert
+			// it to a real text block here instead, so every downstream
+			// consumer of newMsgs sees one consistent, already-degraded
+			// shape rather than each needing its own role check.
+			if bType == "tool_use" && role != "assistant" {
+				name, _ := b["name"].(string)
+				for k := range b {
+					delete(b, k)
+				}
+				b["type"] = "text"
+				b["text"] = fmt.Sprintf("[tool_use %q in a non-assistant message — ignored]", name)
 			}
 		}
 	}

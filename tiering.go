@@ -61,10 +61,22 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 		model = "gemini-3.8-flash-medium"
 	} else if strings.HasPrefix(model, "claude-haiku") || strings.HasPrefix(model, "claude-3-5-haiku") || strings.HasPrefix(model, "claude-3-haiku") || model == "haiku" {
 		model = "gemini-2.5-flash"
-	} else if !strings.HasPrefix(model, "gemini-") {
+	} else if model != "" && !strings.HasPrefix(model, "gemini-") {
 		// Fallback for unmapped or legacy models (claude-2.1, claude-instant, etc.)
 		model = "gemini-3.8-flash-tiered"
 	}
+	// A Round 15 audit caught that an empty model (the request simply
+	// didn't set one) fell into the generic unmapped/legacy fallback
+	// above like any other unrecognized name, forcing
+	// "gemini-3.8-flash-tiered" — which made
+	// ConvertClaudeRequestToGemini's own `if modelName == "" { modelName
+	// = tenant.DefaultModel }` fallback (translator.go) permanently dead
+	// code, since this function could never actually return "". Leaving
+	// model empty here doesn't break the rest of this function: every
+	// later check below is an explicit prefix/equality match against a
+	// real model name, so an empty model simply falls through to the
+	// generic non-tiered budget defaults, same as any other model this
+	// function doesn't specifically recognize.
 
 	effort := ""
 	if outCfg, ok := claudeReqJSON["output_config"].(map[string]interface{}); ok {
@@ -126,6 +138,17 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 					model = "gemini-3.8-flash-tiered"
 					budget = -1 // Native Google ModeAuto
 				}
+			case "none", "off", "disabled":
+				// A Round 15 audit caught that these literal thinking-off
+				// values (as opposed to the standard Anthropic
+				// thinking.type=="disabled" object, or no effort at all)
+				// fell into default: below, which for an Opus-class
+				// request selected the HEAVIEST ModeAuto/unlimited-
+				// thinking tier — the exact opposite of what was
+				// explicitly asked for, costing ~30-40s of extra latency
+				// and quota the caller was specifically trying to avoid.
+				model = base + "-medium"
+				budget = 0
 			default:
 				if wasTieredClass {
 					model = "gemini-3.8-flash-tiered"
@@ -156,6 +179,9 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 			case "xhigh", "max", "ultracode":
 				model = base + "-tiered"
 				budget = -1
+			case "none", "off", "disabled":
+				model = base + "-medium"
+				budget = 0
 			default:
 				model = base + "-medium"
 				budget = 8192
@@ -180,6 +206,17 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 		// for Haiku to actually reason hard on this one call.
 		if model == "gemini-2.5-flash" && effort != "xhigh" && effort != "max" && effort != "ultracode" {
 			budget = 0
+		} else if strings.HasSuffix(model, "-thinking") && effort == "" {
+			// A Round 15 audit caught that a "-thinking"-suffixed native
+			// model (e.g. "claude-opus-4-6-thinking", preserved verbatim
+			// by the native-models branch above) never matched any of
+			// this switch's -high/-low/-medium suffix checks in its
+			// default: case, so with no explicit effort it silently kept
+			// budget at this function's generic 8192 initializer instead
+			// of the unlimited ModeAuto reasoning its name and purpose
+			// call for. Only applies with no explicit effort override —
+			// an explicit low/medium/high/xhigh request below still wins.
+			budget = -1
 		} else if reqClass == "auxiliary" || isLightweightSubagent {
 			budget = 2048
 		} else {
@@ -192,6 +229,8 @@ func ResolveTieringAndEffort(claudeReqJSON map[string]interface{}, reqClass stri
 				budget = 16384
 			case "xhigh", "max", "ultracode":
 				budget = -1
+			case "none", "off", "disabled":
+				budget = 0
 			default:
 				if strings.HasSuffix(model, "-high") {
 					budget = 16384

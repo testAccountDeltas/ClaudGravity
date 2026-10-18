@@ -277,6 +277,17 @@ var thisNetworkSubnet = &net.IPNet{
 	Mask: net.CIDRMask(8, 32),
 }
 
+// classESubnet is the reserved 240.0.0.0/4 block (RFC 1112/RFC 6890) —
+// "reserved for future use," never legitimately routable, and the same
+// range also covers the limited broadcast address 255.255.255.255 at its
+// top end. A Round 15 audit caught Go's net.IP has no IsReserved-style
+// helper covering this at all, so it fell straight through every check
+// below as if it were an ordinary public address.
+var classESubnet = &net.IPNet{
+	IP:   net.IPv4(240, 0, 0, 0),
+	Mask: net.CIDRMask(4, 32),
+}
+
 // checkConnectTarget reports whether host resolves to a public, safe address.
 // It returns every verified safe IP (IPv4 addresses first — a dual-stack
 // DNS answer commonly lists AAAA before A, and a host with no outbound IPv6
@@ -296,7 +307,7 @@ func checkConnectTarget(host string) ([]net.IP, error) {
 		return nil, fmt.Errorf("no addresses found for %s", host)
 	}
 	for _, ip := range ips {
-		if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() || (ip.To4() != nil && (cgnatSubnet.Contains(ip.To4()) || thisNetworkSubnet.Contains(ip.To4()))) {
+		if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() || (ip.To4() != nil && (cgnatSubnet.Contains(ip.To4()) || thisNetworkSubnet.Contains(ip.To4()) || classESubnet.Contains(ip.To4()))) {
 			return nil, fmt.Errorf("blocked target address: %s", ip)
 		}
 	}
@@ -419,8 +430,30 @@ func HandleConnectTunnel(w http.ResponseWriter, r *http.Request, ca *MitmCA, tar
 	if len(verifiedIPs) == 0 {
 		targetConn, err = net.DialTimeout("tcp", r.Host, 10*time.Second)
 	} else {
-		for _, ip := range verifiedIPs {
-			targetConn, err = net.DialTimeout("tcp", net.JoinHostPort(ip.String(), port), 10*time.Second)
+		// A Round 15 audit caught that every candidate IP got the full
+		// 10s timeout regardless of how many there were — a dual-stack
+		// host whose first-tried (IPv4-preferred, per the sort above)
+		// address happens to be unreachable from this host still blocked
+		// for the full 10s before ever trying the next one, so a client
+		// could wait up to 10s * len(verifiedIPs) for a tunnel that a
+		// single working address would have opened in milliseconds.
+		// Shorten the per-attempt timeout once there's more than one
+		// candidate to fall through to — similar in spirit to Happy
+		// Eyeballs (RFC 8305) without the full parallel-dial machinery.
+		perAttemptTimeout := 10 * time.Second
+		if len(verifiedIPs) > 1 {
+			perAttemptTimeout = 2500 * time.Millisecond
+		}
+		for i, ip := range verifiedIPs {
+			attemptTimeout := perAttemptTimeout
+			if i == len(verifiedIPs)-1 {
+				// Give the LAST candidate the full timeout — if every
+				// earlier address failed fast (refused/unreachable, not
+				// merely slow), there's no reason to also rush the one
+				// remaining attempt.
+				attemptTimeout = 10 * time.Second
+			}
+			targetConn, err = net.DialTimeout("tcp", net.JoinHostPort(ip.String(), port), attemptTimeout)
 			if err == nil {
 				break
 			}
@@ -776,6 +809,12 @@ type MitmResponseWriter struct {
 	headersSent bool
 	chunked     bool
 	sentOffset  int
+	// writeErr is set the moment a real socket write to the client fails
+	// (client disconnected). A Round 15 audit caught this had no equivalent
+	// at all — Write() kept buffering a handler's output into memory for
+	// the rest of a generation nobody could still read, with nothing
+	// upstream ever told the connection was already dead.
+	writeErr error
 }
 
 func newMitmResponseWriter(conn net.Conn) *MitmResponseWriter {
@@ -793,6 +832,16 @@ func (w *MitmResponseWriter) Header() http.Header {
 func (w *MitmResponseWriter) Write(b []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// A Round 15 audit caught this never surfaced a prior socket-write
+	// failure — the handler (and the upstream-read loop feeding it, via
+	// SSEStreamer.SendRaw) had no way to learn the client was already
+	// gone and kept buffering/reading from upstream for nothing. Returning
+	// the stored error here lets io.Copy-style callers and SendRaw's own
+	// error check stop immediately instead of discovering it only once
+	// the whole response is done.
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
 	return w.buf.Write(b)
 }
 
@@ -875,18 +924,36 @@ func (w *MitmResponseWriter) writeNewBytes() {
 		return
 	}
 	chunk := all[w.sentOffset:]
-	w.sentOffset = len(all)
 	_ = w.conn.SetWriteDeadline(time.Now().Add(mitmIdleDeadline))
 	// Same read-deadline refresh as sendHeaders above, and for the same
 	// reason — this is the per-chunk activity point for a real SSE stream.
 	_ = w.conn.SetReadDeadline(time.Now().Add(mitmIdleDeadline))
+	var writeErr error
 	if w.chunked {
-		_, _ = w.conn.Write([]byte(fmt.Sprintf("%x\r\n", len(chunk))))
-		_, _ = w.conn.Write(chunk)
-		_, _ = w.conn.Write([]byte("\r\n"))
+		if _, writeErr = w.conn.Write([]byte(fmt.Sprintf("%x\r\n", len(chunk)))); writeErr == nil {
+			if _, writeErr = w.conn.Write(chunk); writeErr == nil {
+				_, writeErr = w.conn.Write([]byte("\r\n"))
+			}
+		}
 	} else {
-		_, _ = w.conn.Write(chunk)
+		_, writeErr = w.conn.Write(chunk)
 	}
+	// A Round 15 audit caught two gaps here:
+	// (1) w.buf never shrinks — only sentOffset advances — so a long SSE
+	// stream (a multi-thousand-token reasoning turn) keeps the ENTIRE
+	// response accumulated in memory for the whole connection's lifetime.
+	// Reset the buffer once its already-sent prefix has actually left the
+	// wire, instead of growing it forever.
+	// (2) a write error was silently discarded — Write/WriteHeader calls
+	// from the handler above kept right on buffering into w.buf for the
+	// rest of a generation the client already disconnected from, with
+	// nothing upstream ever noticing the connection was dead.
+	if writeErr != nil {
+		w.writeErr = writeErr
+		return
+	}
+	w.buf.Reset()
+	w.sentOffset = 0
 }
 
 // Flush is called mid-handler by anything holding this writer as an

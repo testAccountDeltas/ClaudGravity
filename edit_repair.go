@@ -215,7 +215,14 @@ func canonicalSnapshotKey(path string) string {
 	if len(p) >= 2 && p[1] == ':' && p[0] >= 'A' && p[0] <= 'Z' {
 		p = strings.ToLower(p[:1]) + p[1:]
 	}
-	return filepath.Clean(p)
+	// A Round 15 audit caught that filepath.Clean itself re-introduces the
+	// exact divergence the backslash-stripping above exists to prevent:
+	// on a GOOS=windows build of this binary, filepath.Clean rewrites
+	// every "/" back into the OS-native "\" separator, so a key cleaned on
+	// the Windows instance and the same key cleaned on the Linux instance
+	// (where Clean leaves "/" alone) diverge again despite both having
+	// been slash-normalized going in. Re-normalize after Clean too.
+	return strings.ReplaceAll(filepath.Clean(p), "\\", "/")
 }
 
 func getSessionSnapshot(sessionID, path string) (string, bool) {
@@ -247,11 +254,25 @@ func getSessionSnapshot(sessionID, path string) (string, bool) {
 func isSessionSnapshotFull(sessionID, path string) bool {
 	sessionSnapLock.RLock()
 	defer sessionSnapLock.RUnlock()
-	m := sessionSnapFull[sessionID]
-	if m == nil {
-		return false
+	key := canonicalSnapshotKey(path)
+	if m := sessionSnapFull[sessionID]; m != nil {
+		if full, ok := m[key]; ok {
+			return full
+		}
 	}
-	return m[canonicalSnapshotKey(path)]
+	// A Round 15 audit caught that getSessionSnapshot falls back to the
+	// parent session (just above) but this function never did — a
+	// subagent's first partial read of a file the PARENT session already
+	// read in full got isSessionSnapshotFull==false (no entry at all),
+	// mismatched the parent's true "full" state, and let a later small
+	// partial read overwrite/destroy the inherited full snapshot instead
+	// of being treated as a refinement of already-complete data.
+	if parent, ok := parentSessionKey(sessionID); ok {
+		if m := sessionSnapFull[parent]; m != nil {
+			return m[key]
+		}
+	}
+	return false
 }
 
 func setSessionSnapshot(sessionID, path, content string, isFull bool) {
@@ -341,6 +362,9 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 		if !content.IsArray() {
 			return true
 		}
+		if msg.Get("role").String() != "user" {
+			return true
+		}
 		content.ForEach(func(_, p gjson.Result) bool {
 			if p.Get("type").String() == "tool_result" && p.Get("is_error").Bool() {
 				if tid := p.Get("tool_use_id").String(); tid != "" {
@@ -357,8 +381,25 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 		if !content.IsArray() {
 			return true
 		}
+		role := msg.Get("role").String()
 		content.ForEach(func(_, p gjson.Result) bool {
-			switch p.Get("type").String() {
+			// A Round 15 audit caught that neither branch below checked the
+			// enclosing message's role — tool_use is only ever real coming
+			// from "assistant" (a user message quoting/pasting an example
+			// tool call in their own text is valid JSON but not a real
+			// file operation), and tool_result is only ever real coming
+			// from "user". Without this, a user message that happened to
+			// contain a tool_use-shaped block got replayed as if the model
+			// had actually performed that file operation, corrupting the
+			// snapshot with content that was never written to disk.
+			ptype := p.Get("type").String()
+			if ptype == "tool_use" && role != "assistant" {
+				return true
+			}
+			if ptype == "tool_result" && role != "user" {
+				return true
+			}
+			switch ptype {
 			case "tool_use":
 				id := p.Get("id").String()
 				name := strings.ToLower(p.Get("name").String())
@@ -405,9 +446,12 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					// old_text/new_text added — same gap as notebook_path
 					// above: RepairEditToolCall already recognized these
 					// (NotebookEdit's own param names), this recording pass
-					// didn't.
+					// didn't. new_source added too (a Round 15 audit caught
+					// it was still missing here) — NotebookEdit's actual
+					// Claude Code schema names its replacement content
+					// new_source, not new_string/new_str/new_text.
 					oldStr := firstNonEmpty(input.Get("old_string").String(), input.Get("old_str").String(), input.Get("pattern").String(), input.Get("old_text").String())
-					newStr := firstNonEmpty(input.Get("new_string").String(), input.Get("new_str").String(), input.Get("new_text").String())
+					newStr := firstNonEmpty(input.Get("new_string").String(), input.Get("new_str").String(), input.Get("new_text").String(), input.Get("new_source").String())
 					if oldStr != "" {
 						// An audit caught this lookup only ever tried the
 						// literal `path` as given — if an earlier Read in
@@ -531,7 +575,20 @@ func RecordSessionFileSnapshots(sessionID string, bodyBytes []byte) {
 					// already exists (still doesn't merge two different
 					// partial ranges together — see sessionSnapFull's doc
 					// comment).
-					if !isPartial || !isSessionSnapshotFull(sessionID, path) {
+					//
+					// A Round 15 audit caught that this guard only ever
+					// protected a FULL snapshot from a partial one — a large
+					// partial snapshot (e.g. the >2000-line case just above,
+					// which is deliberately marked isPartial=true since
+					// there's no way to know if more lines exist) had no
+					// protection at all against being overwritten by a much
+					// SMALLER later partial read of the same file (a 20-line
+					// slice replacing a 2000-line one), destroying most of
+					// the fuzzy-match baseline. Also require the new content
+					// to be at least as large when both are partial.
+					existing, hasExisting := getSessionSnapshot(sessionID, path)
+					shrinksPartial := isPartial && hasExisting && !isSessionSnapshotFull(sessionID, path) && len(cleanContent) < len(existing)
+					if (!isPartial || !isSessionSnapshotFull(sessionID, path)) && !shrinksPartial {
 						setSessionSnapshot(sessionID, path, cleanContent, !isPartial)
 						if !isAbsPath(path) {
 							if cwd := GetSessionCWD(sessionID); cwd != "" {
@@ -905,7 +962,16 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 			// Ensure new_string matches CRLF/LF line endings of file
 			if newStrKey != "" {
 				effectiveNewStr := newStr
-				if hasCRLF {
+				// A Round 15 audit caught that this reused the file-WIDE
+				// hasCRLF from step 4 above — a 10,000-line LF file with a
+				// single stray \r\n somewhere unrelated (a comment, a
+				// binary-ish string literal) made hasCRLF true for the
+				// whole file, forcing CRLF onto new_string even though the
+				// actual matched segment (repairedExact, with its own real
+				// per-line endings from findFuzzyLineMatch) is plain LF.
+				// Decide based on the matched segment itself, not the file.
+				segmentHasCRLF := strings.Contains(repairedExact, "\r\n")
+				if segmentHasCRLF {
 					newCRLFCandidate := strings.ReplaceAll(strings.ReplaceAll(newStr, "\r\n", "\n"), "\n", "\r\n")
 					if newCRLFCandidate != newStr {
 						effectiveNewStr = newCRLFCandidate
@@ -1351,7 +1417,30 @@ func findFuzzyLineMatch(fileContent, oldStr string) (string, []string, string, b
 			oldLeadingLen := len(rawOldLines[j]) - len(strings.TrimLeft(rawOldLines[j], " \t"))
 			oldIndent := rawOldLines[j][:oldLeadingLen]
 			if fileIndent == oldIndent {
-				continue // old_string's own line j already matches the file's real indentation; nothing missing
+				if j == 0 {
+					// Line 0 keeps the original "only record when it
+					// differs" behavior unconditionally — the
+					// startOffset-shift logic just below depends on
+					// lineIndents[0] staying "" exactly when old_string's
+					// own line 0 already matched the file, including the
+					// stripOnlyIndentMarker sentinel case.
+					continue
+				}
+				// A Round 15 audit caught that this `continue` — correct
+				// for detecting a DELTA in old_string's own indentation —
+				// left lineIndents[j] empty whenever old_string's line
+				// already matched the file, even if the fuzzy match was
+				// triggered by a non-whitespace difference elsewhere on the
+				// line (code/punctuation). reapplyLineIndents then saw
+				// every entry empty, treated the whole match as "nothing to
+				// fix", and returned new_string completely untouched —
+				// including any line where the model, independently of
+				// old_string, wrote new_string's own line with no (or
+				// wrong) indentation. Recording the file's real indent here
+				// unconditionally is safe: reapplyLineIndents' 1:1 branch
+				// already no-ops when new_string's line already carries
+				// that exact indent, so this only ever fixes a genuine
+				// mismatch, never touches an already-correct line.
 			}
 			lineIndents[j] = fileIndent
 		}

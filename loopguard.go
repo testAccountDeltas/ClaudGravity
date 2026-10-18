@@ -160,7 +160,14 @@ const (
 // "HEAD" and "pr" sit mid-command, never right after `;`/`&`/`|` or at
 // position 0, so neither matches; a real `head file.txt` or `ls && head
 // file.txt` still does.
-var readEquivalentBashPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*(sed\s+-n|head|tail|cat|more|less|pr|seq|dd\s+bs=|cut\s+-[df]|fold|nl\s+-)\b`)
+// A Round 15 audit caught the separator class below ([;&|], anchored to
+// string-start or a real shell boundary) never included \r or \n — a
+// multiline bash script (heredoc, or just several commands joined by real
+// newlines rather than ;/&&) has a read command legitimately starting a
+// LINE that isn't the start of the whole string and isn't preceded by
+// ;/&/|, so it silently matched nothing and LoopGuard never saw the read
+// at all on any line past the first.
+var readEquivalentBashPattern = regexp.MustCompile(`(?i)(?:^|[\r\n;&|])\s*(sed\s+-n|head|tail|cat|more|less|pr|seq|dd\s+bs=|cut\s+-[df]|fold|nl\s+-)\b`)
 var awkNRPattern = regexp.MustCompile(`(?i)\bNR\s*[<>=!]`)
 
 // awkInvocationPattern requires "awk" to appear as an actual command
@@ -179,7 +186,7 @@ var awkNRPattern = regexp.MustCompile(`(?i)\bNR\s*[<>=!]`)
 // RE2 has no lookbehind, so the fix is structural: require the anchor
 // character itself to be a real separator immediately before any
 // whitespace, not whitespace standing in for one.
-var awkInvocationPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*awk\b`)
+var awkInvocationPattern = regexp.MustCompile(`(?i)(?:^|[\r\n;&|])\s*awk\b`)
 
 // catIsWritePattern matches `cat` used to WRITE a file (heredoc into a
 // redirect, e.g. `cat << 'EOF' > file.go`, or `cat file1 file2 > out`) —
@@ -198,7 +205,15 @@ var awkInvocationPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*awk\b`)
 // no `>` at all — matched separately, no trailing-redirect requirement);
 // `tee file` and `touch file` (write via the command's own mere
 // invocation, no redirect needed at all either).
-var catIsWritePattern = regexp.MustCompile(`(?i)\b(cat|head|tail|sed|echo)\b[^|]*>|\bsed\s+-i\b|\btee\b|\btouch\b`)
+// A Round 15 audit caught that [^|]* can never cross a pipe character by
+// construction, so a genuine write pipeline like `cat a | sort > b` —
+// cat's own output piped through another command before the real
+// redirect — never matched at all: there's no literal ">" between "cat"
+// and the first "|". The redirect only needs to exist SOMEWHERE after the
+// command on the same line, piped through any number of other commands
+// first; switch to [^\n]* so it can cross pipes but still stops at a real
+// line boundary (multiline scripts are handled line-by-line elsewhere).
+var catIsWritePattern = regexp.MustCompile(`(?i)\b(cat|head|tail|sed|echo)\b[^\n]*>|\bsed\s+-i\b|\btee\b|\btouch\b`)
 
 // stderrRedirectPattern matches a file-descriptor-specific redirect used to
 // suppress error output — `2>/dev/null`, `2>&1`, `2>$null` (PowerShell) —
@@ -217,7 +232,15 @@ var catIsWritePattern = regexp.MustCompile(`(?i)\b(cat|head|tail|sed|echo)\b[^|]
 // `Get-Content file.txt *>$null` as a write. The target is PowerShell's
 // null device either way, never a real file being written to, so it's
 // exactly the same "read with suppressed output" shape as 2>$null.
-var stderrRedirectPattern = regexp.MustCompile(`([0-9]|\*)>\S*`)
+// A Round 15 audit caught this stripped ANY digit-prefixed redirect,
+// including "1>" — explicit stdout redirect (`cmd 1> out.txt` is exactly
+// as real a write as `cmd > out.txt`), not an error-suppression one. That
+// erased the only ">" in the command before catIsWritePattern/
+// powerShellIsWritePattern ever got to look for one, misclassifying a
+// genuine write as a plain read. Only fd 2 (stderr) and PowerShell's "*"
+// (all-streams) are genuinely about suppressing/redirecting errors, not
+// real output.
+var stderrRedirectPattern = regexp.MustCompile(`(2|\*)>\S*`)
 
 func stripStderrRedirects(command string) string {
 	return stderrRedirectPattern.ReplaceAllString(command, "")
@@ -237,13 +260,13 @@ func stripStderrRedirects(command string) string {
 // branch treated the ordinary space between "cat" and "grep.txt" as if
 // it were a real command separator. Same structural fix as
 // awkInvocationPattern above.
-var grepInvocationPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*(grep|rg)\b`)
+var grepInvocationPattern = regexp.MustCompile(`(?i)(?:^|[\r\n;&|])\s*(grep|rg)\b`)
 
 // jqInvocationPattern recognizes jq as an actual command invocation (not
 // a path substring), same boundary convention as awk/grep above — jq
 // reads and filters a file's content to stdout, the same read-loop shape
 // as sed -n/head/tail, but under a tool name those patterns never match.
-var jqInvocationPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*jq\b`)
+var jqInvocationPattern = regexp.MustCompile(`(?i)(?:^|[\r\n;&|])\s*jq\b`)
 
 // psSearchInvocationPattern is grepInvocationPattern's PowerShell
 // counterpart, covering findstr/grep/rg the same way — select-string is
@@ -263,7 +286,7 @@ var jqInvocationPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*jq\b`)
 // sls.json` has "sls" preceded by an ordinary space (a top-level filename
 // argument), which the old `\s` branch wrongly treated as a real command
 // separator.
-var psSearchInvocationPattern = regexp.MustCompile(`(?i)(?:^|[;&|])\s*(findstr|grep|rg|sls)\b`)
+var psSearchInvocationPattern = regexp.MustCompile(`(?i)(?:^|[\r\n;&|])\s*(findstr|grep|rg|sls)\b`)
 
 func isReadEquivalentBashCommand(command string) bool {
 	lc := strings.ToLower(command)
@@ -318,7 +341,15 @@ func isReadEquivalentBashCommand(command string) bool {
 // stay excluded the same way grep/rg does for Bash.
 // cat is a built-in PowerShell alias for Get-Content — an audit caught it
 // was missing here, leaving a bare `cat file.txt` completely invisible.
-var readEquivalentPowerShellPattern = regexp.MustCompile(`(?i)\b(get-content|gc|cat)\b|select-object\s+-(first|last|skip)|\btype\b|\bmore\b`)
+// A Round 15 audit caught that \btype\b (and \bmore\b) here had no
+// command-boundary anchor at all, unlike every other read-equivalent
+// pattern in this file — \b only asserts a word boundary, not "this is
+// the command being invoked", so `git commit -m "fix type error"` or any
+// prose/commit-message mentioning the bare word "type" matched and got
+// wrongly counted as a read. Anchor cat/get-content/gc/type/more to
+// actual command-start position the same way readEquivalentBashPattern
+// etc. already do, including the \r\n case for multiline scripts.
+var readEquivalentPowerShellPattern = regexp.MustCompile(`(?i)(?:^|[\r\n;&|])\s*(get-content|gc|cat|type|more)\b|select-object\s+-(first|last|skip)`)
 
 // powerShellIsWritePattern is catIsWritePattern's PowerShell counterpart —
 // an audit caught that `cat file.txt > out.txt` or `gc file.txt | Out-File
@@ -331,7 +362,15 @@ var readEquivalentPowerShellPattern = regexp.MustCompile(`(?i)\b(get-content|gc|
 // using the alias form was invisible to BOTH this write check and the
 // read-equivalent check below, so it counted as neither a read nor a
 // write and never reset the read-streak counter after a genuine write.
-var powerShellIsWritePattern = regexp.MustCompile(`(?i)>|Out-File|Set-Content|Add-Content|\bsc\b|\bac\b`)
+// A Round 15 audit caught \bsc\b/\bac\b had the same missing-anchor
+// problem as \btype\b above — "sc" and "ac" are short enough to
+// plausibly appear as an ordinary standalone word/argument (a branch or
+// ticket reference like "sc-1234", "ac" as an abbreviation in a commit
+// message) with no real command invocation at all. Anchor them to actual
+// command-start position; the bare ">" and full cmdlet names stay
+// unanchored since a literal redirect character or a full cmdlet name is
+// unambiguous evidence on its own.
+var powerShellIsWritePattern = regexp.MustCompile(`(?i)>|Out-File|Set-Content|Add-Content|(?:^|[\r\n;&|])\s*(sc|ac)\b`)
 
 func isReadEquivalentPowerShellCommand(command string) bool {
 	lc := strings.ToLower(command)
@@ -452,17 +491,25 @@ func readLoopEquivalentToolName(signature string) (name string, isReadEquivalent
 		return signature, signature == "Read", false
 	}
 	name = signature[:idx]
-	if name == "Read" {
+	// A Round 15 audit caught these were exact, case-sensitive string
+	// comparisons against only "Read"/"Bash"/"PowerShell" — a versioned
+	// Anthropic built-in tool name (bash_20250124, text_editor_20250728;
+	// translator.go and sse.go both already recognize these elsewhere)
+	// or the "pwsh" alias (sse.go already maps it to the same "command"
+	// arg key as PowerShell) matched none of them, silently exempting
+	// those calls from read-loop/write-progress detection entirely.
+	lowerName := strings.ToLower(name)
+	if lowerName == "read" {
 		return name, true, false
 	}
-	if name == "Bash" {
+	if lowerName == "bash" || strings.HasPrefix(lowerName, "bash_") {
 		command := gjson.Get(signature[idx+1:], "command").String()
 		if isReadEquivalentBashCommand(command) {
 			return name, true, false
 		}
 		return name, false, catIsWritePattern.MatchString(stripStderrRedirects(command))
 	}
-	if name == "PowerShell" {
+	if lowerName == "powershell" || lowerName == "pwsh" {
 		command := gjson.Get(signature[idx+1:], "command").String()
 		if isReadEquivalentPowerShellCommand(command) {
 			return name, true, false
@@ -816,6 +863,26 @@ func InjectUserNudge(claudeReqJSON map[string]interface{}, text string) {
 	// upstream 400 on top of it.
 	if len(msgs) > 0 {
 		if lastMsg, ok := msgs[len(msgs)-1].(map[string]interface{}); ok {
+			if role, _ := lastMsg["role"].(string); role == "assistant" {
+				// A Round 15 audit caught that falling through to the
+				// unconditional append below (a brand-new trailing "user"
+				// message) breaks the Anthropic assistant-prefill contract
+				// whenever the client's last turn is this same trailing
+				// assistant message on purpose — the model is meant to
+				// CONTINUE that exact text, which requires the conversation
+				// to still end on an assistant turn. Appending a user turn
+				// after it is read by Gemini as a brand new exchange
+				// instead, silently discarding the prefill. This function's
+				// own doc comment already rules out folding the nudge into
+				// the system instruction (breaks the KV-cache-prefix byte
+				// invariance it exists to guarantee), so the safest choice
+				// is to skip injecting the nudge for this one request
+				// rather than corrupt the prefill — a request that both
+				// trips LoopGuard AND carries a trailing prefill is rare,
+				// and losing one nudge cycle is far cheaper than a broken
+				// prefill contract.
+				return
+			}
 			if role, _ := lastMsg["role"].(string); role == "user" {
 				switch rawContent := lastMsg["content"].(type) {
 				case []map[string]interface{}:
