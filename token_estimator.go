@@ -8,6 +8,35 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// estimateContentSourceText extracts the real text from a document block
+// whose source.type == "content" (Anthropic's other text-document form,
+// alongside "base64"/"text"/"url" — "content" is either a literal string or
+// an array of {"type":"text","text":...} blocks). An audit caught that
+// callers previously fell back to reading src.Get("data").String()
+// regardless of source type — "content" documents have no "data" field at
+// all, so that silently priced them at 0 tokens, letting a genuinely large
+// document slip through token accounting unnoticed and overflow Gemini's
+// real context window with no warning.
+func estimateContentSourceText(src gjson.Result) string {
+	contentField := src.Get("content")
+	if contentField.Type == gjson.String {
+		return contentField.String()
+	}
+	if contentField.IsArray() {
+		var sb strings.Builder
+		contentField.ForEach(func(_, block gjson.Result) bool {
+			if block.Get("type").String() == "text" {
+				sb.WriteString(block.Get("text").String())
+			} else if block.Type == gjson.String {
+				sb.WriteString(block.String())
+			}
+			return true
+		})
+		return sb.String()
+	}
+	return ""
+}
+
 // detectRussianConversation checks the latest user-role message for Cyrillic
 // text, to pick which language gateway-synthesized strings use (the
 // grounding-sources footer, currently) — this text bypasses the model
@@ -184,6 +213,8 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 											est = 1600
 										}
 										total += est
+									} else if src.Get("type").String() == "content" {
+										total += estimateApproxTokens(estimateContentSourceText(src))
 									} else {
 										total += estimateApproxTokens(src.Get("data").String())
 									}
@@ -219,6 +250,8 @@ func estimateApproxClaudeTokens(bodyBytes []byte) int {
 								est = 1600
 							}
 							total += est
+						} else if src.Get("type").String() == "content" {
+							total += estimateApproxTokens(estimateContentSourceText(src))
 						} else {
 							total += estimateApproxTokens(src.Get("data").String())
 						}

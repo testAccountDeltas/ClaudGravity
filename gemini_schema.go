@@ -70,6 +70,33 @@ func stripNestedOpenDictReason(toolName, argsRaw string) string {
 			}
 			continue
 		}
+		// An audit caught that the ".items" handling above only covers
+		// "reason" sitting directly on each array element — a free-form
+		// dict ONE LEVEL DEEPER inside an array element's own sub-object
+		// (e.g. "tasks.items.metadata", for tasks[].metadata) produces a
+		// field string with ".items." in the MIDDLE, not at the end, so
+		// it fell through to the plain-path branch below, which built
+		// "tasks.items.metadata.reason" — not a real gjson/sjson path
+		// (neither library treats ".items." as an array-index wildcard),
+		// so it never matched anything and the placeholder leaked into
+		// every element of the array unstripped.
+		if idx := strings.Index(field, ".items."); idx != -1 {
+			arrayField := field[:idx]
+			remainder := field[idx+len(".items."):]
+			arr := gjson.Get(argsRaw, arrayField)
+			if arr.IsArray() {
+				n := len(arr.Array())
+				for i := n - 1; i >= 0; i-- {
+					path := fmt.Sprintf("%s.%d.%s.reason", arrayField, i, remainder)
+					if gjson.Get(argsRaw, path).Exists() {
+						if cleaned, err := sjson.Delete(argsRaw, path); err == nil {
+							argsRaw = cleaned
+						}
+					}
+				}
+			}
+			continue
+		}
 		path := field + ".reason"
 		if gjson.Get(argsRaw, path).Exists() {
 			if cleaned, err := sjson.Delete(argsRaw, path); err == nil {
@@ -1116,6 +1143,17 @@ func mergeObjectBranches(branches []gjson.Result) string {
 				if c := pv.Get("const"); c.Exists() {
 					entry.isConstField = true
 					entry.constValues = append(entry.constValues, c.String())
+				} else if en := pv.Get("enum"); en.IsArray() && len(en.Array()) == 1 {
+					// An audit caught that JSON Schema Draft-04/07 commonly
+					// expresses a discriminated-union tag as a single-
+					// element enum ("enum":["delete"]) rather than "const" —
+					// semantically identical, but this only ever checked
+					// "const", so a second branch's enum-tagged discriminator
+					// value was silently dropped (its properties never even
+					// got merged, since the "already exists" check above
+					// skips straight past a repeated property key).
+					entry.isConstField = true
+					entry.constValues = append(entry.constValues, en.Array()[0].String())
 				}
 				return true
 			})
@@ -1188,6 +1226,25 @@ func selectBest(items []gjson.Result) (bestIdx int, types []string) {
 			score, t = 2, orDefault(t, "array")
 		case t != "" && t != "null":
 			score = 1
+		case t == "" && item.Get("enum").IsArray() && len(item.Get("enum").Array()) > 0:
+			// An audit caught that a branch using "enum" without an
+			// explicit "type" (valid JSON Schema — the type is implied by
+			// the enum's own values) fell straight into the default
+			// "null" case below, same as a genuinely untyped/empty
+			// branch. flattenAnyOfOneOf then saw "null" in the collected
+			// types and both marked the field nullable AND stripped it
+			// from "required" — turning an enum-typed required parameter
+			// into an optional, falsely-nullable one. Infer the type from
+			// the enum's own first value instead, the same way
+			// convertConstToEnum already infers a type for "const".
+			switch item.Get("enum.0").Type {
+			case gjson.Number:
+				score, t = 1, "number"
+			case gjson.True, gjson.False:
+				score, t = 1, "boolean"
+			default:
+				score, t = 1, "string"
+			}
 		default:
 			t = orDefault(t, "null")
 		}

@@ -718,6 +718,20 @@ func (w *MitmResponseWriter) sendHeaders(chunked bool) {
 	}
 	sb.WriteString("\r\n")
 	_ = w.conn.SetWriteDeadline(time.Now().Add(mitmIdleDeadline))
+	// An audit caught that the original tlsConn.SetDeadline call before
+	// this handler started (serveInterceptedTLS) sets BOTH read and write
+	// deadlines to the same absolute instant, but only the write side ever
+	// gets refreshed (here and in writeNewBytes below) — the disconnect-
+	// watcher goroutine's own tlsConn.Read is still bound by that original,
+	// never-renewed READ deadline, so a genuinely long-but-active
+	// generation gets its connection killed exactly mitmIdleDeadline after
+	// it STARTED, not after it went idle. Refresh the read side on every
+	// chunk too, the same idle-timeout pattern this file already uses
+	// correctly elsewhere (serveTunneledConnection's src/dst deadline
+	// refresh) — this keeps a real upper bound against a leaked goroutine
+	// on a silently-dead connection, just one that resets on genuine
+	// activity instead of the connection's start time.
+	_ = w.conn.SetReadDeadline(time.Now().Add(mitmIdleDeadline))
 	_, _ = w.conn.Write([]byte(sb.String()))
 }
 
@@ -736,6 +750,9 @@ func (w *MitmResponseWriter) writeNewBytes() {
 	chunk := all[w.sentOffset:]
 	w.sentOffset = len(all)
 	_ = w.conn.SetWriteDeadline(time.Now().Add(mitmIdleDeadline))
+	// Same read-deadline refresh as sendHeaders above, and for the same
+	// reason — this is the per-chunk activity point for a real SSE stream.
+	_ = w.conn.SetReadDeadline(time.Now().Add(mitmIdleDeadline))
 	if w.chunked {
 		_, _ = w.conn.Write([]byte(fmt.Sprintf("%x\r\n", len(chunk))))
 		_, _ = w.conn.Write(chunk)

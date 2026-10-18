@@ -529,6 +529,18 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 								// decoding binary PDF bytes as if UTF-8 and
 								// sending invalid text to Gemini (400).
 								mediaType = "application/pdf"
+							} else if mediaType == "" && ptype == "image" {
+								// A follow-up audit caught the same gap for
+								// "image" blocks specifically — this default
+								// only ever covered "document", so a
+								// no-media_type image block ALSO fell into
+								// the text-decode branch below, producing the
+								// exact same invalid-UTF-8-as-text failure.
+								// PNG is the most common lossless screenshot
+								// format in practice (Claude Code's own
+								// screenshot tooling), so it's the more
+								// reasonable default than erroring outright.
+								mediaType = "image/png"
 							}
 							b64Data := src.Get("data").String()
 							if b64Data != "" {
@@ -638,7 +650,17 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 						}
 						part := `{"thoughtSignature":"","functionCall":{"name":"","args":{}}}`
 						part, _ = sjson.Set(part, "thoughtSignature", sig)
-						part, _ = sjson.Set(part, "functionCall.name", name)
+						// An audit caught that sanitizeGeminiFunctionName
+						// (added for the initial tools.functionDeclarations
+						// list) was never applied when replaying a PRIOR
+						// turn's tool_use back into history — a hyphenated
+						// MCP tool name (e.g. "mcp__brave-search__search")
+						// sent fine on turn 1 (declared tools get
+						// sanitized), but turn 2+ resent the raw hyphenated
+						// name here, and Gemini validates every
+						// functionCall.name in the conversation against the
+						// sanitized declared list, 400ing the whole request.
+						part, _ = sjson.Set(part, "functionCall.name", sanitizeGeminiFunctionName(name))
 						if callID != "" {
 							part, _ = sjson.Set(part, "functionCall.id", callID)
 						}
@@ -729,6 +751,20 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 										// as invalid-UTF-8 "text".
 										mediaType := strings.ToLower(src.Get("media_type").String())
 										data := src.Get("data").String()
+										if mediaType == "" && data != "" {
+											// Same missing-media_type default as
+											// the top-level content-block path
+											// above, applied here too for
+											// consistency — otherwise this
+											// nested tool_result path silently
+											// drops the attachment entirely
+											// instead of a best-effort default.
+											if item.Get("type").String() == "document" {
+												mediaType = "application/pdf"
+											} else {
+												mediaType = "image/png"
+											}
+										}
 										if mediaType != "" && data != "" {
 											if mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/") {
 												imgPart := `{"inlineData":{"mimeType":"","data":""}}`
@@ -753,6 +789,28 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 										if u := src.Get("url").String(); u != "" {
 											sb.WriteString("[Attached by URL: " + u + "]")
 										}
+									case "content":
+										// An audit caught that the top-level
+										// message-content path got this case
+										// added, but this separate, nested
+										// tool_result switch didn't — a text
+										// document with source.type=="content"
+										// returned BY A TOOL (as opposed to one
+										// the user attached directly) still
+										// silently vanished here.
+										contentField := src.Get("content")
+										if contentField.IsArray() {
+											contentField.ForEach(func(_, block gjson.Result) bool {
+												if block.Get("type").String() == "text" {
+													sb.WriteString(block.Get("text").String())
+												} else if block.Type == gjson.String {
+													sb.WriteString(block.String())
+												}
+												return true
+											})
+										} else if contentField.Type == gjson.String {
+											sb.WriteString(contentField.String())
+										}
 									}
 								}
 								return true
@@ -771,7 +829,10 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							responseField = "error"
 						}
 						part := `{"functionResponse":{"name":"","response":{}}}`
-						part, _ = sjson.Set(part, "functionResponse.name", fnName)
+						// Same history-replay sanitization gap as
+						// functionCall.name above — fnName here is the
+						// raw Claude-side name recovered from toolIDToName.
+						part, _ = sjson.Set(part, "functionResponse.name", sanitizeGeminiFunctionName(fnName))
 						if toolUseID != "" {
 							part, _ = sjson.Set(part, "functionResponse.id", toolUseID)
 						}
@@ -1127,17 +1188,28 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// it must still send an explicit thinkingBudget:0 rather than fall
 	// through to Gemini's own default (models that think by default would
 	// otherwise keep thinking with no cap at all).
-	out, _ = sjson.Set(out, "generationConfig.thinkingConfig.includeThoughts", budget != 0)
-	if budget > 0 {
-		if hasMeta && modelMeta.MinThinkingBudget > 0 && budget < modelMeta.MinThinkingBudget {
-			budget = modelMeta.MinThinkingBudget
+	// An audit caught that thinkingConfig was injected unconditionally,
+	// with no check against the model catalog's own Thinking capability
+	// flag — a 3rd-party model routed through CloudCode's native-model
+	// passthrough (tiering.go's "Explicit native models preservation"
+	// case, e.g. "gpt-oss-120b-medium") that genuinely doesn't support
+	// thinking got thinkingConfig anyway, and Google rejects that outright
+	// with "Thinking is not supported for this model". Only known-false
+	// (hasMeta && !modelMeta.Thinking) skips it — an unrecognized model
+	// still gets the existing best-effort behavior, same as before.
+	if !hasMeta || modelMeta.Thinking {
+		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.includeThoughts", budget != 0)
+		if budget > 0 {
+			if hasMeta && modelMeta.MinThinkingBudget > 0 && budget < modelMeta.MinThinkingBudget {
+				budget = modelMeta.MinThinkingBudget
+			}
+			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", budget)
+		} else if budget < 0 {
+			// -1 enables ModeAuto unbracketed
+			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", -1)
+		} else {
+			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", 0)
 		}
-		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", budget)
-	} else if budget < 0 {
-		// -1 enables ModeAuto unbracketed
-		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", -1)
-	} else {
-		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", 0)
 	}
 
 	// 6.5 Carry over sampling hyperparameters: previously dropped entirely,

@@ -58,6 +58,33 @@ func conservativeTokenEstimate(v interface{}) int {
 // screenshot sitting inside a tool_result fell through to the same
 // len(json)/2 flat estimate conservativeTokenEstimate exists to avoid for
 // a top-level image block — only one level shallower.
+// contentSourceTextFromBlockMap extracts the real text from a
+// source.type=="content" document's "content" field — either a literal
+// string, or an array of {"type":"text","text":...} blocks — operating on
+// the plain map[string]interface{} shape this file uses throughout
+// (unlike token_estimator.go/translator.go, which use gjson on raw bytes).
+func contentSourceTextFromBlockMap(content interface{}) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []interface{}:
+		var sb strings.Builder
+		for _, item := range c {
+			if m, ok := item.(map[string]interface{}); ok {
+				if m["type"] == "text" {
+					if t, ok := m["text"].(string); ok {
+						sb.WriteString(t)
+					}
+				}
+			} else if s, ok := item.(string); ok {
+				sb.WriteString(s)
+			}
+		}
+		return sb.String()
+	}
+	return ""
+}
+
 func blockTokenEstimate(bMap map[string]interface{}) int {
 	switch bMap["type"] {
 	case "image":
@@ -68,6 +95,18 @@ func blockTokenEstimate(bMap map[string]interface{}) int {
 		// Using flatTokenEstimate (len/2) treats base64 text as raw ASCII tokens, pricing a 2MB
 		// PDF at 1.33M tokens and instantly destroying conversation history.
 		if src, ok := bMap["source"].(map[string]interface{}); ok {
+			if src["type"] == "content" {
+				// An audit caught that Anthropic's other text-document
+				// form — source.type == "content" (no "data" field at
+				// all, the real text lives in "content" instead) — fell
+				// through every branch below (all gated on "data" being a
+				// string) straight to the flat 2500-token floor at the
+				// bottom of this function, regardless of the document's
+				// real size. A genuinely large "content" document could
+				// silently blow past the real budget this function exists
+				// to enforce, since its true size was never measured.
+				return flatTokenEstimate(contentSourceTextFromBlockMap(src["content"]))
+			}
 			if dataStr, isStr := src["data"].(string); isStr {
 				if src["type"] == "base64" {
 					// An audit caught that fmt.Sprint on a missing

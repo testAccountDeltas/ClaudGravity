@@ -157,9 +157,42 @@ var awkNRPattern = regexp.MustCompile(`(?i)\bNR\s*[<>=!]`)
 // progress (a file write), which should reset the window, not add to it.
 var catIsWritePattern = regexp.MustCompile(`(?i)\bcat\b[^|]*>`)
 
+// stderrRedirectPattern matches a file-descriptor-specific redirect used to
+// suppress error output — `2>/dev/null`, `2>&1`, `2>$null` (PowerShell) —
+// rather than a genuine stdout write. An audit caught that catIsWritePattern
+// and powerShellIsWritePattern both just look for any literal ">" in the
+// command, with no way to distinguish that from a plain READ command that
+// merely silences its stderr (e.g. `cat file.txt 2>/dev/null`, `Get-Content
+// file.txt 2>$null`) — RE2 (Go's regexp engine) has no lookbehind to assert
+// "not preceded by a digit" directly in the write-pattern regexes
+// themselves, so strip this specific shape out of the command first,
+// before testing for a real write-redirect.
+var stderrRedirectPattern = regexp.MustCompile(`[0-9]>\S*`)
+
+func stripStderrRedirects(command string) string {
+	return stderrRedirectPattern.ReplaceAllString(command, "")
+}
+
+// grepInvocationPattern requires grep/rg to appear as an actual COMMAND —
+// at the start of the string, or right after a shell command-boundary
+// (whitespace, pipe, semicolon, &&/||) — not merely as a substring anywhere
+// in the command line. An audit caught that a plain strings.Contains(lc,
+// "grep") also matched "grep" sitting inside a file PATH being read, e.g.
+// `cat cmd/grep/main.go` or `less grep_test.go`, wrongly treating an
+// ordinary file read as "used search" and skipping it from the read-loop
+// counter entirely — the exact opposite of what a loop-nudge guard is for.
+var grepInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])(grep|rg)\b`)
+
+// psSearchInvocationPattern is grepInvocationPattern's PowerShell
+// counterpart, covering findstr/grep/rg the same way — select-string is
+// intentionally excluded here since it's checked separately with a plain
+// substring match (a file path segment named exactly "select-string" is
+// implausible enough not to bother with a command-boundary check).
+var psSearchInvocationPattern = regexp.MustCompile(`(?i)(^|[\s;&|])(findstr|grep|rg)\b`)
+
 func isReadEquivalentBashCommand(command string) bool {
 	lc := strings.ToLower(command)
-	if strings.Contains(lc, "grep") || strings.Contains(lc, "rg ") || strings.HasPrefix(lc, "rg") {
+	if grepInvocationPattern.MatchString(command) {
 		return false
 	}
 	if strings.Contains(lc, "awk") {
@@ -172,7 +205,7 @@ func isReadEquivalentBashCommand(command string) bool {
 	if strings.Contains(lc, "readlines") || strings.Contains(lc, "splitlines") {
 		return true
 	}
-	if strings.Contains(lc, "cat") && catIsWritePattern.MatchString(command) {
+	if strings.Contains(lc, "cat") && catIsWritePattern.MatchString(stripStderrRedirects(command)) {
 		return false
 	}
 	return readEquivalentBashPattern.MatchString(command)
@@ -206,12 +239,11 @@ func isReadEquivalentPowerShellCommand(command string) bool {
 	// caught that only select-string was excluded, so a genuine targeted
 	// search piped through any of the others got miscounted as unproductive
 	// reading instead of recognized as exactly what the nudge recommends.
-	if strings.Contains(lc, "select-string") || strings.Contains(lc, "findstr") ||
-		strings.Contains(lc, "grep") || strings.Contains(lc, "rg ") || strings.HasPrefix(lc, "rg") {
+	if strings.Contains(lc, "select-string") || psSearchInvocationPattern.MatchString(command) {
 		return false
 	}
 	if readEquivalentPowerShellPattern.MatchString(command) {
-		if powerShellIsWritePattern.MatchString(command) {
+		if powerShellIsWritePattern.MatchString(stripStderrRedirects(command)) {
 			return false
 		}
 		return true

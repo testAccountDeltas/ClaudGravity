@@ -711,7 +711,7 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 	}
 
 	// 5. Advanced Whitespace-Insensitive & Tab Matching (Line-by-line Sliding Window)
-	repairedExact, lineIndents, ok := findFuzzyLineMatch(fileContent, oldStr)
+	repairedExact, lineIndents, fileLine0Indent, ok := findFuzzyLineMatch(fileContent, oldStr)
 	if ok && repairedExact != "" {
 		repaired, err := sjson.Set(argsRaw, oldStrKey, repairedExact)
 		if err == nil {
@@ -739,7 +739,7 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 				// line added/removed), reapplyLineIndents falls back to a
 				// uniform best-effort indent for lines 1..N instead of a
 				// precise 1:1 mapping.
-				if reindented, did := reapplyLineIndents(effectiveNewStr, lineIndents); did {
+				if reindented, did := reapplyLineIndents(effectiveNewStr, lineIndents, fileLine0Indent); did {
 					effectiveNewStr = reindented
 				}
 				if effectiveNewStr != newStr {
@@ -765,7 +765,15 @@ func repairEditToolCallCore(toolName string, argsRaw string, sessionID string) (
 // correspond 1:1 (lines were added/removed), and guessing which new line
 // maps to which old one would risk indenting the wrong line instead of
 // just leaving the ambiguous case alone.
-func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
+// stripOnlyIndentMarker is a sentinel findFuzzyLineMatch stores in
+// lineIndents[0] instead of "" when its own start-offset shift already
+// preserved the file's real indentation as untouched surrounding text —
+// new_string's line 0 must have any leading whitespace of its OWN
+// stripped (not replaced with anything) so it doesn't stack on top of
+// that preserved prefix, but nothing should be prepended here.
+const stripOnlyIndentMarker = "\x00strip-only\x00"
+
+func reapplyLineIndents(newStr string, lineIndents []string, fileLine0Indent string) (string, bool) {
 	hasAny := false
 	for _, ind := range lineIndents {
 		if ind != "" {
@@ -773,7 +781,15 @@ func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
 			break
 		}
 	}
-	if !hasAny {
+	// An audit caught that a single-line old_string expanding into a
+	// multi-line new_string had no information at all to indent lines
+	// 1..N with: there's no old_string line 1..N to compare against the
+	// file, so lineIndents (length 1) carries nothing for them even when
+	// old_string's own line 0 matched the file exactly (lineIndents[0] ==
+	// ""). Keep going in that specific case so the fallback below can use
+	// fileLine0Indent as a best-effort base for the newly-inserted lines,
+	// instead of leaving them flush-left.
+	if !hasAny && !(len(lineIndents) == 1 && fileLine0Indent != "" && strings.Contains(newStr, "\n")) {
 		return newStr, false
 	}
 	lines := strings.Split(newStr, "\n")
@@ -785,7 +801,13 @@ func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
 	// zeroes it out itself when its own start-offset shift already fixed
 	// it), so there's never a need to guess at a uniform indent for it the
 	// way lines 1..N do below.
-	if len(lineIndents) > 0 && lineIndents[0] != "" {
+	if len(lineIndents) > 0 && lineIndents[0] == stripOnlyIndentMarker {
+		trimmed := strings.TrimLeft(lines[0], " \t")
+		if trimmed != lines[0] {
+			lines[0] = trimmed
+			changed = true
+		}
+	} else if len(lineIndents) > 0 && lineIndents[0] != "" {
 		trimmed := strings.TrimLeft(lines[0], " \t")
 		if lineIndents[0]+trimmed != lines[0] {
 			lines[0] = lineIndents[0] + trimmed
@@ -841,6 +863,14 @@ func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
 				baseIndent = ind
 			}
 		}
+		if baseIndent == "" && len(lineIndents) == 1 && fileLine0Indent != "" {
+			// old_string was a single line, so there's no lines-1..N
+			// indentation to have detected in the first place — fall
+			// back to the file's own indentation at that single matched
+			// line as a best-effort base for whatever new lines the
+			// model inserted after it.
+			baseIndent = fileLine0Indent
+		}
 		if baseIndent != "" {
 			for j := range lines {
 				if j == 0 {
@@ -869,7 +899,7 @@ func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
 // must be re-applied to new_string if the caller doesn't want to lose it,
 // ok). lineIndents has exactly as many entries as oldStr has lines; most
 // are "" (that line's own indentation already matched).
-func findFuzzyLineMatch(fileContent, oldStr string) (string, []string, bool) {
+func findFuzzyLineMatch(fileContent, oldStr string) (string, []string, string, bool) {
 	// Parse model lines
 	rawOldLines := strings.Split(strings.ReplaceAll(oldStr, "\r\n", "\n"), "\n")
 	hasTrailingNewline := strings.HasSuffix(oldStr, "\n") || strings.HasSuffix(oldStr, "\r")
@@ -877,7 +907,7 @@ func findFuzzyLineMatch(fileContent, oldStr string) (string, []string, bool) {
 		rawOldLines = rawOldLines[:len(rawOldLines)-1]
 	}
 	if len(rawOldLines) == 0 {
-		return "", nil, false
+		return "", nil, "", false
 	}
 
 	var normOldLines []string
@@ -919,7 +949,7 @@ func findFuzzyLineMatch(fileContent, oldStr string) (string, []string, bool) {
 
 	mLen := len(normOldLines)
 	if len(fileLines) < mLen {
-		return "", nil, false
+		return "", nil, "", false
 	}
 
 	// Sliding window scan
@@ -978,6 +1008,14 @@ func findFuzzyLineMatch(fileContent, oldStr string) (string, []string, bool) {
 			}
 			lineIndents[j] = fileIndent
 		}
+		// Captured unconditionally (unlike lineIndents[0], which stays ""
+		// when old_string's line 0 already matched) so the caller has the
+		// file's real line-0 indentation available even in that matching
+		// case — needed below for a single-line-to-multi-line replacement,
+		// where lines 1..N never existed in old_string at all and so have
+		// no indent of their own to detect a mismatch against.
+		fileLine0Clean := fileLines[startIdx].clean
+		fileLine0Indent := fileLine0Clean[:len(fileLine0Clean)-len(strings.TrimLeft(fileLine0Clean, " \t"))]
 
 		startOffset := fileLines[startIdx].offset
 		// normalizeLineForMatch strips leading whitespace for comparison,
@@ -1010,7 +1048,17 @@ func findFuzzyLineMatch(fileContent, oldStr string) (string, []string, bool) {
 		oldLine0LeadingLen := len(rawOldLines[0]) - len(strings.TrimLeft(rawOldLines[0], " \t"))
 		if lineIndents[0] != "" && oldLine0LeadingLen == 0 {
 			startOffset += len(lineIndents[0])
-			lineIndents[0] = "" // already handled via the span shift above
+			// An audit caught a remaining edge case even after the shift:
+			// it assumes new_string's line 0 mirrors old_string's own lack
+			// of indentation (the common case), but if the model happened
+			// to write new_string's line 0 WITH its own leading whitespace
+			// anyway (while old_string had none), that whitespace would
+			// land right after the real indentation this shift already
+			// preserves, doubling it (e.g. "\t\t" instead of "\t"). Use a
+			// sentinel so reapplyLineIndents strips any such whitespace
+			// from new_string's line 0 without prepending anything — the
+			// correct indentation already comes from the preserved span.
+			lineIndents[0] = stripOnlyIndentMarker
 		}
 		lastLine := fileLines[endIdx]
 
@@ -1022,11 +1070,11 @@ func findFuzzyLineMatch(fileContent, oldStr string) (string, []string, bool) {
 		}
 
 		if endOffset <= len(fileContent) && startOffset <= endOffset {
-			return fileContent[startOffset:endOffset], lineIndents, true
+			return fileContent[startOffset:endOffset], lineIndents, fileLine0Indent, true
 		}
 	}
 
-	return "", nil, false
+	return "", nil, "", false
 }
 
 // RepairGrepToolCall and RepairGlobToolCall catch the specific ways Gemini

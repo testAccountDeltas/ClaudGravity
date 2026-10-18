@@ -858,6 +858,31 @@ func (s *SSEStreamer) ProcessGeminiChunk(chunkJSON []byte) error {
 
 	parts := cand.Get("content.parts")
 	if parts.IsArray() {
+		// An audit re-raised the known thought->text->functionCall
+		// signature-loss gap (closeCurrentBlock streams signature_delta
+		// to the client irreversibly the moment a non-thinking part
+		// closes the block, before a LATER part's real signature is
+		// seen) — a full fix needs cross-chunk buffering, which carries
+		// real ordering/latency risk and was deliberately left alone in
+		// two earlier rounds. But live captures confirm Gemini commonly
+		// delivers a thought part and its functionCall's thoughtSignature
+		// together in the SAME candidate (same parts array, same call to
+		// this function) — in that specific case, a plain look-ahead over
+		// THIS chunk's own parts before processing any of them costs
+		// nothing (no buffering, no latency, a no-op when a chunk only
+		// ever has one part) and lets a later part's signature already be
+		// captured before an earlier text part's HandleText call closes
+		// the thinking block. Doesn't fully close the gap when Gemini
+		// splits them across separate chunks, but strictly improves the
+		// common same-chunk case with zero downside otherwise.
+		for _, part := range parts.Array() {
+			if sig := part.Get("thoughtSignature").String(); sig != "" {
+				s.lastTurnThoughtSignature = sig
+				if s.thoughtSignature == "" {
+					s.thoughtSignature = sig
+				}
+			}
+		}
 		for _, part := range parts.Array() {
 			partSig := part.Get("thoughtSignature").String()
 			if partSig != "" {

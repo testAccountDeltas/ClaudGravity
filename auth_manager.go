@@ -247,6 +247,15 @@ func (am *AccountManager) RefreshAccessToken(email string) (string, error) {
 			deadRefreshTokensMu.Lock()
 			deadRefreshTokens[email] = time.Now().Add(deadRefreshTokenCooldown)
 			deadRefreshTokensMu.Unlock()
+			// An audit caught that deadRefreshTokens alone only makes
+			// THIS function fail fast on a dead account — it says nothing
+			// to the account SELECTOR, which keeps choosing this same
+			// dead account for every new incoming user request (sticky
+			// affinity or scoring has no idea it's unusable) until the
+			// retry loop excludes it for that one attempt, burning a real
+			// slot out of maxAttempts on every single request. Put it in
+			// the selector's own cooldown too so it's skipped up front.
+			am.MarkAccountCooldown(email, deadRefreshTokenCooldown)
 		}
 		return "", fmt.Errorf("refresh failed (%d): %s", resp.StatusCode, string(bodyBytes))
 	}

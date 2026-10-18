@@ -140,13 +140,23 @@ func commonAPIMiddleware(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE, PUT")
-		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, x-claude-code-request-class, x-claude-code-agent-type, x-claude-code-agent-id, x-claude-code-prompt-id, x-session-id, x-claude-code-session-id")
+		// An audit caught anthropic-dangerous-direct-browser-access missing
+		// here — the official Anthropic SDKs send this REQUEST header
+		// specifically to opt into being called directly from a browser
+		// (bypassing the real API's own browser-origin block); without it
+		// allow-listed, the browser's own CORS preflight rejects the
+		// header before the request ever reaches this gateway.
+		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, x-claude-code-request-class, x-claude-code-agent-type, x-claude-code-agent-id, x-claude-code-prompt-id, x-session-id, x-claude-code-session-id")
 		// An audit noted the preflight response never set Max-Age, so a
 		// browser-based client re-sent an OPTIONS preflight before every
 		// single request instead of caching this permissive, static
 		// policy for a while.
 		h.Set("Access-Control-Max-Age", "86400")
-		h.Set("Access-Control-Expose-Headers", "anthropic-version, request-id, retry-after, anthropic-organization-id, anthropic-workspace-id, anthropic-ratelimit-requests-limit, anthropic-ratelimit-requests-remaining, anthropic-ratelimit-requests-reset, anthropic-ratelimit-tokens-limit, anthropic-ratelimit-tokens-remaining, anthropic-ratelimit-tokens-reset, anthropic-ratelimit-input-tokens-limit, anthropic-ratelimit-input-tokens-remaining, anthropic-ratelimit-input-tokens-reset, anthropic-ratelimit-output-tokens-limit, anthropic-ratelimit-output-tokens-remaining, anthropic-ratelimit-output-tokens-reset, anthropic-ratelimit-unified-5h-status, anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, anthropic-ratelimit-unified-7d-status, anthropic-ratelimit-unified-7d-utilization, anthropic-ratelimit-unified-7d-reset, anthropic-ratelimit-unified-status, anthropic-ratelimit-unified-representative-claim, anthropic-ratelimit-unified-reset")
+		// An audit caught the unified-overage-* headers (set further down
+		// in applyRateLimitHeaders) missing from this list — they were
+		// present on the wire but invisible to browser-side JS, which can
+		// only read a response header a CORS preflight explicitly exposed.
+		h.Set("Access-Control-Expose-Headers", "anthropic-version, request-id, retry-after, anthropic-organization-id, anthropic-workspace-id, anthropic-ratelimit-requests-limit, anthropic-ratelimit-requests-remaining, anthropic-ratelimit-requests-reset, anthropic-ratelimit-tokens-limit, anthropic-ratelimit-tokens-remaining, anthropic-ratelimit-tokens-reset, anthropic-ratelimit-input-tokens-limit, anthropic-ratelimit-input-tokens-remaining, anthropic-ratelimit-input-tokens-reset, anthropic-ratelimit-output-tokens-limit, anthropic-ratelimit-output-tokens-remaining, anthropic-ratelimit-output-tokens-reset, anthropic-ratelimit-unified-5h-status, anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, anthropic-ratelimit-unified-7d-status, anthropic-ratelimit-unified-7d-utilization, anthropic-ratelimit-unified-7d-reset, anthropic-ratelimit-unified-status, anthropic-ratelimit-unified-representative-claim, anthropic-ratelimit-unified-reset, anthropic-ratelimit-unified-overage-status, anthropic-ratelimit-unified-overage-disabled-reason")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -548,6 +558,20 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"tier":"tier_4","status":"active","has_payment_method":true,"currency":"usd"}`))
 	}
+	// An audit caught these two were unhandled, same failure mode as the
+	// organizations/billing endpoints above: Claude Code CLI calls
+	// policy_limits on startup/compliance checks and prints a visible
+	// terminal warning ("Couldn't load your organization's policy...")
+	// when it 404s; claude_code_first_token_date is queried during
+	// onboarding.
+	handlePolicyLimitsJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"restrictions":{},"compliance_taints":[]}`))
+	}
+	handleFirstTokenDateJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"first_token_date":null}`))
+	}
 
 	mux.HandleFunc("/api/claude_cli_profile", handleProfileJSON)
 	mux.HandleFunc("/api/oauth/profile", handleProfileJSON)
@@ -567,6 +591,8 @@ func main() {
 	mux.HandleFunc("/api/auth/current_user", handleAuthCurrentUserJSON)
 	mux.HandleFunc("/api/organizations/current/billing", handleBillingJSON)
 	mux.HandleFunc("/api/organizations/{id}/billing", handleBillingJSON)
+	mux.HandleFunc("/api/claude_code/policy_limits", handlePolicyLimitsJSON)
+	mux.HandleFunc("/api/organization/claude_code_first_token_date", handleFirstTokenDateJSON)
 
 	// Separate mux for TLS-intercepted anthropic.com/claude.ai traffic (see
 	// HandleConnectTunnel). This must NOT be the same mux as above: that one
@@ -648,6 +674,8 @@ func main() {
 	interceptedMux.Handle("/api/auth/current_user", commonAPIMiddleware(http.HandlerFunc(handleAuthCurrentUserJSON)))
 	interceptedMux.Handle("/api/organizations/current/billing", commonAPIMiddleware(http.HandlerFunc(handleBillingJSON)))
 	interceptedMux.Handle("/api/organizations/{id}/billing", commonAPIMiddleware(http.HandlerFunc(handleBillingJSON)))
+	interceptedMux.Handle("/api/claude_code/policy_limits", commonAPIMiddleware(http.HandlerFunc(handlePolicyLimitsJSON)))
+	interceptedMux.Handle("/api/organization/claude_code_first_token_date", commonAPIMiddleware(http.HandlerFunc(handleFirstTokenDateJSON)))
 	interceptedMux.Handle("/v1/embeddings", commonAPIMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleEmbeddings(cfgMgr, w, r)
 	})))
@@ -658,7 +686,17 @@ func main() {
 	interceptedMux.Handle("/v1/complete", commonAPIMiddleware(http.HandlerFunc(handleDeprecatedComplete)))
 	interceptedMux.Handle("/v1/messages/batches", commonAPIMiddleware(http.HandlerFunc(handleUnsupportedBatches)))
 	interceptedMux.Handle("/v1/messages/batches/", commonAPIMiddleware(http.HandlerFunc(handleUnsupportedBatches)))
-	interceptedMux.Handle("/v1/", commonAPIMiddleware(http.HandlerFunc(handleUnknownV1Path)))
+	// An audit caught that a "/v1/" catch-all here (added for the plain
+	// mux, where there's no real Anthropic to fall back to) was a mistake
+	// on the MITM mux specifically: Go's ServeMux always prefers the
+	// longest matching registered pattern, so ANY "/v1/*" path this
+	// gateway hasn't explicitly implemented — "/v1/skills", "/v1/sessions",
+	// the MCP proxy's own "/v1/..." calls — matched this "/v1/" prefix
+	// instead of falling through to "/" (PassthroughToReal), getting a
+	// local 404 instead of transparently reaching the real
+	// api.anthropic.com. The whole point of MITM mode is that unimplemented
+	// paths pass through; only explicitly-handled "/v1/*" routes should
+	// ever get a local answer here.
 	interceptedMux.HandleFunc("/", PassthroughToReal)
 
 	proxySecret := cfgMgr.ProxySecret()
@@ -2347,9 +2385,19 @@ func executeNonStreaming(
 	// this as [], same issue already guarded against in sse.go's streaming
 	// path.
 	if contentBlocks, ok := claudeResp["content"].([]map[string]interface{}); ok && len(contentBlocks) == 0 {
+		// An audit caught that a safety-blocked candidate with genuinely
+		// zero parts (finishReason SAFETY/RECITATION/etc., stopReason
+		// already set to "refusal" above) fell into this same generic
+		// fallback and got the literal placeholder "(empty response)"
+		// instead of refusal-shaped text — sse.go's streaming path
+		// already uses real refusal text for the equivalent case.
+		emptyText := "(empty response)"
+		if claudeResp["stop_reason"] == "refusal" {
+			emptyText = "I'm not able to help with that request."
+		}
 		claudeResp["content"] = append(contentBlocks, map[string]interface{}{
 			"type": "text",
-			"text": "(empty response)",
+			"text": emptyText,
 		})
 	}
 
@@ -2478,12 +2526,27 @@ func allModels() []map[string]interface{} {
 			continue
 		}
 		seen[m.ID] = true
-		out = append(out, map[string]interface{}{
+		// An audit caught that these dynamically-discovered entries
+		// (gemini-3.8-flash-high/-medium/-low etc. — the real tiering
+		// targets, fetched live from Google) were missing
+		// max_input_tokens/max_tokens/capabilities entirely, unlike every
+		// static knownModels entry above — an SDK reading /v1/models to
+		// decide context budgeting or thinking support for one of these
+		// IDs got nothing to go on.
+		entry := map[string]interface{}{
 			"id":           m.ID,
 			"type":         "model",
 			"display_name": m.DisplayName,
 			"created_at":   "2026-01-01T00:00:00Z",
-		})
+			"capabilities": map[string]interface{}{"tools": true, "thinking": m.Thinking, "vision": true},
+		}
+		if m.MaxTokens > 0 {
+			entry["max_input_tokens"] = m.MaxTokens
+		}
+		if m.MaxOutput > 0 {
+			entry["max_tokens"] = m.MaxOutput
+		}
+		out = append(out, entry)
 	}
 	return out
 }
@@ -2866,15 +2929,26 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 	// quota numbers (only fractions-remaining), so these use the same
 	// round synthetic ceiling the unified headers' own fake org/workspace
 	// IDs already rely on — honest about utilization, not a real count.
-	if fiveHourBucket != nil {
+	// An audit caught that gating this whole block on fiveHourBucket alone
+	// meant an account with ONLY a weekly bucket (no 5h data parsed, or
+	// genuinely 5h-exhausted-and-expired while the week isn't) got NONE
+	// of these standard headers at all — not degraded, just silently
+	// absent, violating the exact "every successful response carries
+	// these" contract this comment itself is about. Fall back to the
+	// weekly bucket's frac/reset when the 5h one isn't available.
+	standardFrac, standardReset, haveStandard := fiveHourFrac, fiveHourReset, fiveHourBucket != nil
+	if !haveStandard && weeklyBucket != nil {
+		standardFrac, standardReset, haveStandard = weeklyFrac, weeklyReset, true
+	}
+	if haveStandard {
 		const reqLimit, tokLimit = 1000, 1000000
 		header.Set("anthropic-ratelimit-requests-limit", fmt.Sprintf("%d", reqLimit))
-		header.Set("anthropic-ratelimit-requests-remaining", fmt.Sprintf("%d", int(float64(reqLimit)*(1-fiveHourFrac))))
-		header.Set("anthropic-ratelimit-requests-reset", time.Unix(fiveHourReset, 0).UTC().Format(time.RFC3339))
+		header.Set("anthropic-ratelimit-requests-remaining", fmt.Sprintf("%d", int(float64(reqLimit)*(1-standardFrac))))
+		header.Set("anthropic-ratelimit-requests-reset", time.Unix(standardReset, 0).UTC().Format(time.RFC3339))
 		header.Set("anthropic-ratelimit-tokens-limit", fmt.Sprintf("%d", tokLimit))
-		header.Set("anthropic-ratelimit-tokens-remaining", fmt.Sprintf("%d", int(float64(tokLimit)*(1-fiveHourFrac))))
-		header.Set("anthropic-ratelimit-tokens-reset", time.Unix(fiveHourReset, 0).UTC().Format(time.RFC3339))
-		setSplitTokenRateLimitHeaders(header, tokLimit, 1-fiveHourFrac, time.Unix(fiveHourReset, 0))
+		header.Set("anthropic-ratelimit-tokens-remaining", fmt.Sprintf("%d", int(float64(tokLimit)*(1-standardFrac))))
+		header.Set("anthropic-ratelimit-tokens-reset", time.Unix(standardReset, 0).UTC().Format(time.RFC3339))
+		setSplitTokenRateLimitHeaders(header, tokLimit, 1-standardFrac, time.Unix(standardReset, 0))
 	}
 
 	// anthropic-organization-id/anthropic-workspace-id are set earlier in
