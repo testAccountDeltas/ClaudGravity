@@ -199,7 +199,7 @@ type SSEStreamer struct {
 	estInputTokens           int             // approximate input token count, known upfront unlike Gemini's real usageMetadata (only arrives at stream end)
 	preferRussian            bool            // conversation's own language, detected from the user's latest message — picks which language gateway-synthesized text (grounding footer) uses, since that text bypasses the model entirely
 	syntheticReasonTools     map[string]bool // tool names whose Gemini-bound schema got our synthetic "reason" placeholder injected (translator.go); that key is stripped back out of the model's actual function-call args before handing them to Claude Code
-	hasCacheControl          bool            // whether the client's own request set an Anthropic cache_control breakpoint anywhere — gates the cache_creation_input_tokens simulation in FinishStream, see hasCacheControlBreakpoint's doc comment
+	cachePrefixFrac          float64         // 0 if the client's request set no Anthropic cache_control breakpoint; otherwise the approximate fraction of uncached input tokens that sit before the breakpoint — gates AND scales the cache_creation_input_tokens simulation in FinishStream, see cacheBreakpointPrefixFraction's doc comment
 	disableParallelToolUse   bool            // client's disable_parallel_tool_use — HandleFunctionCall drops any call past the first when set, see wantsSingleToolUse's doc comment
 }
 
@@ -215,7 +215,7 @@ const (
 	TypeToolUse  = 3
 )
 
-func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool, hasCacheControl bool, disableParallelToolUse bool) *SSEStreamer {
+func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, model string, sessionID string, requestedSafeguards bool, estInputTokens int, preferRussian bool, syntheticReasonTools map[string]bool, hasPriorTurns bool, cachePrefixFrac float64, disableParallelToolUse bool) *SSEStreamer {
 	return &SSEStreamer{
 		rid:                    rid,
 		w:                      w,
@@ -229,7 +229,7 @@ func NewSSEStreamer(rid uint64, w http.ResponseWriter, flusher http.Flusher, mod
 		estInputTokens:         estInputTokens,
 		preferRussian:          preferRussian,
 		syntheticReasonTools:   syntheticReasonTools,
-		hasCacheControl:        hasCacheControl,
+		cachePrefixFrac:        cachePrefixFrac,
 		disableParallelToolUse: disableParallelToolUse,
 		hasPriorTurns:          hasPriorTurns,
 	}
@@ -635,11 +635,17 @@ func (s *SSEStreamer) FinishStream(finishReason string) error {
 	// — an audit caught this firing on every large, cache-miss prompt
 	// regardless of whether caching was ever requested, misreporting a
 	// plain request as one that paid for a (more expensive) cache write.
-	if s.cacheTokens == 0 && uncachedInputTokens > 1024 && s.hasCacheControl {
-		cacheCreationTokens = uncachedInputTokens
+	//
+	// A second audit caught that treating the ENTIRE uncached amount as
+	// cache_creation (zeroing input_tokens outright) overstates it: only
+	// the prefix up to the breakpoint is actually written to cache, and
+	// the current turn's own new content after it should stay counted as
+	// plain input_tokens. s.cachePrefixFrac approximates that split.
+	if s.cacheTokens == 0 && uncachedInputTokens > cacheCreationThreshold(s.model) && s.cachePrefixFrac > 0 {
+		cacheCreationTokens = int64(float64(uncachedInputTokens) * s.cachePrefixFrac)
 		// In Anthropic's formula: Total prompt tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens.
 		// Tokens that created cache must NOT be counted in input_tokens as well, or SDKs double-count every token.
-		uncachedInputTokens = 0
+		uncachedInputTokens -= cacheCreationTokens
 	}
 
 	// Record this turn's real cache fraction for the NEXT turn's message_start estimate

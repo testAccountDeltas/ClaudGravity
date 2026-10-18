@@ -203,14 +203,25 @@ func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey
 	// only one stickyMap entry per apiKey, shared by the main thread and
 	// every subagent, so this collapsed 5-10 parallel subagents onto the
 	// exact same Google account on their first request and then PERSISTED
-	// that via bindAffinityLocked below, undoing the whole point of
+	// that via RememberAffinity on success, undoing the whole point of
 	// qualifying conversationKey by instanceID in the first place.
 	isSubagentKey := strings.Count(conversationKey, ":") >= 2
 	if !isSubagentKey && (tenant.Strategy == "sticky" || tenant.Strategy == "") && apiKey != "" {
 		if assignedEmail, ok := as.stickyMap[apiKey]; ok {
 			for _, acc := range accounts {
 				if acc.Email == assignedEmail && !isExcluded(acc) && hasRemainingQuota(acc) {
-					as.bindAffinityLocked(conversationKey, acc.Email, now)
+					// An audit caught that binding session affinity HERE —
+					// at selection time, before any network attempt with
+					// this account has even started — meant a retry
+					// (SelectAccountExcluding called again with this
+					// account now excluded after a transient
+					// timeout/429) immediately overwrote the conversation's
+					// affinity to whichever account the retry picked next,
+					// even if that pick never ends up succeeding either.
+					// RememberAffinity already does this correctly, gated
+					// on an actual confirmed HTTP 200 (server.go), so the
+					// speculative bind here only ever destroyed the
+					// previous account's warm KV-cache for no benefit.
 					return acc, nil
 				}
 			}
@@ -234,7 +245,9 @@ func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey
 			if !isSubagentKey && apiKey != "" {
 				as.stickyMap[apiKey] = chosen.Email
 			}
-			as.bindAffinityLocked(conversationKey, chosen.Email, now)
+			// Speculative affinity bind removed here too — see the sticky
+			// branch above for why; RememberAffinity (server.go, gated on
+			// a confirmed 200) is now the only place affinity gets set.
 			return chosen, nil
 		}
 	}
@@ -265,14 +278,26 @@ func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey
 		if !isSubagentKey && apiKey != "" {
 			as.stickyMap[apiKey] = bestAcc.Email
 		}
-		as.bindAffinityLocked(conversationKey, bestAcc.Email, now)
+		// Speculative affinity bind removed here too — see the sticky
+		// branch above for why.
 		return bestAcc, nil
 	}
 
-	// 5. Fallback: Round-Robin across any non-excluded accounts
+	// 5. Fallback: Round-Robin across any non-excluded accounts not
+	// currently in cooldown.
+	//
+	// An audit caught that this filtered only on isExcluded (accounts
+	// already tried THIS request) and never checked CooldownUntil at
+	// all — reaching this step means step 4b's maxQuota>0 check already
+	// failed, i.e. every account's effective quota fraction is at or near
+	// zero, overwhelmingly because they're all in cooldown. Without this
+	// check, every one of the caller's retry attempts picked a
+	// guaranteed-to-fail cooling-down account and burned a real network
+	// round-trip on it, instead of recognizing the pool is genuinely
+	// exhausted and failing fast with 429.
 	valid := make([]*AccountRecord, 0)
 	for _, acc := range accounts {
-		if !isExcluded(acc) {
+		if !isExcluded(acc) && (acc.CooldownUntil.IsZero() || !now.Before(acc.CooldownUntil)) {
 			valid = append(valid, acc)
 		}
 	}
@@ -283,7 +308,8 @@ func (as *AccountSelector) SelectAccountExcluding(apiKey string, conversationKey
 
 	as.roundRobinIdx = (as.roundRobinIdx + 1) % len(valid)
 	chosen := valid[as.roundRobinIdx]
-	as.bindAffinityLocked(conversationKey, chosen.Email, now)
+	// Speculative affinity bind removed here too — see the sticky branch
+	// above for why.
 	return chosen, nil
 }
 

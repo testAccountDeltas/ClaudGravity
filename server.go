@@ -141,7 +141,12 @@ func commonAPIMiddleware(next http.Handler) http.Handler {
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE, PUT")
 		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, x-claude-code-request-class, x-claude-code-agent-type, x-claude-code-agent-id, x-claude-code-prompt-id, x-session-id, x-claude-code-session-id")
-		h.Set("Access-Control-Expose-Headers", "anthropic-version, request-id, retry-after, anthropic-organization-id, anthropic-workspace-id, anthropic-ratelimit-requests-limit, anthropic-ratelimit-requests-remaining, anthropic-ratelimit-requests-reset, anthropic-ratelimit-tokens-limit, anthropic-ratelimit-tokens-remaining, anthropic-ratelimit-tokens-reset, anthropic-ratelimit-unified-5h-status, anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, anthropic-ratelimit-unified-7d-status, anthropic-ratelimit-unified-7d-utilization, anthropic-ratelimit-unified-7d-reset, anthropic-ratelimit-unified-status, anthropic-ratelimit-unified-representative-claim, anthropic-ratelimit-unified-reset")
+		// An audit noted the preflight response never set Max-Age, so a
+		// browser-based client re-sent an OPTIONS preflight before every
+		// single request instead of caching this permissive, static
+		// policy for a while.
+		h.Set("Access-Control-Max-Age", "86400")
+		h.Set("Access-Control-Expose-Headers", "anthropic-version, request-id, retry-after, anthropic-organization-id, anthropic-workspace-id, anthropic-ratelimit-requests-limit, anthropic-ratelimit-requests-remaining, anthropic-ratelimit-requests-reset, anthropic-ratelimit-tokens-limit, anthropic-ratelimit-tokens-remaining, anthropic-ratelimit-tokens-reset, anthropic-ratelimit-input-tokens-limit, anthropic-ratelimit-input-tokens-remaining, anthropic-ratelimit-input-tokens-reset, anthropic-ratelimit-output-tokens-limit, anthropic-ratelimit-output-tokens-remaining, anthropic-ratelimit-output-tokens-reset, anthropic-ratelimit-unified-5h-status, anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, anthropic-ratelimit-unified-7d-status, anthropic-ratelimit-unified-7d-utilization, anthropic-ratelimit-unified-7d-reset, anthropic-ratelimit-unified-status, anthropic-ratelimit-unified-representative-claim, anthropic-ratelimit-unified-reset")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -166,6 +171,26 @@ func commonAPIMiddleware(next http.Handler) http.Handler {
 // account-rotation loop exhausts retries) meant a 429 (quota) or 503/502/504
 // (upstream overloaded) got surfaced as a type SDKs don't know to retry —
 // they'd hard-fail instead of backing off and trying again.
+// setSplitTokenRateLimitHeaders sets the input/output-specific token
+// rate-limit headers Anthropic's spec defines alongside (not instead of)
+// the aggregated anthropic-ratelimit-tokens-* triplet this gateway already
+// sends. These are synthetic, like the aggregated numbers they split — the
+// gateway has no real per-tenant quota to report — using an 80/20
+// input/output split as a representative approximation of a typical
+// Claude-Code-shaped workload (large context reads, comparatively short
+// generations).
+func setSplitTokenRateLimitHeaders(header http.Header, tokLimit int, remainingFrac float64, reset time.Time) {
+	inputLimit := int(float64(tokLimit) * 0.8)
+	outputLimit := tokLimit - inputLimit
+	resetStr := reset.UTC().Format(time.RFC3339)
+	header.Set("anthropic-ratelimit-input-tokens-limit", fmt.Sprintf("%d", inputLimit))
+	header.Set("anthropic-ratelimit-input-tokens-remaining", fmt.Sprintf("%d", int(float64(inputLimit)*remainingFrac)))
+	header.Set("anthropic-ratelimit-input-tokens-reset", resetStr)
+	header.Set("anthropic-ratelimit-output-tokens-limit", fmt.Sprintf("%d", outputLimit))
+	header.Set("anthropic-ratelimit-output-tokens-remaining", fmt.Sprintf("%d", int(float64(outputLimit)*remainingFrac)))
+	header.Set("anthropic-ratelimit-output-tokens-reset", resetStr)
+}
+
 func anthropicErrorTypeForStatus(status int) string {
 	switch status {
 	case http.StatusTooManyRequests:
@@ -185,6 +210,13 @@ func anthropicErrorTypeForStatus(status int) string {
 	case 529:
 		return "overloaded_error"
 	default:
+		// An audit caught that unhandled 4xx statuses (405, 415, 422, …)
+		// fell into api_error, but Anthropic's spec classifies every
+		// client (4xx) error as invalid_request_error — api_error is
+		// reserved for the gateway's own 5xx failures.
+		if status >= 400 && status < 500 {
+			return "invalid_request_error"
+		}
 		return "api_error"
 	}
 }
@@ -203,11 +235,31 @@ func stripThoughtFieldsForPublicAPI(geminiBody []byte) []byte {
 	if err := json.Unmarshal(geminiBody, &root); err != nil {
 		return geminiBody
 	}
+	changed := false
+	// An audit caught that remapping to gemini-2.5-flash for the public
+	// Gemini Developer API (server.go, right before this function runs)
+	// only fixes the model name — translator.go may have already baked in
+	// thinkingBudget: -1 (ModeAuto), which only the internal CloudCode/
+	// Antigravity endpoint understands; the public API rejects it outright
+	// with 400 INVALID_ARGUMENT. Pin it to a fixed, broadly-supported
+	// budget instead when present.
+	if genCfg, ok := root["generationConfig"].(map[string]interface{}); ok {
+		if thinkCfg, ok := genCfg["thinkingConfig"].(map[string]interface{}); ok {
+			if budget, ok := thinkCfg["thinkingBudget"].(float64); ok && budget < 0 {
+				thinkCfg["thinkingBudget"] = 8192
+				changed = true
+			}
+		}
+	}
 	contents, ok := root["contents"].([]interface{})
 	if !ok {
+		if changed {
+			if out, err := json.Marshal(root); err == nil {
+				return out
+			}
+		}
 		return geminiBody
 	}
-	changed := false
 	for _, c := range contents {
 		cm, ok := c.(map[string]interface{})
 		if !ok {
@@ -250,6 +302,12 @@ func stripThoughtFieldsForPublicAPI(geminiBody []byte) []byte {
 
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
 	w.Header().Set("Content-Type", "application/json")
+	// An audit caught these were only ever set on success responses
+	// (applyRateLimitHeaders) — a client expecting them on every response,
+	// error or not, saw them vanish specifically when something went
+	// wrong.
+	w.Header().Set("anthropic-organization-id", fakeOrgID)
+	w.Header().Set("anthropic-workspace-id", fakeWorkspaceID)
 	// The real Anthropic API answers an overloaded backend with HTTP 529,
 	// not 502/503/504 — some SDK retry/backoff logic keys off the literal
 	// wire status code, not just the JSON "type" field, so passing
@@ -282,6 +340,18 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 		// careful client could reasonably act on — zero these out too.
 		w.Header().Set("anthropic-ratelimit-requests-remaining", "0")
 		w.Header().Set("anthropic-ratelimit-tokens-remaining", "0")
+		// An audit caught that only the Claude-Code-specific
+		// unified-reset (a Unix timestamp) was ever set on a 429 — a
+		// generic Anthropic SDK reads the standard requests-reset/
+		// tokens-reset headers instead, in RFC 3339 UTC, and without them
+		// has no reset time to back off to.
+		resetAt := time.Now().Add(15 * time.Minute).UTC().Format(time.RFC3339)
+		if w.Header().Get("anthropic-ratelimit-requests-reset") == "" {
+			w.Header().Set("anthropic-ratelimit-requests-reset", resetAt)
+		}
+		if w.Header().Get("anthropic-ratelimit-tokens-reset") == "" {
+			w.Header().Set("anthropic-ratelimit-tokens-reset", resetAt)
+		}
 	} else if errType == "overloaded_error" {
 		w.Header().Set("Retry-After", "3")
 	}
@@ -371,6 +441,11 @@ func main() {
 		if r.Method == http.MethodPost {
 			handleMessages(cfgMgr, w, r)
 		} else {
+			// An audit caught that every 405 response here omitted the
+			// RFC 7231-required Allow header naming which methods ARE
+			// accepted — a well-behaved client has nothing to fall back
+			// to besides guessing.
+			w.Header().Set("Allow", "POST")
 			writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method Not Allowed")
 		}
 	})
@@ -417,11 +492,19 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("anthropic-organization-id", "0bad747f-0000-4000-a000-000000000000")
 		w.Header().Set("anthropic-workspace-id", "wrkspc_0000000000000000000000000")
-		_, _ = w.Write([]byte(`{"account":{"uuid":"0bad747f-0000-4000-a000-000000000000","email_address":"user@claudgravity.local"},"organization":{"uuid":"0bad747f-0000-4000-a000-000000000000","name":"ClaudGravity Workspace"}}`))
+		// An audit flagged (independent of its own unverifiable claude.exe
+		// decompilation) that this response only had "email_address", not
+		// "email" — checkable directly against our own structural claim
+		// here. Keep both so any client reading either name works.
+		_, _ = w.Write([]byte(`{"account":{"uuid":"0bad747f-0000-4000-a000-000000000000","email":"user@claudgravity.local","email_address":"user@claudgravity.local"},"organization":{"uuid":"0bad747f-0000-4000-a000-000000000000","name":"ClaudGravity Workspace"}}`))
 	}
 	handleValidateJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"valid":true}`))
+		// Same audit flagged this response lacked account_uuid/
+		// organization_uuid alongside "valid" — add them so a client that
+		// expects to read them back after validating doesn't see them as
+		// missing.
+		_, _ = w.Write([]byte(`{"valid":true,"account_uuid":"0bad747f-0000-4000-a000-000000000000","organization_uuid":"0bad747f-0000-4000-a000-000000000000"}`))
 	}
 	handleMetricsJSON := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -476,6 +559,7 @@ func main() {
 		if r.Method == http.MethodPost {
 			handleMessages(cfgMgr, w, r)
 		} else {
+			w.Header().Set("Allow", "POST")
 			writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method Not Allowed")
 		}
 	})))
@@ -651,8 +735,18 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	agentKey, agentType, subagentName, instanceID := ParseAgentInfo(r)
 	reqClass := r.Header.Get("x-claude-code-request-class")
 
+	// An audit caught that nothing here enforced Anthropic's documented
+	// 25MB request body cap (HTTP 413 request_too_large) — an unbounded
+	// io.ReadAll on a client sending a huge binary payload is a memory-
+	// exhaustion risk, not just a spec gap.
+	const maxRequestBodyBytes = 25 * 1024 * 1024
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
+		if err.Error() == "http: request body too large" {
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds the 25MB limit")
+			return
+		}
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
@@ -660,6 +754,28 @@ func handleMessages(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Reques
 	globalSpecCapture.Begin(rid)
 	globalSpecCapture.RecordClaudeRequest(rid, r.Header, bodyBytes)
 	defer globalSpecCapture.Finish(rid)
+
+	// An audit caught that no upfront schema check existed here — a
+	// request missing/malformed on "model", "messages", or "max_tokens"
+	// fell straight into account selection and burned up to 3 real
+	// upstream round-trips before eventually failing, instead of this
+	// instant, free rejection.
+	if !gjson.ValidBytes(bodyBytes) {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Request body must be valid JSON")
+		return
+	}
+	if !gjson.GetBytes(bodyBytes, "messages").IsArray() || len(gjson.GetBytes(bodyBytes, "messages").Array()) == 0 {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "\"messages\": array is required and must be non-empty")
+		return
+	}
+	if gjson.GetBytes(bodyBytes, "model").String() == "" {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "\"model\": required field is missing")
+		return
+	}
+	if mt := gjson.GetBytes(bodyBytes, "max_tokens"); !mt.Exists() || mt.Int() <= 0 {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "\"max_tokens\": required field must be a positive integer")
+		return
+	}
 
 	// 2. Derive Conversation Anchor for Session Affinity (Prompt Caching)
 	headerSessionID := r.Header.Get("x-claude-code-session-id")
@@ -1146,6 +1262,50 @@ func hasCacheControlBreakpoint(claudeBody []byte) bool {
 	return bytes.Contains(claudeBody, []byte(`"cache_control"`))
 }
 
+// cacheCreationThreshold returns the minimum uncached-prompt size (tokens)
+// below which the cache_creation_input_tokens simulation doesn't fire.
+// An audit caught this was hardcoded to 1024 everywhere — Anthropic's own
+// spec sets a higher minimum cacheable prefix, 2048 tokens, specifically
+// for the Haiku model family.
+func cacheCreationThreshold(claudeModelName string) int64 {
+	if strings.Contains(strings.ToLower(claudeModelName), "haiku") {
+		return 2048
+	}
+	return 1024
+}
+
+// cacheBreakpointPrefixFraction approximates how much of the request's
+// uncached input actually sits BEFORE the last cache_control breakpoint
+// (the part that would really get written to cache) versus after it (the
+// current turn's own new content, which real Anthropic billing still
+// counts as plain input_tokens).
+//
+// An audit caught that the cache_creation_input_tokens simulation below
+// unconditionally treated 100% of uncachedInTok as cache_creation and
+// zeroed input_tokens entirely once a breakpoint was merely present
+// anywhere — but a breakpoint near the start of a message (the common
+// case: it's set on an early, large system/tool block, with new user
+// content after it) means most of the "uncached" tokens are actually this
+// turn's own new content, not what's being written to cache. There's no
+// real token-level breakpoint signal available (same reason the whole
+// thing is a simulation), so this uses the breakpoint's byte offset within
+// the request body as a proxy for its proportion of the token stream —
+// coarse, but far closer than treating it as 100% either way.
+func cacheBreakpointPrefixFraction(claudeBody []byte) float64 {
+	idx := bytes.LastIndex(claudeBody, []byte(`"cache_control"`))
+	if idx <= 0 || len(claudeBody) == 0 {
+		return 1.0
+	}
+	frac := float64(idx) / float64(len(claudeBody))
+	if frac < 0 {
+		return 0
+	}
+	if frac > 1 {
+		return 1
+	}
+	return frac
+}
+
 // wantsSingleToolUse reports whether the client set
 // disable_parallel_tool_use — an audit caught that this parameter was
 // completely unhandled anywhere in the codebase. translator.go adds a
@@ -1323,6 +1483,12 @@ func executeStreamingWithWatchdog(
 					wMu.Lock()
 					errPayload := fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":%q}}`, fmt.Sprintf("Upstream failed after panic: %v", res.err))
 					_, _ = w.Write([]byte(fmt.Sprintf("event: error\ndata: %s\n\n", errPayload)))
+					// An audit caught that the panic watchdog's error paths
+					// write straight to the socket, bypassing
+					// SSEStreamer.SendRaw — the one place every OTHER event
+					// gets captured — so a watchdog-triggered failure left
+					// no trace in speccapture's record of this request.
+					globalSpecCapture.AppendClaudeEvent(rid, "error", errPayload)
 					flusher.Flush()
 					wMu.Unlock()
 					globalLogStore.Add(RequestLog{
@@ -1359,6 +1525,7 @@ func executeStreamingWithWatchdog(
 				wMu.Lock()
 				errPayload := `{"type":"error","error":{"type":"api_error","message":"Upstream timed out: no response received"}}`
 				_, _ = w.Write([]byte(fmt.Sprintf("event: error\ndata: %s\n\n", errPayload)))
+				globalSpecCapture.AppendClaudeEvent(rid, "error", errPayload)
 				flusher.Flush()
 				wMu.Unlock()
 				globalLogStore.Add(RequestLog{
@@ -1412,6 +1579,7 @@ UpstreamReady:
 			},
 		})
 		_, _ = w.Write([]byte(fmt.Sprintf("event: error\ndata: %s\n\n", errPayloadBytes)))
+		globalSpecCapture.AppendClaudeEvent(rid, "error", string(errPayloadBytes))
 		flusher.Flush()
 		wMu.Unlock()
 
@@ -1476,7 +1644,16 @@ UpstreamReady:
 		respModel = modelName
 	}
 	hasPrior := hasAssistantTurns(claudeBodyBytes)
-	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior, hasCacheControlBreakpoint(claudeBodyBytes), wantsSingleToolUse(claudeBodyBytes))
+	cachePrefixFrac := 0.0
+	if hasCacheControlBreakpoint(claudeBodyBytes) {
+		// An audit caught the old bool-only signal made FinishStream treat
+		// 100% of the uncached input as cache_creation whenever a
+		// breakpoint was merely present — see cacheBreakpointPrefixFraction's
+		// doc comment for why this byte-offset-based split is closer to
+		// real Anthropic billing.
+		cachePrefixFrac = cacheBreakpointPrefixFraction(claudeBodyBytes)
+	}
+	streamer := NewSSEStreamer(rid, w, flusher, respModel, cwdKey, hasSafeguards, estInputTokens, preferRussian, syntheticReasonTools, hasPrior, cachePrefixFrac, wantsSingleToolUse(claudeBodyBytes))
 
 	err = StreamGeminiToClaude(streamer, upResp.Body, touch)
 	if err != nil {
@@ -1724,9 +1901,10 @@ func executeNonStreaming(
 	// regardless of whether cache_control was ever set, misreporting a
 	// plain request as one that paid for a (more expensive) cache write.
 	var cacheCreationTok int64
-	if cacheTok == 0 && uncachedInTok > 1024 && hasCacheControlBreakpoint(claudeBodyBytes) {
-		cacheCreationTok = uncachedInTok
-		uncachedInTok = 0
+	if cacheTok == 0 && uncachedInTok > cacheCreationThreshold(gjson.GetBytes(claudeBodyBytes, "model").String()) && hasCacheControlBreakpoint(claudeBodyBytes) {
+		frac := cacheBreakpointPrefixFraction(claudeBodyBytes)
+		cacheCreationTok = int64(float64(uncachedInTok) * frac)
+		uncachedInTok -= cacheCreationTok
 	}
 	// Same per-instance CWD key as the streaming path (see
 	// executeStreamingWithWatchdog) — needed below for RepairEditToolCall.
@@ -1803,6 +1981,26 @@ func executeNonStreaming(
 	if cand.Exists() {
 		parts := cand.Get("content.parts")
 		if parts.IsArray() {
+			// An audit caught that the thinking block below falls back to
+			// lastTurnThoughtSig, which only reflects parts visited SO FAR
+			// in this forward pass — but Gemini commonly attaches the
+			// signature to the functionCall part that FOLLOWS a thought
+			// part, not to the thought part itself. sse.go's streaming
+			// path already handles this correctly by deferring the
+			// thinking block's close until the next part arrives and
+			// backfilling its signature from that part (see
+			// HandleFunctionCall's effectiveSig logic); this non-streaming
+			// path finalizes the thinking block eagerly as it's visited,
+			// so it never saw a later part's signature. Pre-scan the whole
+			// candidate once so a later part's signature is available
+			// up front, independent of visitation order.
+			var candidateThoughtSig string
+			for _, p := range parts.Array() {
+				if s := p.Get("thoughtSignature").String(); s != "" {
+					candidateThoughtSig = s
+					break
+				}
+			}
 			for _, p := range parts.Array() {
 				partSig := p.Get("thoughtSignature").String()
 				if partSig != "" {
@@ -1811,6 +2009,9 @@ func executeNonStreaming(
 				if p.Get("thought").Bool() {
 					t := p.Get("text").String()
 					sig := partSig
+					if sig == "" {
+						sig = candidateThoughtSig
+					}
 					if sig == "" {
 						sig = lastTurnThoughtSig
 					}
@@ -2058,6 +2259,7 @@ func executeNonStreaming(
 
 func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "This endpoint requires a POST request")
 		return
 	}
@@ -2071,7 +2273,12 @@ func handleCountTokens(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Req
 		return
 	}
 	bodyBytes, _ := io.ReadAll(r.Body)
-	if !gjson.ValidBytes(bodyBytes) || !gjson.GetBytes(bodyBytes, "messages").Exists() || !gjson.GetBytes(bodyBytes, "model").Exists() {
+	// estimateApproxClaudeTokens silently skips a non-array "messages"
+	// (its IsArray() guard just no-ops), so checking only Exists() here let
+	// e.g. {"messages": "a string"} through as 200 OK with a tiny token
+	// count instead of the 400 invalid_request_error Anthropic's spec
+	// requires for a malformed messages field.
+	if !gjson.ValidBytes(bodyBytes) || !gjson.GetBytes(bodyBytes, "messages").IsArray() || !gjson.GetBytes(bodyBytes, "model").Exists() {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Request body must be valid JSON with \"model\" and \"messages\"")
 		return
 	}
@@ -2154,6 +2361,7 @@ func authenticatedTenantFromRequest(cfgMgr *ConfigManager, r *http.Request) (Ten
 
 func handleModels(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "This endpoint requires a GET request")
 		return
 	}
@@ -2180,6 +2388,7 @@ func handleModels(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request)
 
 func handleModelByID(cfgMgr *ConfigManager, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "This endpoint requires a GET request")
 		return
 	}
@@ -2419,6 +2628,12 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 		header.Set("anthropic-ratelimit-tokens-limit", fmt.Sprintf("%d", tokLimit))
 		header.Set("anthropic-ratelimit-tokens-remaining", fmt.Sprintf("%d", int(float64(tokLimit)*0.95)))
 		header.Set("anthropic-ratelimit-tokens-reset", now.Add(5*time.Hour).UTC().Format(time.RFC3339))
+		// An audit caught that only the aggregated tokens-* triplet was
+		// ever sent — official Anthropic SDKs and newer Claude Code
+		// versions budget input/output tokens separately and read these
+		// split headers; without them they have no visibility into either
+		// budget specifically.
+		setSplitTokenRateLimitHeaders(header, tokLimit, 0.95, now.Add(5*time.Hour))
 		header.Set("anthropic-organization-id", fakeOrgID)
 		header.Set("anthropic-workspace-id", fakeWorkspaceID)
 		return
@@ -2517,6 +2732,7 @@ func applyRateLimitHeaders(header http.Header, acc *AccountRecord, modelName str
 		header.Set("anthropic-ratelimit-tokens-limit", fmt.Sprintf("%d", tokLimit))
 		header.Set("anthropic-ratelimit-tokens-remaining", fmt.Sprintf("%d", int(float64(tokLimit)*(1-fiveHourFrac))))
 		header.Set("anthropic-ratelimit-tokens-reset", time.Unix(fiveHourReset, 0).UTC().Format(time.RFC3339))
+		setSplitTokenRateLimitHeaders(header, tokLimit, 1-fiveHourFrac, time.Unix(fiveHourReset, 0))
 	}
 
 	// anthropic-organization-id/anthropic-workspace-id are set earlier in

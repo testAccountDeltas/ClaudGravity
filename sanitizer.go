@@ -145,6 +145,18 @@ func dedupedRepeatedReads(newMsgs []map[string]interface{}) bool {
 				if text == "" {
 					continue
 				}
+				// An audit caught that on a SECOND pass over the same
+				// messages (SanitizeMessagesAndGraph can run more than
+				// once per request), a block this function already
+				// marked on a prior pass now holds the marker text
+				// itself, not the real file content — reading it back in
+				// here and caching it under seenContent[path] replaced
+				// the real content a later genuine duplicate needs to
+				// compare against, breaking dedup for any further
+				// occurrence of this same path later in the pass.
+				if strings.HasPrefix(text, "[Identical to the Read result already shown earlier") {
+					continue
+				}
 				if prev, seen := seenContent[path]; seen && prev == text {
 					b["content"] = fmt.Sprintf("[Identical to the Read result already shown earlier in this conversation for %s — unchanged, see above. Do not re-read; proceed with what you already have.]", path)
 					changed = true

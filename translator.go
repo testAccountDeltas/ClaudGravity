@@ -175,6 +175,22 @@ func sealFunctionResponseTurn(parts []string) (sealed []string, followUpImages [
 	return fnResp, followUpImages
 }
 
+// decodeBase64Loose decodes a base64 string that may contain embedded
+// whitespace (RFC 2045 line-wrapping at 76 chars, or stray \r\n/\n/spaces
+// some clients leave in). base64.StdEncoding.DecodeString rejects any
+// non-alphabet byte outright with CorruptInputError, silently dropping an
+// otherwise well-formed document whose encoder happened to wrap lines.
+func decodeBase64Loose(s string) ([]byte, error) {
+	cleaned := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			return -1
+		}
+		return r
+	}, s)
+	return base64.StdEncoding.DecodeString(cleaned)
+}
+
 // ConvertClaudeRequestToGemini converts an Anthropic Messages API payload into
 // a Google Gemini streamGenerateContent payload with full sanitization and tiering.
 func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqClass string, agentKey string, sessionID string, instanceID string) ([]byte, string, int, bool, map[string]bool, error) {
@@ -427,10 +443,43 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 							partsJSON = append(partsJSON, part)
 							return true
 						}
+						if ptype == "document" {
+							// An audit caught that Anthropic's document
+							// block's "title" and "context" fields (e.g. the
+							// real filename, or a caller-supplied
+							// description) were dropped entirely — Gemini
+							// then sees only raw inlineData bytes with no
+							// name or description attached, so "analyze
+							// report_2026.pdf" has nothing for the model to
+							// connect to the attachment it's looking at.
+							title := p.Get("title").String()
+							docContext := p.Get("context").String()
+							if title != "" || docContext != "" {
+								label := "[Attached Document"
+								if title != "" {
+									label += ": \"" + title + "\""
+								}
+								if docContext != "" {
+									label += " - Context: " + docContext
+								}
+								label += "]"
+								part := `{"text":""}`
+								part, _ = sjson.Set(part, "text", label)
+								partsJSON = append(partsJSON, part)
+							}
+						}
 						src := p.Get("source")
 						switch src.Get("type").String() {
 						case "base64":
-							mediaType := src.Get("media_type").String()
+							// An audit caught this comparison ran without
+							// strings.ToLower(): a client sending
+							// "APPLICATION/PDF" or "IMAGE/PNG" (valid per
+							// MIME's case-insensitivity) missed both checks
+							// and fell into the text-decode branch below,
+							// which wraps the still-binary bytes in a Go
+							// string and sends them as a "text" part —
+							// invalid UTF-8 that Gemini rejects or garbles.
+							mediaType := strings.ToLower(src.Get("media_type").String())
 							b64Data := src.Get("data").String()
 							if b64Data != "" {
 								if mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/") {
@@ -442,7 +491,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 									// Plain text, code, CSV, JSON base64 documents:
 									// Gemini inlineData only accepts binary media types.
 									// Decode base64 to UTF-8 text!
-									if decoded, err := base64.StdEncoding.DecodeString(b64Data); err == nil && len(decoded) > 0 {
+									if decoded, err := decodeBase64Loose(b64Data); err == nil && len(decoded) > 0 {
 										part := `{"text":""}`
 										part, _ = sjson.Set(part, "text", string(decoded))
 										partsJSON = append(partsJSON, part)
@@ -460,12 +509,33 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 								part, _ = sjson.Set(part, "text", txt)
 								partsJSON = append(partsJSON, part)
 							}
+						case "url":
+							// An audit caught that a "url"-sourced
+							// image/document block hit no case here at all
+							// and vanished — if it was the message's only
+							// content, the whole turn collapsed to the
+							// sanitizer's "..." placeholder with no trace
+							// an attachment ever existed. We don't fetch
+							// arbitrary URLs ourselves, but surface what
+							// was attached as text instead of silence.
+							if u := src.Get("url").String(); u != "" {
+								part := `{"text":""}`
+								part, _ = sjson.Set(part, "text", "[Attached "+ptype+" by URL: "+u+"]")
+								partsJSON = append(partsJSON, part)
+							}
 						}
 					case "tool_use":
 						name := p.Get("name").String()
 						callID := p.Get("id").String()
 						argsRaw := p.Get("input").Raw
-						if argsRaw == "" {
+						if argsRaw == "" || argsRaw == "null" {
+							// gjson's .Raw for a JSON `null` value is the
+							// literal string "null", not "" — a tool_use
+							// block with "input": null (some clients omit
+							// args entirely this way) passed straight
+							// through to Gemini as "args": null, which
+							// Gemini rejects with 400 since functionCall.args
+							// must be an object.
 							argsRaw = "{}"
 						}
 						// Prefer the real signature this exact call was
@@ -564,7 +634,12 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 									src := item.Get("source")
 									switch src.Get("type").String() {
 									case "base64":
-										mediaType := src.Get("media_type").String()
+										// Same case-sensitivity bug as the
+										// top-level content-block path above:
+										// without ToLower, "IMAGE/PNG" etc.
+										// missed both checks and got wrapped
+										// as invalid-UTF-8 "text".
+										mediaType := strings.ToLower(src.Get("media_type").String())
 										data := src.Get("data").String()
 										if mediaType != "" && data != "" {
 											if mediaType == "application/pdf" || strings.HasPrefix(mediaType, "image/") {
@@ -573,7 +648,7 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 												imgPart, _ = sjson.Set(imgPart, "inlineData.data", data)
 												imageParts = append(imageParts, imgPart)
 											} else {
-												if decoded, err := base64.StdEncoding.DecodeString(data); err == nil {
+												if decoded, err := decodeBase64Loose(data); err == nil {
 													sb.Write(decoded)
 												}
 											}
@@ -581,6 +656,14 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 									case "text":
 										if txt := src.Get("data").String(); txt != "" {
 											sb.WriteString(txt)
+										}
+									case "url":
+										// Same as the top-level content-block
+										// path: a url-sourced tool_result
+										// attachment silently vanished instead
+										// of at least surfacing as text.
+										if u := src.Get("url").String(); u != "" {
+											sb.WriteString("[Attached by URL: " + u + "]")
 										}
 									}
 								}
@@ -951,7 +1034,19 @@ func ConvertClaudeRequestToGemini(claudeJSON []byte, tenant TenantConfig, reqCla
 	// so a client asking for temperature:0 (deterministic code generation)
 	// silently got Gemini's own default (commonly ~1.0) instead.
 	if temp := root.Get("temperature"); temp.Exists() {
-		out, _ = sjson.Set(out, "generationConfig.temperature", temp.Float())
+		t := temp.Float()
+		if budget != 0 && t != 1.0 {
+			// An audit caught that Anthropic's own spec requires
+			// temperature == 1.0 whenever thinking is enabled (any other
+			// value is rejected outright on the real API) — passing a
+			// client's temperature:0 (the common default for
+			// deterministic code generation) straight through here, on
+			// top of a thinking budget, measured live to degrade Gemini
+			// 2.5/3.8's reasoning into repetitive thought loops instead of
+			// erroring, a much harder failure to notice and debug.
+			t = 1.0
+		}
+		out, _ = sjson.Set(out, "generationConfig.temperature", t)
 	}
 	if topP := root.Get("top_p"); topP.Exists() {
 		out, _ = sjson.Set(out, "generationConfig.topP", topP.Float())

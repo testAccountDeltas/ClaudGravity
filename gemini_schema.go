@@ -47,6 +47,29 @@ func stripNestedOpenDictReason(toolName, argsRaw string) string {
 	fields := openDictArgFields[toolName]
 	openDictArgFieldsMu.Unlock()
 	for _, field := range fields {
+		// An audit caught that a field ending in ".items" — the marker
+		// addEmptySchemaPlaceholder's caller leaves behind for "this open
+		// dict placeholder was injected into an array's element schema,
+		// not a plain nested object" — was handled identically to a plain
+		// nested object: path = field + ".reason" assumes a single object,
+		// but gjson/sjson have no "items" path token, so this never
+		// matched any real element and the "reason" placeholder leaked
+		// into every element of the array unstripped.
+		if arrayField, ok := strings.CutSuffix(field, ".items"); ok {
+			arr := gjson.Get(argsRaw, arrayField)
+			if arr.IsArray() {
+				n := len(arr.Array())
+				for i := n - 1; i >= 0; i-- {
+					path := fmt.Sprintf("%s.%d.reason", arrayField, i)
+					if gjson.Get(argsRaw, path).Exists() {
+						if cleaned, err := sjson.Delete(argsRaw, path); err == nil {
+							argsRaw = cleaned
+						}
+					}
+				}
+			}
+			continue
+		}
 		path := field + ".reason"
 		if gjson.Get(argsRaw, path).Exists() {
 			if cleaned, err := sjson.Delete(argsRaw, path); err == nil {
@@ -250,6 +273,7 @@ func cleanJSONSchema(toolName, jsonStr string, addPlaceholder bool) (string, []s
 	// Phase 1: Convert references and inline structures
 	jsonStr = convertRefsToHints(jsonStr)
 	jsonStr = convertConstToEnum(jsonStr)
+	jsonStr = convertPrefixItemsToItems(jsonStr)
 
 	// Phase 2: Flatten complex structures
 	jsonStr = mergeAllOf(jsonStr)
@@ -277,6 +301,7 @@ func cleanJSONSchema(toolName, jsonStr string, addPlaceholder bool) (string, []s
 		jsonStr = removePlaceholderFields(jsonStr)
 	}
 	jsonStr = cleanupRequiredFields(jsonStr)
+	jsonStr = addMissingPropertyTypes(jsonStr)
 	jsonStr = addMissingArrayItems(jsonStr)
 	// Phase 4: Add placeholder for empty object schemas (Claude VALIDATED mode requirement)
 	var nestedOpenDictFields []string
@@ -503,6 +528,19 @@ func convertConstToEnum(jsonStr string) string {
 		if !gjson.Get(jsonStr, enumPath).Exists() {
 			jsonStr, _ = sjson.Set(jsonStr, enumPath, []interface{}{val.Value()})
 		}
+		// An audit caught that leaving "type" unset here (it was only ever
+		// filled in later by convertEnumValuesToStrings, which runs AFTER
+		// flattenAnyOfOneOf) made every const-derived branch of an
+		// anyOf/oneOf look untyped (type=="") to flattenAnyOfOneOf's
+		// allStringEnums/selectBest logic — so instead of merging all the
+		// branches' enum values together, it silently kept only the first
+		// branch and mislabeled the field "nullable" on top of that. Set
+		// the type immediately so these branches are recognized as string
+		// enums right away.
+		typePath := parentPath + ".type"
+		if val.Type == gjson.String && !gjson.Get(jsonStr, typePath).Exists() {
+			jsonStr, _ = sjson.Set(jsonStr, typePath, "string")
+		}
 	}
 	return jsonStr
 }
@@ -589,6 +627,56 @@ func moveConstraintsToDescription(jsonStr string) string {
 	return jsonStr
 }
 
+// mergeAllOfPropertiesInto merges one allOf branch's "properties" object
+// into whatever already lives at propsDestPath (another branch's own
+// "properties", possibly already merged from earlier branches).
+//
+// An audit caught that the collision path below only ever copied a
+// colliding key's ATTRIBUTES (type, description, other scalar keywords) and
+// explicitly skipped "properties" once any properties object already
+// existed at that destination — so {allOf: [{properties:{config:
+// {properties:{a}}}}, {properties:{config:{properties:{b}}}}]} merged
+// "config" once (branch 1, with only "a") and then, on branch 2, saw
+// destPath+".properties" already existed and silently dropped "b" entirely
+// instead of merging it alongside "a". Recursing into "properties" instead
+// of treating it as an opaque atomic value fixes this at any nesting depth.
+func mergeAllOfPropertiesInto(jsonStr, propsDestPath string, props gjson.Result) string {
+	props.ForEach(func(key, value gjson.Result) bool {
+		destPath := joinPath(propsDestPath, escapeGJSONPathKey(key.String()))
+		if !gjson.Get(jsonStr, destPath).Exists() {
+			jsonStr, _ = sjson.SetRaw(jsonStr, destPath, value.Raw)
+			return true
+		}
+		// Deep merge collision: preserve existing type if incoming lacks one, merge description hints
+		existingType := gjson.Get(jsonStr, destPath+".type").String()
+		incomingType := value.Get("type").String()
+		if existingType == "" && incomingType != "" {
+			jsonStr, _ = sjson.Set(jsonStr, destPath+".type", incomingType)
+		}
+		existingDesc := gjson.Get(jsonStr, destPath+".description").String()
+		incomingDesc := value.Get("description").String()
+		if incomingDesc != "" && incomingDesc != existingDesc {
+			jsonStr = appendHint(jsonStr, destPath, incomingDesc)
+		}
+		value.ForEach(func(attrKey, attrVal gjson.Result) bool {
+			k := attrKey.String()
+			if k == "description" || k == "type" {
+				return true
+			}
+			if k == "properties" && attrVal.IsObject() {
+				jsonStr = mergeAllOfPropertiesInto(jsonStr, destPath+".properties", attrVal)
+				return true
+			}
+			if !gjson.Get(jsonStr, destPath+"."+k).Exists() {
+				jsonStr, _ = sjson.SetRaw(jsonStr, destPath+"."+k, attrVal.Raw)
+			}
+			return true
+		})
+		return true
+	})
+	return jsonStr
+}
+
 func mergeAllOf(jsonStr string) string {
 	paths := findPaths(jsonStr, "allOf")
 	sortByDepth(paths)
@@ -605,32 +693,7 @@ func mergeAllOf(jsonStr string) string {
 				if !gjson.Get(jsonStr, joinPath(parentPath, "type")).Exists() {
 					jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "type"), "object")
 				}
-				props.ForEach(func(key, value gjson.Result) bool {
-					destPath := joinPath(parentPath, "properties."+escapeGJSONPathKey(key.String()))
-					if !gjson.Get(jsonStr, destPath).Exists() {
-						jsonStr, _ = sjson.SetRaw(jsonStr, destPath, value.Raw)
-						return true
-					}
-					// Deep merge collision: preserve existing type if incoming lacks one, merge description hints
-					existingType := gjson.Get(jsonStr, destPath+".type").String()
-					incomingType := value.Get("type").String()
-					if existingType == "" && incomingType != "" {
-						jsonStr, _ = sjson.Set(jsonStr, destPath+".type", incomingType)
-					}
-					existingDesc := gjson.Get(jsonStr, destPath+".description").String()
-					incomingDesc := value.Get("description").String()
-					if incomingDesc != "" && incomingDesc != existingDesc {
-						jsonStr = appendHint(jsonStr, destPath, incomingDesc)
-					}
-					value.ForEach(func(attrKey, attrVal gjson.Result) bool {
-						k := attrKey.String()
-						if k != "description" && k != "type" && !gjson.Get(jsonStr, destPath+"."+k).Exists() {
-							jsonStr, _ = sjson.SetRaw(jsonStr, destPath+"."+k, attrVal.Raw)
-						}
-						return true
-					})
-					return true
-				})
+				jsonStr = mergeAllOfPropertiesInto(jsonStr, joinPath(parentPath, "properties"), props)
 			}
 			if req := item.Get("required"); req.IsArray() {
 				reqPath := joinPath(parentPath, "required")
@@ -973,6 +1036,13 @@ func removeUnsupportedKeywords(jsonStr string) string {
 		// $anchor/$dynamicAnchor/$dynamicRef/$vocabulary are Draft 2020-12
 		// schema-identification keywords Gemini has no concept of either.
 		"additionalItems", "contentSchema", "$anchor", "$dynamicAnchor", "$dynamicRef", "$vocabulary",
+		// An audit caught these OpenAPI 3.0 annotation keywords were never
+		// stripped at all: "discriminator" (polymorphic oneOf/anyOf
+		// schemas), "xml" and "externalDocs" (OpenAPI doc-generation
+		// metadata). Any tool schema carrying one passes through to
+		// Gemini's protobuf parser unchanged and gets rejected outright
+		// with "unknown field <name> in Schema".
+		"discriminator", "xml", "externalDocs",
 		// "title" is commonly auto-generated by Pydantic/TypeScript MCP
 		// tool schemas, and unlike a plain JSON Schema validator (which
 		// ignores unrecognized annotation keywords), Gemini's proto3-based
@@ -1370,6 +1440,91 @@ func Walk(value gjson.Result, path string, targetKey string, paths *[]string) {
 			return true
 		})
 	}
+}
+
+// convertPrefixItemsToItems rewrites Draft 2020-12 tuple validation
+// ("prefixItems": [schemaA, schemaB, ...]) into an "items" schema before
+// "prefixItems" is stripped as an unsupported keyword later in the pipeline.
+//
+// An audit caught that without this, a tuple's element schemas were simply
+// discarded: "prefixItems" is in unsupportedConstraints (deleted outright by
+// Phase 3), "items" never existed on these schemas to begin with, and
+// addMissingArrayItems then fills that gap with a bare {} — collapsing a
+// described tuple into a completely untyped array. Gemini's protobuf Schema
+// has no tuple concept either, so this can only approximate: a single
+// prefixItems entry becomes that entry's own schema; several become a oneOf
+// of them (flattenAnyOfOneOf, which runs right after this in Phase 2,
+// collapses that down further) — far closer to the original intent than an
+// empty items.
+func convertPrefixItemsToItems(jsonStr string) string {
+	for _, p := range findPaths(jsonStr, "prefixItems") {
+		arr := gjson.Get(jsonStr, p)
+		if !arr.IsArray() || len(arr.Array()) == 0 {
+			continue
+		}
+		parentPath := trimSuffix(p, ".prefixItems")
+		itemsPath := joinPath(parentPath, "items")
+		if gjson.Get(jsonStr, itemsPath).Exists() {
+			continue
+		}
+		items := arr.Array()
+		if len(items) == 1 {
+			jsonStr, _ = sjson.SetRaw(jsonStr, itemsPath, items[0].Raw)
+			continue
+		}
+		oneOf := "["
+		for i, it := range items {
+			if i > 0 {
+				oneOf += ","
+			}
+			oneOf += it.Raw
+		}
+		oneOf += "]"
+		jsonStr, _ = sjson.SetRaw(jsonStr, itemsPath, `{"oneOf":`+oneOf+`}`)
+	}
+	return jsonStr
+}
+
+// addMissingPropertyTypes gives every object property that declares no type
+// of its own a default one.
+//
+// An audit caught that addEmptySchemaPlaceholder only ever looks at paths
+// where "type" ALREADY equals "object" (it walks findPaths(jsonStr, "type")),
+// so a property with no "type" field at all — e.g. {"description": "any
+// payload"}, which Pydantic/TypeScript generators emit routinely for a
+// deliberately open-ended field — was never visited by anything and reached
+// Gemini's protobuf Schema with no type, which rejects it outright
+// ("parameters.properties[x].type: missing field"). By this point in the
+// pipeline (after mergeAllOf/flattenAnyOfOneOf/convertConstToEnum),
+// "properties"/"items"/"enum"/a surviving composition keyword already means
+// a type is implied; only genuinely bare property schemas are affected.
+func addMissingPropertyTypes(jsonStr string) string {
+	for _, p := range findPaths(jsonStr, "properties") {
+		propsVal := gjson.Get(jsonStr, p)
+		if !propsVal.IsObject() {
+			continue
+		}
+		propsVal.ForEach(func(k, v gjson.Result) bool {
+			if !v.IsObject() {
+				return true
+			}
+			if v.Get("type").Exists() || v.Get("enum").Exists() ||
+				v.Get("anyOf").Exists() || v.Get("oneOf").Exists() || v.Get("allOf").Exists() {
+				return true
+			}
+			propPath := joinPath(p, escapeGJSONPathKey(k.String()))
+			switch {
+			case v.Get("properties").Exists():
+				jsonStr, _ = sjson.Set(jsonStr, joinPath(propPath, "type"), "object")
+			case v.Get("items").Exists():
+				jsonStr, _ = sjson.Set(jsonStr, joinPath(propPath, "type"), "array")
+			default:
+				jsonStr, _ = sjson.Set(jsonStr, joinPath(propPath, "type"), "string")
+			}
+			return true
+		})
+	}
+	return jsonStr
 }
 
 // addMissingArrayItems gives every array schema that declares no "items" an empty one.

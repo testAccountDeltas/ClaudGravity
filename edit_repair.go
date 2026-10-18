@@ -671,16 +671,16 @@ func RepairEditToolCall(toolName string, argsRaw string, sessionID string) (stri
 						effectiveNewStr = newLFCandidate
 					}
 				}
-				// Re-apply the indentation findFuzzyLineMatch stripped
-				// from the comparison on lines 1..N — an audit caught that
-				// only line 0's own leading whitespace was ever restored
-				// (via repairedExact's start offset), so new_string's
-				// later lines kept whatever indentation the model wrote
-				// them with (typically none, mirroring its own flawed
-				// old_string), silently de-indenting the file on replace.
-				// Only safe to apply when new_string has the exact same
-				// line count as old_string — a line being added or removed
-				// means there's no 1:1 correspondence to reapply against.
+				// Re-apply the indentation findFuzzyLineMatch detected as
+				// missing or mismatched on lines 1..N — an audit caught
+				// that only line 0's own leading whitespace was ever
+				// restored (via repairedExact's start offset), so
+				// new_string's later lines kept whatever indentation the
+				// model wrote them with, silently corrupting the file's
+				// indentation on replace. When new_string's line count
+				// differs from old_string's (a line added/removed),
+				// reapplyLineIndents falls back to a uniform best-effort
+				// indent instead of a precise 1:1 mapping.
 				if reindented, did := reapplyLineIndents(effectiveNewStr, lineIndents); did {
 					effectiveNewStr = reindented
 				}
@@ -722,19 +722,70 @@ func reapplyLineIndents(newStr string, lineIndents []string) (string, bool) {
 		return newStr, false
 	}
 	lines := strings.Split(newStr, "\n")
-	if len(lines) != len(lineIndents) {
-		return newStr, false
-	}
 	changed := false
-	for j, ind := range lineIndents {
-		if ind == "" || j == 0 {
-			continue // line 0's indentation is already handled via repairedExact's start offset, not here
+	if len(lines) == len(lineIndents) {
+		// Exact 1:1 correspondence — reapply each line's own detected indent.
+		// lineIndents[j] is the file's real indentation whenever it differs
+		// from old_string's own line j (findFuzzyLineMatch already filters
+		// out lines where they match), so replace whatever leading
+		// whitespace new_string's line carries — not just fill in an
+		// absent one — to also correct a wrong style/depth (e.g. the model
+		// mirrored its own space-indented old_string against a
+		// tab-indented file).
+		for j, ind := range lineIndents {
+			if ind == "" || j == 0 {
+				continue // line 0's indentation is already handled via repairedExact's start offset, not here
+			}
+			trimmed := strings.TrimLeft(lines[j], " \t")
+			if ind+trimmed == lines[j] {
+				continue // already correct
+			}
+			lines[j] = ind + trimmed
+			changed = true
 		}
-		if lines[j] != strings.TrimLeft(lines[j], " \t") {
-			continue // this line already has its own leading whitespace
+	} else {
+		// An audit caught that a differing line count (the model added or
+		// removed a line — common when editing, not an edge case) made
+		// this bail out entirely, leaving EVERY line past the first
+		// flush-left with no indentation at all — worse than doing
+		// nothing targeted, since this is the common case, not the rare
+		// one. No 1:1 line mapping is possible here, but old_string's own
+		// lines overwhelmingly tend to share one indentation depth (a
+		// single block/function body) — apply the most common non-empty
+		// detected indent uniformly to every new_string line (other than
+		// line 0) that doesn't already have its own leading whitespace,
+		// instead of giving up and guaranteeing flush-left on all of them.
+		counts := make(map[string]int)
+		for j, ind := range lineIndents {
+			if j == 0 || ind == "" {
+				continue
+			}
+			counts[ind]++
 		}
-		lines[j] = ind + lines[j]
-		changed = true
+		var baseIndent string
+		best := 0
+		for ind, n := range counts {
+			if n > best {
+				best = n
+				baseIndent = ind
+			}
+		}
+		if baseIndent != "" {
+			for j := range lines {
+				if j == 0 {
+					continue
+				}
+				if strings.TrimSpace(lines[j]) == "" {
+					continue // don't indent a genuinely blank line
+				}
+				trimmed := strings.TrimLeft(lines[j], " \t")
+				if baseIndent+trimmed == lines[j] {
+					continue // already correct
+				}
+				lines[j] = baseIndent + trimmed
+				changed = true
+			}
+		}
 	}
 	if !changed {
 		return newStr, false
@@ -833,16 +884,28 @@ func findFuzzyLineMatch(fileContent, oldStr string) (string, []string, bool) {
 		// corrupting the result (especially syntactically significant for
 		// Python/YAML). Record each line's missing indentation here so the
 		// caller can re-apply it to new_string.
+		// An audit further caught that checking "old_string's line already
+		// had SOME leading whitespace" (any space/tab) was too weak: a
+		// model that writes old_string with its own space-indentation
+		// against a tab-indented file passes that check and gets treated
+		// as "nothing missing", even though the style/depth is wrong — the
+		// replacement then injects space-indented lines into a tab file
+		// (or vice versa), corrupting Go/Python/YAML indentation rules
+		// just as badly as missing indentation does. Compare against the
+		// file's actual leading whitespace for that line, not just
+		// presence vs. absence, so a mismatched style/depth is corrected
+		// too, not only a totally absent one.
 		lineIndents := make([]string, mLen)
 		for j := 0; j < mLen; j++ {
-			if rawOldLines[j] != strings.TrimLeft(rawOldLines[j], " \t") {
-				continue // old_string's own line j already had indentation; nothing missing
-			}
 			fileLineClean := fileLines[startIdx+j].clean
-			leadingLen := len(fileLineClean) - len(strings.TrimLeft(fileLineClean, " \t"))
-			if leadingLen > 0 {
-				lineIndents[j] = fileLineClean[:leadingLen]
+			fileLeadingLen := len(fileLineClean) - len(strings.TrimLeft(fileLineClean, " \t"))
+			fileIndent := fileLineClean[:fileLeadingLen]
+			oldLeadingLen := len(rawOldLines[j]) - len(strings.TrimLeft(rawOldLines[j], " \t"))
+			oldIndent := rawOldLines[j][:oldLeadingLen]
+			if fileIndent == oldIndent {
+				continue // old_string's own line j already matches the file's real indentation; nothing missing
 			}
+			lineIndents[j] = fileIndent
 		}
 
 		startOffset := fileLines[startIdx].offset

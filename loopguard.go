@@ -140,7 +140,15 @@ const (
 // in the group (bare `cat file` is still a read), but isReadEquivalentBashCommand
 // below excludes it specifically when it's writing TO a file (heredoc/
 // redirect), not reading one.
-var readEquivalentBashPattern = regexp.MustCompile(`(?i)\b(sed\s+-n|head\s+(-[nc]|[-+]?[0-9]+)|tail\s+(-[nc]|[-+]?[0-9]+)|cat|more|less|pr\b|seq\b|dd\s+bs=|cut\s+-[df]|fold\b|nl\s+-)\b`)
+//
+// A second audit caught that `head\s+(-[nc]|...)` still required SOME
+// flag or number right after "head"/"tail" — a genuinely bare `head
+// file.go` or `tail file.go` (no flags at all, the single most common way
+// to type either command) matched neither alternative and was completely
+// invisible to this guard. `cat`/`more`/`less`/`pr` already match bare
+// with no such requirement; head/tail now do too, dropping the dangling
+// \s+(...) group entirely.
+var readEquivalentBashPattern = regexp.MustCompile(`(?i)\b(sed\s+-n|head|tail|cat|more|less|pr\b|seq\b|dd\s+bs=|cut\s+-[df]|fold\b|nl\s+-)\b`)
 var awkNRPattern = regexp.MustCompile(`(?i)\bNR\s*[<>=!]`)
 
 // catIsWritePattern matches `cat` used to WRITE a file (heredoc into a
@@ -194,7 +202,20 @@ func isReadEquivalentPowerShellCommand(command string) bool {
 		strings.Contains(lc, "grep") || strings.Contains(lc, "rg ") || strings.HasPrefix(lc, "rg") {
 		return false
 	}
-	return readEquivalentPowerShellPattern.MatchString(command)
+	if readEquivalentPowerShellPattern.MatchString(command) {
+		return true
+	}
+	// An audit caught that isReadEquivalentBashCommand's own
+	// readlines/splitlines check (for a Python/Perl one-liner invoked from
+	// Bash) had no PowerShell counterpart — on Windows the exact same
+	// dump-the-file one-liners are routinely invoked through `python -c
+	// "..."`, `node -e "..."`, or .NET's own [System.IO.File] static
+	// methods, all completely invisible to this guard without this.
+	if strings.Contains(lc, "readlines") || strings.Contains(lc, "readfilesync") ||
+		strings.Contains(lc, "readalllines") || strings.Contains(lc, "readalltext") {
+		return true
+	}
+	return false
 }
 
 // isPlanModeRequest detects the same thing translator.go's own inline check
@@ -486,8 +507,25 @@ func InjectUserNudge(claudeReqJSON map[string]interface{}, text string) {
 	if !ok {
 		return
 	}
-	msgs, ok := msgsRaw.([]interface{})
-	if !ok {
+	var msgs []interface{}
+	switch v := msgsRaw.(type) {
+	case []interface{}:
+		msgs = v
+	case []map[string]interface{}:
+		// An audit caught that this only ever accepted []interface{} —
+		// SanitizeMessagesAndGraph's own normalization has previously
+		// left "messages" as []map[string]interface{} at points in its
+		// pipeline (see context_window.go's history of exactly this
+		// mismatch), and a caller that still sees that shape here hit
+		// this type assertion's failure path and silently did nothing,
+		// with no error or log to notice it by. Maps are reference
+		// types, so wrapping each one loses no ability to mutate it in
+		// place below.
+		msgs = make([]interface{}, len(v))
+		for i, m := range v {
+			msgs[i] = m
+		}
+	default:
 		return
 	}
 

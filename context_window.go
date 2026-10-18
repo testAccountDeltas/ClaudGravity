@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 )
 
@@ -71,7 +70,22 @@ func blockTokenEstimate(bMap map[string]interface{}) int {
 		if src, ok := bMap["source"].(map[string]interface{}); ok {
 			if dataStr, isStr := src["data"].(string); isStr {
 				if src["type"] == "base64" {
-					mediaType := strings.ToLower(fmt.Sprint(src["media_type"]))
+					// An audit caught that fmt.Sprint on a missing
+					// media_type key (a nil interface{}) returns the
+					// literal string "<nil>", not "" — so the intended
+					// "unknown type defaults to PDF pricing" fallback
+					// below never actually triggered; a PDF with no
+					// media_type fell through to the raw-text-density
+					// formula instead, which treats base64's high-entropy
+					// bytes as if decoded text, inflating a few-thousand-
+					// token PDF into a six-figure estimate and needlessly
+					// evicting history to "fit" a budget it was never
+					// close to. Extract the string directly so a missing
+					// or non-string media_type yields "" as intended.
+					var mediaType string
+					if mt, ok := src["media_type"].(string); ok {
+						mediaType = strings.ToLower(mt)
+					}
 					if mediaType == "application/pdf" || mediaType == "" {
 						est := len(dataStr) / 500
 						if est < 2500 {
@@ -158,7 +172,17 @@ func TruncateConversationToFit(reqMap map[string]interface{}, modelName string, 
 	if !hasMeta || maxTokens <= 0 {
 		maxTokens = fallbackMaxTokens[modelName]
 		if maxTokens <= 0 {
-			return 0, false
+			// An audit caught that a model name present in neither the
+			// (possibly empty, if FetchAvailableModels failed/raced at
+			// startup) live catalog NOR this hardcoded fallback map —
+			// a new Gemini release, or a custom/renamed model — silently
+			// disabled truncation entirely instead of erring conservative,
+			// the exact failure case fallbackMaxTokens itself exists to
+			// prevent. Fall back to the smallest known real ceiling rather
+			// than giving up: trimming a request that didn't need it is
+			// harmless; sailing an oversized one straight into Google's
+			// raw context-length 400 is not.
+			maxTokens = 1048576
 		}
 	}
 
